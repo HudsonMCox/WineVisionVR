@@ -22,7 +22,12 @@
   "nativeBatteryFaultFixed": false,
   "resolutionChanged": false,
   "gameLaunchedByAgent": false,
-  "installation": "pending; CoreDevice error 4016, headset developer services currently unavailable",
+  "installation": {
+    "status": "success",
+    "configuration": "Release",
+    "bundleID": "org.avpplay.visionos-windows-vr",
+    "gameLaunchedByAgent": false
+  },
   "notes": "The audio-session interruption defect is fixed in source and the preserved-runtime adapter. Its attribution as the cause of the observed 53.9-second whole-process gap remains unproven. Tests do not claim game execution or FPS gains.",
   "buildPath": "/Users/hudsonmcox/Library/Developer/Xcode/DerivedData/WineVisionVR-Device/Build/Products/Release-xros/WineVision VR.app"
 }

@@ -34,4 +34,4 @@ The simulator audio policy probe exercises installation/idempotence, real legacy
 
 ## Delivery status
 
-The final Release build and strict recursive signature verification pass. Installation retry is blocked by CoreDevice error 4016: the headset cannot currently provide trusted remote developer services or a power assertion. The repaired build has not yet been installed. The signed app is retained in persistent Xcode DerivedData under `WineVisionVR-Device/Build/Products/Release-xros/WineVision VR.app`; source and validation metadata are saved in WineVisionVR.
+The final Release build and strict recursive signature verification pass. The initial installation retry failed with CoreDevice error 4016 while the headset was unavailable. After the user readied the headset, the repaired Release app installed successfully. The agent did not launch a game; physical verification of readiness and freeze behavior remains pending. The signed app is retained in persistent Xcode DerivedData under `WineVisionVR-Device/Build/Products/Release-xros/WineVision VR.app`; source and validation metadata are saved in WineVisionVR.
