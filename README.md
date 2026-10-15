@@ -95,6 +95,9 @@ Headset-confirmed unless marked otherwise. The full engineering record is in `do
   lock (patch 0013); visibility queries that end in an empty command chunk now complete (patch 0011); query
   publication (patch 0010), with exact GPU event completion preserved; FEX address-translation caches (patch
   `windows-runtime-plugin/patches/0003`).
+- **Startup repair (headset validation pending):** only the built-in display publishes stereo readiness;
+  capture reuses its snapshot. Cooperative audio preserves the JIT helper. See the
+  [routing and freeze investigation](docs/windows-vr-drawable-routing.md).
 - **CPU optimization (headset validation pending):** patch 0015 removes repeated completed-query allocations
   and per-sample atomic additions. Host lifecycle/race checks and the ARM64EC build pass; no game FPS gain
   has been measured. The unsafe whole-buffer completion cache (retired patch 0014) is removed.

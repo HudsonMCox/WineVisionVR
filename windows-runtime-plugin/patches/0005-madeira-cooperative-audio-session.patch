@@ -1,0 +1,12 @@
+--- a/app/Madeira/WineProcessBridge.m
++++ b/app/Madeira/WineProcessBridge.m
+@@ -971,7 +971,8 @@
+         {
+             NSError *aerr = nil;
+             AVAudioSession *session = [AVAudioSession sharedInstance];
+-            [session setCategory:AVAudioSessionCategoryPlayback error:&aerr];
++            [session setCategory:AVAudioSessionCategoryPlayback
++                    withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&aerr];
+             if (aerr) LOG("AVAudioSession setCategory failed: %{public}s",
+                           aerr.localizedDescription.UTF8String);
+             aerr = nil;

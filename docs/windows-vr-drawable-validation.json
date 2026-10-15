@@ -1,0 +1,28 @@
+{
+  "date": "2026-10-15",
+  "scope": [
+    "built-in display owns readiness and one guest-frame acquisition",
+    "capture reuses the owned stereo snapshot and never resets display state",
+    "display FPS excludes capture presentations",
+    "cooperative playback audio preserves the external JIT helper session",
+    "scene activation and drawable-layout diagnostics"
+  ],
+  "checks": {
+    "optimizedProductionRouter": "pass; Swift -O, display/capture ordering, one acquisition, readiness and invalidation",
+    "nativeCompositorGPU": "pass on Mac Metal GPU in preceding repair pass; synthetic frames only",
+    "productionPresentationShaderGPU": "pass on Mac Metal GPU in preceding repair pass; crop, scaling, depth and reprojection",
+    "visionOSSimulatorAudioPolicy": "pass in preceding repair pass; actual AVAudioSession legacy/modern calls, idempotence, errors and options",
+    "sourceAudioPatch": "applies to pinned Madeira source",
+    "testScriptShellSyntax": "pass",
+    "signedReleaseDeviceBuild": "pass; persistent Xcode DerivedData/WineVisionVR-Device",
+    "strictRecursiveCodeSignature": "pass"
+  },
+  "headsetRoutingFixVerified": false,
+  "wholeSceneFreezeResolved": false,
+  "nativeBatteryFaultFixed": false,
+  "resolutionChanged": false,
+  "gameLaunchedByAgent": false,
+  "installation": "pending; CoreDevice error 4016, headset developer services currently unavailable",
+  "notes": "The audio-session interruption defect is fixed in source and the preserved-runtime adapter. Its attribution as the cause of the observed 53.9-second whole-process gap remains unproven. Tests do not claim game execution or FPS gains.",
+  "buildPath": "/Users/hudsonmcox/Library/Developer/Xcode/DerivedData/WineVisionVR-Device/Build/Products/Release-xros/WineVision VR.app"
+}

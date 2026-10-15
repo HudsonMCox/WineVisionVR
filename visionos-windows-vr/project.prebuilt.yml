@@ -127,6 +127,7 @@ targets:
       - framework: ../dist/windows-vr-air-writer-canonical/libWindowsVRAIRWriter.a
         embed: false
       - sdk: Metal.framework
+      - sdk: AVFAudio.framework
     sources:
       - path: ../windows-vr-native/Sources
       - path: ../windows-vr-native/include

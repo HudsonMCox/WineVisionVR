@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct VisionOSWindowsVRApp: App {
     @State private var launcherModel = LauncherModel()
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         // Before anything calls the compositor bridge, which reads this switch once.
@@ -15,6 +16,9 @@ struct VisionOSWindowsVRApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(model: launcherModel)
+                .onChange(of: scenePhase, initial: true) { _, phase in
+                    LaunchLogFile.append("lifecycle", "App scene phase=\(String(describing: phase)) uptime=\(ProcessInfo.processInfo.systemUptime) thermal=\(ProcessInfo.processInfo.thermalState.rawValue)")
+                }
         }
         .windowStyle(.automatic)
 

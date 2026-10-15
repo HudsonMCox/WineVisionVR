@@ -148,6 +148,7 @@ private final class WindowsVRCompositorRenderer {
     private var snapshotGeneration: UInt64 = 0
     private var snapshotTracking: WVRFrameTrackingV1?
     private var loggedMissingAnchor = false
+    private var lastDrawableLayout = ""
     private var lastFrameDiagnosticTime: TimeInterval = 0
     private var lastGPUStatisticsTime: TimeInterval = 0
     private var transferStatus: WindowsVRFrameTransferStatus?
@@ -336,19 +337,37 @@ private final class WindowsVRCompositorRenderer {
             return
         }
 
-        for drawable in drawables {
-            if publishTargets(for: drawable) {
+        if LaunchDiagnostics.enabled {
+            let layout = drawables.map { "target=\($0.target.rawValue) views=\($0.views.count)" }.joined(separator: "; ")
+            if layout != lastDrawableLayout {
+                lastDrawableLayout = layout
+                LaunchLogFile.append("compositor", "Drawable routing: \(layout); built-in display owns guest targets")
+            }
+        }
+
+        WindowsVRDrawableRouter.renderFrame(
+            drawables,
+            isDisplay: { $0.target == .builtIn },
+            prepareDisplay: { drawable in
+                guard publishTargets(for: drawable) else { return false }
                 publishFrameTracking(for: drawable)
-            } else {
+                return true
+            },
+            render: { drawable, consumeGuestFrame in
+                // Capture can be monocular and has its own viewport/format. It
+                // reuses the display snapshot and must not reset shared targets,
+                // tracking, controller state, or acquire another guest lease.
+                if !consumeGuestFrame, let display = drawables.first(where: { $0.target == .builtIn }) {
+                    drawable.deviceAnchor = display.deviceAnchor
+                }
+                render(drawable, consumeGuestFrame: consumeGuestFrame)
+            },
+            invalidateDisplay: {
                 wvr_compositor_pause_v1()
                 publishUnavailablePose()
                 controllerTracking.publishUnavailableState()
             }
-            // Keep submission balanced while ARKit is acquiring its first
-            // anchor. Skipping encodePresent here leaves a queried drawable
-            // without a presentation at endSubmission.
-            render(drawable)
-        }
+        )
         endSubmissionIfValid(frame)
     }
 
@@ -508,7 +527,7 @@ private final class WindowsVRCompositorRenderer {
         }
     }
 
-    private func render(_ drawable: LayerRenderer.Drawable) {
+    private func render(_ drawable: LayerRenderer.Drawable, consumeGuestFrame: Bool) {
         let encodeStartedAt = CACurrentMediaTime()
         if transferStatus?.failed == true {
             lastEyeSnapshots.removeAll()
@@ -531,9 +550,9 @@ private final class WindowsVRCompositorRenderer {
                 }
             }
         }
-        let acquireStatus = withUnsafeMutablePointer(to: &acquired) {
+        let acquireStatus = consumeGuestFrame ? withUnsafeMutablePointer(to: &acquired) {
             wvr_compositor_acquire_latest_stereo_frame_v2($0)
-        }
+        } : Int32(WVRCompositorStatusNoFrameAvailable.rawValue)
         let hasFrame = acquireStatus == 0 && acquired.lease != nil
         var renderTracking: WVRFrameTrackingV1? = nil
         if let lease = acquired.lease {
@@ -602,8 +621,8 @@ private final class WindowsVRCompositorRenderer {
                 EyeSource(texture: $0, slice: 0, x: 0, y: 0, width: $0.width, height: $0.height)
             }
         }
-        let matchesTarget = (hasFrame || lastEyeSnapshots.count == 2) && hasCurrentTargets && drawable.views.count == 2 && targets.count == 2 &&
-            sources.count == 2 && sources.allSatisfy { $0 != nil } && (!hasFrame || readyEvent != nil) &&
+        let matchesTarget = (hasFrame || lastEyeSnapshots.count == 2) && hasCurrentTargets && !drawable.views.isEmpty && drawable.views.count <= 2 &&
+            targets.count == drawable.views.count && sources.count == 2 && sources.allSatisfy { $0 != nil } && (!hasFrame || readyEvent != nil) &&
             targets.indices.allSatisfy { index in
                 guard let source = sources[index] else { return false }
                 return source.width <= Int(producerWidths[index]) &&
@@ -614,7 +633,7 @@ private final class WindowsVRCompositorRenderer {
                        source.x <= source.texture.width && source.y <= source.texture.height &&
                        source.width <= source.texture.width - source.x &&
                        source.height <= source.texture.height - source.y &&
-                       producerFormats[index] == targets[index].pixelFormat &&
+                       (!consumeGuestFrame || producerFormats[index] == targets[index].pixelFormat) &&
                        UInt32(source.texture.pixelFormat.rawValue) == producerFormats[index] &&
                        source.texture.device === layerRenderer.device
             }
@@ -726,7 +745,7 @@ private final class WindowsVRCompositorRenderer {
         // Both buffers must be committed in order after installing callbacks.
         if transferred { leaseCompletionBuffer.commit() }
         commandBuffer.commit()
-        if LaunchDiagnostics.enabled {
+        if LaunchDiagnostics.enabled && consumeGuestFrame {
             presentationCount &+= 1
             encodeMilliseconds += (CACurrentMediaTime() - encodeStartedAt) * 1000
             let elapsed = CACurrentMediaTime() - performanceStartedAt

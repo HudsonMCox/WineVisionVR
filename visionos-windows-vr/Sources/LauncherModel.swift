@@ -570,21 +570,20 @@ final class LauncherModel {
         #endif
     }
 
-    private static func configureAudioEnvironment() {
-        // Existing logs show 30–40 ms late wakes and buffer underruns. Keep
-        // more headroom, bounded by the native driver's actual buffer capacity;
-        // an explicit user setting still takes precedence. This adds buffering,
-        // not throughput, and cannot compensate for a stalled guest thread.
+    private static func configureAudioEnvironment() throws {
+        // The JIT helper uses a background audio session. Both the host and
+        // the preserved runtime's legacy activation must allow it to continue.
+        guard wvr_audio_session_install_mixing_policy_v1() == 0 else {
+            throw NSError(domain: "WineVision.AudioSession", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Could not configure cooperative audio for the JIT helper."
+            ])
+        }
         if getenv("MADEIRA_AUDIO_LEAD_MS") == nil { setenv("MADEIRA_AUDIO_LEAD_MS", "90", 0) }
         let audio = AVAudioSession.sharedInstance()
-        do {
-            try audio.setCategory(.playback)
-            try audio.setPreferredSampleRate(48_000)
-            try audio.setActive(true)
-            launchLog.notice("Audio session: actual rate=\(audio.sampleRate)Hz output latency=\(audio.outputLatency)s")
-        } catch {
-            launchLog.error("Audio session configuration failed: \(String(describing: error))")
-        }
+        try audio.setCategory(.playback, options: .mixWithOthers)
+        try audio.setPreferredSampleRate(48_000)
+        try audio.setActive(true)
+        launchLog.notice("Audio session: mixing enabled; actual rate=\(audio.sampleRate)Hz output latency=\(audio.outputLatency)s")
     }
 
     private static var guestDisplayLayer: CAMetalLayer?
@@ -650,7 +649,7 @@ final class LauncherModel {
                 _ = wvr_trace_thread_creation_v1("WindowsRuntimePlugin", documents.appendingPathComponent("launcher-log.txt").path)
             }
             Self.configureGraphicsEnvironment()
-            Self.configureAudioEnvironment()
+            try Self.configureAudioEnvironment()
             if launchManifest.id == "steam.shared" { try OpenXRRegistration.install(prefix: MadeiraDock.prefix) }
             try await runtime.launch(manifest: launchManifest, gameDirectory: gameDirectory)
             launchLog.notice("Launch: runtime accepted the launch")

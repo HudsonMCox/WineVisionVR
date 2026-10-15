@@ -113,6 +113,7 @@ targets:
     platform: visionOS
     dependencies:
       - sdk: Metal.framework
+      - sdk: AVFAudio.framework
     sources:
       - path: ../windows-vr-native/Sources
       - path: ../windows-vr-native/include
