@@ -54,6 +54,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         outputDesc.pixelFormat = MTLPixelFormatDepth32Float;
         id<MTLTexture> depth = [device newTextureWithDescriptor:outputDesc];
         MTLRenderPipelineDescriptor *pipelineDesc = [MTLRenderPipelineDescriptor new];
+        pipelineDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
         pipelineDesc.vertexFunction = [library newFunctionWithName:@"wvr_spatial_vertex"];
         pipelineDesc.fragmentFunction = [library newFunctionWithName:array ? @"wvr_spatial_array_fragment" : @"wvr_spatial_fragment"];
         pipelineDesc.colorAttachments[0].pixelFormat = output.pixelFormat;

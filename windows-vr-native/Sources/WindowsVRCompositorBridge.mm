@@ -198,6 +198,7 @@ uint32_t producerExtent(uint32_t drawableExtent, float scale) {
 }
 
 void invalidateTargetsLocked(BridgeState &bridge) {
+    wvr_guest_foveation_reset_v1();
     const bool changed = bridge.drawableWidth[0] != 0 || bridge.drawableWidth[1] != 0 ||
                          bridge.targets.width[0] != 0 || bridge.targets.width[1] != 0;
     while (bridge.count > 0) dropHeadLocked(bridge);
@@ -611,6 +612,9 @@ static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint
         os_unfair_lock_unlock(&bridge.lock);
         return WVRCompositorStatusNoFrameAvailable;
     }
+    if (bridge.sessionExitRequested) { os_unfair_lock_unlock(&bridge.lock); return WVRCompositorStatusNoFrameAvailable; }
+    wvr_guest_foveation_register_eye_v1(0, frame->leftTexture, frame->leftSlice, frame->leftX, frame->leftY, frame->leftWidth, frame->leftHeight);
+    wvr_guest_foveation_register_eye_v1(1, frame->rightTexture, frame->rightSlice, frame->rightX, frame->rightY, frame->rightWidth, frame->rightHeight);
     if (bridge.count == kQueueCapacity) dropHeadLocked(bridge);
     const size_t tail = (bridge.head + bridge.count) % kQueueCapacity;
     QueuedFrame &slot = bridge.queue[tail];

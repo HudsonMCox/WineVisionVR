@@ -1,0 +1,83 @@
+{
+  "date": "2026-10-15",
+  "baselineCommit": "f504e41",
+  "sourceRepository": "HudsonMCox/WineVisionVR",
+  "resolutionChanged": false,
+  "uniformEyeSizeBeforeExistingScale": [
+    1888,
+    1792
+  ],
+  "guestArtifact": {
+    "artifact": "d3d11.dll",
+    "baselineSha256": "27cc9ddbb2e159cb407ed0544e3820ee76c711c5b8515e2b7ef862664372711a",
+    "sha256": "0198768873328c9c2634d4ff4008130a30c9ce58c4afbe382bba7493d2994cf3",
+    "patch": "windows-vr-openxr/patches/0018-dxmt-eye-tracked-guest-foveation.patch",
+    "patchSha256": "b71314483a8a5d96618dffe3b871e2769e0e43703c04e670a7e242ed48211cd9",
+    "matchingImportExportContractVerified": true,
+    "nativeArchiveChanged": false,
+    "nativeCompanionChanged": true,
+    "transport": "492-byte packed request; existing slot 146, count 148 and transport ABI 1",
+    "validation": "docs/windows-vr-guest-foveation-validation.json",
+    "shaderWriterABI": 1,
+    "nativeCompanionSourcesSha256": {
+      "windows-vr-native/Sources/WindowsVRGuestFoveation.mm": "e48dd94c10d6c135f9f05d67769d8859e49ddddcf27d86906335cf989d70a0b8",
+      "windows-vr-native/include/WindowsVRGuestFoveation.h": "7d5f1167015d1fcd9543f292f5b13d5a35d84b2e2777dd16dcec5d16dc342ebf",
+      "windows-vr-native/shader-compiler/WindowsVRAIRFoveation.h": "652ed07e58beff873176122b9294e3b858472626bc31ba34669f0bec83558b1e",
+      "windows-vr-native/shader-compiler/WindowsVRAIRWriter.cpp": "7452367584770d69c713ab64573938825de72d80c5ffee457019f05a44ebdfa8"
+    }
+  },
+  "airWriter": {
+    "schemaVersion": 1,
+    "deploymentTarget": "visionOS 27.0",
+    "llvmRevision": "8dfdcc7b7bf66834a761bd8de445840ef68e4d1a",
+    "baselineArchiveSha256": "2a0abd83845813466161afd43da96373cf7c3433be776d0b65e2e96586c06ed6",
+    "archiveSha256": "4de3c3f1bf68d8e710bc740be9b4632c291217fc2b2f3ddd3e4ac10d3e277fe9",
+    "method": "Recompiled adapter.o with pinned LLVM 15 headers; all other writer/visionOS LLVM objects preserved; no JIT framework modification",
+    "sourceSha256": {
+      "windows-vr-native/Sources/WindowsVRGuestFoveation.mm": "e48dd94c10d6c135f9f05d67769d8859e49ddddcf27d86906335cf989d70a0b8",
+      "windows-vr-native/include/WindowsVRGuestFoveation.h": "7d5f1167015d1fcd9543f292f5b13d5a35d84b2e2777dd16dcec5d16dc342ebf",
+      "windows-vr-native/shader-compiler/WindowsVRAIRFoveation.h": "652ed07e58beff873176122b9294e3b858472626bc31ba34669f0bec83558b1e",
+      "windows-vr-native/shader-compiler/WindowsVRAIRWriter.cpp": "7452367584770d69c713ab64573938825de72d80c5ffee457019f05a44ebdfa8"
+    }
+  },
+  "openComposite": {
+    "baselineSha256": "230e5504c4fdb6564bd15de6358dbf3abbf286cbd4a411673bdbe822c3f673bf",
+    "sha256": "f38a67eae12a01217405ba56cef434a593bb7ad943173f69ceb8dd6fcd13b3e6",
+    "patch": "windows-vr-openvr/patches/0006-writable-application-state.patch",
+    "patchSha256": "b5ff91a52e170ada2226a798709708aa3f53e1e0c28a032190cca8de8a7499ef",
+    "exportsUnchanged": true,
+    "sharedCXXImports": false,
+    "gameTested": false,
+    "cause": "OpenComposite aborts writing applist.json beside a DLL symlinked into the read-only signed app bundle; hidden error dialog blocks initialization",
+    "storage": "Wine user local application data/OpenComposite/applist.json; manifest updates use same path"
+  },
+  "checks": {
+    "dependencyPatchExactRoundTrip": "pass: five source files, byte-exact overlay reproduction",
+    "productionPassAndShaderEligibility": "pass: including empty draws, merged safety, preload/resolve fence order",
+    "metalGPU": "pass: transport forwarding, changing/normalized maps, stereo slices, HDR MRT, sRGB, alpha, partial LOAD, depth, exact packed stencil, read-only stencil, stale/invalid fallback",
+    "productionAIRTransform": "pass: actual Metal AIR, IR verification, argument indices, reserved binding rejection, D3D12 exclusion even with binding 28, idempotency, GPU position x/y/z/w",
+    "sanitizers": "pass: ASan/UBSan packed-stencil and rewritten-position GPU probes; leak detection disabled for system Metal",
+    "layeredPresentation": "pass: production shader, two-layer VRR, both colors and nonzero depth",
+    "framePathRegressions": "pass: completion tickets, presentation math, compositor, frame transfer, GPU stats; 4096 baseline/patched pixels identical",
+    "packagingUnitTests": "pass: 15 tests",
+    "guestDLL": "pass: production ARM64EC build, unchanged import/export contract",
+    "productionPackageValidator": "pass: package accepted; stale D3D11 hash and missing D3D12 rejected",
+    "openVRClosure": "pass: x64 and self-contained C++ runtime",
+    "signedVisionOSBuild": "pass: Release, visionOS 27.0, Apple Development",
+    "signatureAndBundle": "pass: deep/strict codesign and Wine bootstrap/runtime validators",
+    "installation": "pass: org.avpplay.visionos-windows-vr installed on paired physical M2 Vision Pro",
+    "openCompositeWritableState": "pass: extracted production functions with JsonCpp; read-only DLL directory, writable per-user state, repeated discovery and manifest updates, bundled policy retained"
+  },
+  "gameLaunchedByAgent": false,
+  "headsetFPSMeasured": false,
+  "eyeFollowingVerifiedOnHeadset": false,
+  "foveationSource": "current CompositorServices per-eye rasterizationRateMaps; no raw gaze API",
+  "limitations": [
+    "Only validated submitted-eye resource identities; unknown offscreen G-buffers/reflections/shadows remain uniform",
+    "MSAA, queries, UAV side effects, geometry/tessellation/stream output, cropped atlases and unsupported builtins/formats remain uniform",
+    "Uniform preloads/resolves cost bandwidth; synthetic correctness does not establish game speedup",
+    "System map behavior under actual gaze must be validated on the target headset",
+    "No DLSS, MetalFX upscaling or frame generation added in this pass; no 90/120 FPS claim",
+    "Recorded BONEWORKS pre-render stall repaired; later game failures require a new run"
+  ]
+}

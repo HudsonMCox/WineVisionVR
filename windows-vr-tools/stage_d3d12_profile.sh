@@ -52,8 +52,9 @@ required={
  "windows-vr-openxr/patches/0015-dxmt-query-readback-efficiency.patch",
  "windows-vr-openxr/patches/0016-dxmt-event-query-flush-coalescing.patch",
  "windows-vr-openxr/patches/0017-dxmt-completed-event-result.patch",
+ "windows-vr-openxr/patches/0018-dxmt-eye-tracked-guest-foveation.patch",
  "windows-vr-openxr/include/WindowsVRD3D11ContextExt.h","windows-vr-openxr/include/WindowsVRD3D12CommandQueueExt.h","windows-vr-openxr/include/WindowsVRWMTBridge.h",
- "windows-vr-native/include/WindowsVRCompositorBridge.h","windows-vr-ngx/src/WVRMetalFXWMTBridge.h","windows-vr-ngx/src/WVRMetalFXWMTBridge.inc","windows-vr-ngx/include/WindowsVRNGX.h",
+ "windows-vr-native/include/WindowsVRCompositorBridge.h","windows-vr-native/include/WindowsVRGuestFoveation.h","windows-vr-ngx/src/WVRMetalFXWMTBridge.h","windows-vr-ngx/src/WVRMetalFXWMTBridge.inc","windows-vr-ngx/include/WindowsVRNGX.h",
  "windows-vr-metal/Sources/WindowsVRMetalABI/include/WindowsVRMetalC.h","windows-runtime-plugin/WindowsVRRuntimePlugin.mm","native-d3d12/wvr_dxmt_d3d12_native_abi.h","windows-vr-openxr/native-d3d12/generate_metallib_platform.py","windows-vr-openxr/src/WindowsVROpenXR.cpp","windows-vr-openxr/CMakeLists.txt","windows-vr-openvr/patches/0002-direct3d-openxr-build.patch","windows-vr-openvr/CMakeLists.txt","windows-vr-native/Sources/WindowsVRCompositorBridge.mm","windows-vr-tools/sources.lock.json","windows-vr-tools/llvm.lock.json",
  "windows-vr-tools/prepare_d3d12_experimental_source.sh","windows-vr-tools/prepare_d3d12_profile.sh","windows-vr-tools/build_d3d12_experimental.sh","windows-vr-tools/build_d3d12_profile.sh","windows-vr-tools/stage_d3d12_experimental.sh","windows-vr-tools/stage_d3d12_profile.sh","windows-vr-tools/stage_resources.py"
 }

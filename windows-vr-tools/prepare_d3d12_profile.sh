@@ -75,6 +75,7 @@ patches=[
  "windows-vr-openxr/patches/0015-dxmt-query-readback-efficiency.patch",
  "windows-vr-openxr/patches/0016-dxmt-event-query-flush-coalescing.patch",
  "windows-vr-openxr/patches/0017-dxmt-completed-event-result.patch",
+ "windows-vr-openxr/patches/0018-dxmt-eye-tracked-guest-foveation.patch",
 ]
 subprocess.run(["git","init","--quiet"],cwd=dest,check=True)
 for rel in patches:
@@ -92,6 +93,8 @@ headers=[
  ("windows-vr-openxr/include/WindowsVRWMTBridge.h","src/dxmt/WindowsVRWMTBridge.h"),
  ("windows-vr-openxr/include/WindowsVRWMTBridge.h","src/winemetal/WindowsVRWMTBridge.h"),
  ("windows-vr-native/include/WindowsVRCompositorBridge.h","src/winemetal/WindowsVRCompositorBridge.h"),
+ ("windows-vr-native/include/WindowsVRGuestFoveation.h","src/winemetal/WindowsVRGuestFoveation.h"),
+ ("windows-vr-native/include/WindowsVRGuestFoveation.h","src/winemetal/unix/WindowsVRGuestFoveation.h"),
  ("windows-vr-native/include/WindowsVRCompositorBridge.h","src/winemetal/unix/WindowsVRCompositorBridge.h"),
  ("windows-vr-ngx/src/WVRMetalFXWMTBridge.h","src/winemetal/unix/WVRMetalFXWMTBridge.h"),
  ("windows-vr-ngx/src/WVRMetalFXWMTBridge.inc","src/winemetal/unix/WVRMetalFXWMTBridge.inc"),

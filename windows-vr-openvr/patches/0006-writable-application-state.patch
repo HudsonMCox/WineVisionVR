@@ -1,0 +1,42 @@
+--- a/OpenOVR/Reimpl/BaseClientCore.cpp
++++ b/OpenOVR/Reimpl/BaseClientCore.cpp
+@@ -48,6 +48,21 @@
+ 	out << value;
+ }
+ 
++static wstring GetAppSettingsPath();
++
++// The runtime DLL may live in a signed, read-only app bundle. Mutable
++// application discovery/manifest state belongs to the user's Wine profile.
++static wstring GetOpenCompositeStatePath()
++{
++    const auto directory = std::filesystem::path(GetAppSettingsPath()) / L"OpenComposite";
++    std::error_code error;
++    std::filesystem::create_directories(directory, error);
++    if (error) {
++        OOVR_ABORTF("Failed to create OpenComposite state directory: %s", error.message().c_str());
++    }
++    return directory.wstring() + std::wstring(1, static_cast<wchar_t>(std::filesystem::path::preferred_separator));
++}
++
+ enum Runtime {
+ 	Default = 0,
+ 	OpenComposite = 1,
+@@ -61,7 +76,7 @@
+ 	return true;
+ #else
+ 	wstring dlldir = GetDllDir();
+-	wstring listname = dlldir + L"applist.json";
++	wstring listname = GetOpenCompositeStatePath() + L"applist.json";
+ 	wstring configname = dlldir + L"apps-config.json";
+ 
+ 	Json::Value tag(Json::ValueType::objectValue);
+@@ -286,7 +301,7 @@
+ 
+ void BaseClientCore::SetManifestPath(string filename)
+ {
+-	wstring listname = GetDllDir() + L"applist.json";
++	wstring listname = GetOpenCompositeStatePath() + L"applist.json";
+ 	Json::Value root;
+ 	ReadJson(listname, root);
+ 

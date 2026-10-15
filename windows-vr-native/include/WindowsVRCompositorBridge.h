@@ -317,3 +317,5 @@ WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_copy_stats_v1(WVRCompositorStatsV1 
 #endif
 
 #endif /* WINDOWS_VR_COMPOSITOR_BRIDGE_H */
+
+#include "WindowsVRGuestFoveation.h"

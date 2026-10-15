@@ -28,6 +28,8 @@ targets:
         OTHER_LDFLAGS: ["$(inherited)", "-lz", "-llzma"]
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_WVRUniformEyeWidth: 1888
+        INFOPLIST_KEY_WVRUniformEyeHeight: 1792
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_IDENTITY: Apple Development
         # Increased Memory Limit, the same single memory entitlement Madeira ships (its
@@ -112,6 +114,9 @@ targets:
     type: framework
     platform: visionOS
     dependencies:
+      - framework: ../dist/windows-vr-air-writer-foveation/libWindowsVRAIRWriter.a
+        embed: false
+      - sdk: QuartzCore.framework
       - sdk: Metal.framework
       - sdk: AVFAudio.framework
     sources:
@@ -121,6 +126,9 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.avpplay.windows-vr.native-bridge
+        GCC_PREPROCESSOR_DEFINITIONS: ["$(inherited)", "WVR_SOURCE_AIR_WRITER=1"]
+        LIBRARY_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/../dist/windows-vr-air-writer-foveation"]
+        EXPORTED_SYMBOLS_FILE: $(SRCROOT)/../windows-vr-native/shader-compiler/NativeBridge.exports
         GENERATE_INFOPLIST_FILE: YES
         CLANG_ENABLE_OBJC_ARC: YES
         CLANG_CXX_LANGUAGE_STANDARD: c++20

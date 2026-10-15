@@ -560,6 +560,8 @@ final class LauncherModel {
     /// Keep routine graphics logging inexpensive. Explicit DXMT overrides remain
     /// available for shader diagnosis without flooding the normal frame loop.
     private static func configureGraphicsEnvironment() {
+        let guestFoveation = wvr_guest_foveation_install_v1()
+        launchLog.notice("Guest foveation transport installed=\(guestFoveation != 0)")
         #if DEBUG
         if getenv("DXMT_LOG_LEVEL") == nil { setenv("DXMT_LOG_LEVEL", "info", 1) }
         // Shader capture performs startup disk writes; opt in only when needed.

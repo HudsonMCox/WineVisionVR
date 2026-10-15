@@ -1,0 +1,53 @@
+# SDK foveation in guest rendering
+
+This implements the CompositorServices/Metal rate-map path inside the D3D11 translation layer. It is more than a presentation filter: accepted game drawing commands rasterize into compressed intermediate attachments. The compositor also uses the exact system map for its own final presentation.
+
+Use the term **system-managed per-eye foveation**, rather than claiming application access to continuous eye positions. The app takes the maps supplied with the current drawable, follows their actual rate distribution and never substitutes a fixed center mask. The synthetic tests exercise changing maps; they cannot establish how the maps respond to gaze on the user's visionOS build. That requires headset validation. No gaze coordinate is reconstructed, exported or logged.
+
+## Implemented path
+
+1. Enable `isFoveationEnabled` only with supported foveated layouts. Apply the drawable's map to the final Metal render pass. Both array layers draw in one pass so clearing the second eye cannot erase the first. Layer-writing pipelines declare triangle topology.
+2. Preserve the existing uniform game resolution, 1888 × 1792 per eye before the existing render-scale setting. The different physical allocation sizes of system maps never become OpenXR swapchain sizes.
+3. Publish the two system maps and their layer indices to the native companion. Accept maps only while their publication is at most 25 ms old. Adapt their separable rate functions to the game's logical dimensions using public coordinate conversions. Inspect unit intervals, take maxima, dilate by a neighboring cell, and round rates upward; a cell-average alone can hide a smaller high-quality region. Parameters are immutable while GPU work uses them.
+4. Identify eye resources by the textures and subresources actually submitted through the compositor bridge. A first frame stays uniform until those identities are known. Texture views are matched to their root texture and absolute array slice. Texture dimensions alone are **not** proof of an eye-camera render domain.
+5. The versioned 492-byte guest request uses the existing Winemetal pointer transport, slot 146. Installation verifies the pinned table's 148 entries and transport ABI 1. Other ABI requests forward to the original handler. The preserved Wine/FEX/JIT framework is unchanged.
+6. Support one through eight floating/normalized color attachments, including HDR, and optional Depth32Float or packed Depth32Float_Stencil8. Packed stencil uses integer-exact copy shaders and preserves read-only depth/stencil semantics. Each color attachment preserves its own format, clear value, slice and load action. Scratch textures are retained for reuse and use Metal hazard tracking. The registry holds at most twelve eye subresources; its allocation cost still scales with each pass’s MRT formats and should be monitored on the headset.
+7. Preserve `LOAD`: after the original DXMT dependency waits, copy existing uniform contents into mapped attachments, then draw the game pass. Explicit internal fences chain preload encoders into the scene encoder. This preserves untouched regions of partial/transparent passes.
+8. Resolve all affected color attachments, depth and stencil back into the original uniform resources. Explicitly chain multiple resolve encoders. Signal DXMT's resource fences only on the final resolve encoder. SRVs, copies and later ordinary passes retain their original logical coordinates and resources.
+9. Rewrite the fragment `SV_Position` at the AIR compiler boundary using the same `air.map_physical_to_screen_coordinates` intrinsic emitted by Apple's Metal compiler for its documented rasterization-rate decoder. Append a reserved fragment map argument at buffer 28; preserve z/w and existing argument indices. Foveated passes bind their map, ordinary passes bind an identity map. The transform verifies IR, rejects binding collisions, and is idempotent for cached libraries.
+10. Enable rewriting only after the native transport and identity map are ready. The pinned D3D12 compiler's authoritative `rootsig` indirect-buffer metadata excludes that encoder path from the D3D11 transform. Missing/mismatched support leaves ordinary rendering active.
+
+## Coverage and performance limits
+
+This is not a claim that every pass in every game is now foveated. MSAA, unsupported depth/stencil formats, visibility queries, UAV side effects, geometry/tessellation/stream-output paths, cropped/atlas eye regions and unsupported built-in inputs retain uniform rendering. Reduced shading can change occlusion-query results or unordered side effects; removing those guards without implementing the corresponding semantics would be a correctness bug.
+
+Unknown offscreen resources also remain uniform. Deferred G-buffers and reflection/shadow targets require camera-domain-aware dependency propagation; equal dimensions or a downstream connection to an eye image are insufficient to prove the same camera projection. Consequently, Moss may receive only limited shading savings from this version. Submitted-eye pass counts and subsequent game GPU measurements must establish coverage before reporting a gain.
+
+The uniform resolve/preload boundaries add work, especially for bandwidth-heavy MRT or many small passes. They provide a correct compatibility boundary, not a guaranteed optimization for every workload. Keeping compatible resource chains compressed and resolving only at incompatible consumers is the next substantive optimization; it must include SRV sampling, depth reconstruction, compute/copy consumers and camera-domain tracking together. DLSS/MetalFX and frame generation are not included or counted as FPS improvements here.
+
+The native log reports accepted/resolved/rejected requests, accepted draw counts, unmatched resources, stale maps, the physical/logical map-area ratio and map-adaptation CPU time. These are activity counters, not game FPS. The current display and guest-frame telemetry remain separate. No headset/game FPS has been measured for this change, and no 90/120 FPS result is claimed.
+
+## BONEWORKS initialization repair
+
+The retrieved BONEWORKS run predates the earlier FPS batch. Its compositor and tracking remained alive, with zero submitted guest frames. OpenComposite's DLL initialization and C++ logging completed; startup then tried to write `applist.json` beside a runtime DLL symlinked into the signed, read-only application bundle. Wine reported access denied and opened an error dialog that was not visible in the immersive view. This explains the recorded pre-render initialization stall, not every historical BONEWORKS crash.
+
+OpenComposite patch 0006 puts mutable application discovery and manifest state in the Wine user's local application-data directory. Startup and manifest updates use the same path. Existing read-only runtime policy is still read from the DLL directory. Actual BONEWORKS execution must confirm whether any subsequent failure remains.
+
+## Validation
+
+- Real Metal tests on the Mac: changing and differently sized maps, both array slices, normalized and sRGB color, HDR MRT, alpha, depth, packed integer stencil, read-only stencil, partial `LOAD`, final-fence ordering, missing/stale maps, invalid extents/slices, unknown ABI and original transport forwarding.
+- Production AIR transform tested against actual Metal-generated position shaders, including IR verification, metadata indices, collision rejection, D3D12 exclusion, cache idempotency and GPU rendering. Identity mapping preserves ordinary `SV_Position` x/y/z/w too.
+- The exact production layered presentation shader tested with a two-layer rasterization-rate map and per-eye nonzero depth.
+- Optimized and ASan/UBSan native tests. Existing CPU, compositor, frame-transfer and GPU-statistics regressions plus 4096-pixel baseline/patched color/depth comparison.
+- Production guest DLL compiled with unchanged import/export contract. Patch round trip reproduces its source overlay. Production package validators and signed visionOS build are separate checks.
+- visionOS simulator does not advertise rate-map support; it cannot validate actual foveation or eye tracking. No game was launched by the agent.
+
+Run `windows-vr-tools/test_guest_foveation.sh [REWRITTEN_METALLIB]` for the native GPU checks. `windows-vr-openxr/tests/test_guest_foveation.py DXMT_SOURCE` exercises the production eligibility expressions. `AIRFoveationTests.cpp` requires the pinned LLVM 15 headers/libraries and DXMT writer; the integration uses a separately rebuilt AIR adapter, not a relink of the JIT framework. `build_air_writer.sh` records the new transform header and defaults to `dist/windows-vr-air-writer-foveation`.
+
+## Sources and applicability
+
+Apple's [CompositorServices rate maps](https://developer.apple.com/documentation/compositorservices/layerrenderer/drawable/rasterizationratemaps), [Metal rate-map rendering](https://developer.apple.com/documentation/metal/rendering-at-different-rasterization-rates), [scaling mapped content](https://developer.apple.com/documentation/metal/scaling-variable-rasterization-rate-content), and [Metal immersive rendering session](https://developer.apple.com/videos/play/wwdc2023/10089/) define the implementation contract. The installed visionOS 27 headers and Metal compiler output supply the actual ABI and intrinsic. ALVR's native renderer provides a reference for applying maps to layered presentation; its [historical eye-tracking investigation](https://github.com/alvr-org/alvr-visionos/issues/20) is also why system-map support must not be presented as proven app-visible gaze tracking.
+
+[POLO, ISCA 2025](https://www.immersivecomputinglab.org/wp-content/uploads/2025/05/ISCA_2025_POLO_final.pdf) motivates treating eye-to-render delay and uncertainty as quality constraints; its accelerator results do not predict this runtime's speedup. [A3FR, 2025](https://arxiv.org/abs/2507.04147) motivates measuring the overhead of adaptive decisions alongside saved shading; it targets a specialized scene representation. [MetaSapiens v2, 2026](https://arxiv.org/abs/2608.17969) likewise combines specialized neural representation and stereo methods, not an arbitrary D3D11 compatibility layer. These papers informed latency/overhead checks rather than supplying drop-in performance claims.
+
+Apple's [Foveated Streaming framework](https://developer.apple.com/videos/play/wwdc2026/286/) explicitly supports eye-tracked video optimization for external OpenXR/CloudXR endpoints. It is a different rendering architecture; connecting it does not supply a local Windows-to-Metal renderer or an unrestricted gaze API for this implementation.

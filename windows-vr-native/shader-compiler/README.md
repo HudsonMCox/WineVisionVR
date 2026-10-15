@@ -15,7 +15,7 @@ then invoke `windows-vr-tools/build_air_writer.sh` with:
 - `AVPPLAY_AIR_PLATFORM_HEADER`: `wvr_metallib_platform.h`, generated from the
   actual xros compiler reference and SDK version.
 
-The default output is `dist/windows-vr-air-writer-canonical`; choose a fresh
+The default output is `dist/windows-vr-air-writer-foveation`; choose a fresh
 `AVPPLAY_AIR_OUTPUT` for another build. The prebuilt XcodeGen project links the
 archive, enables `WVR_SOURCE_AIR_WRITER`, and restricts NativeBridge exports so
 its compiler implementation cannot replace symbols in the original runtime.
@@ -38,3 +38,10 @@ using both captured shader stages and the complete pipeline descriptors. An
 additional diagnostic that changed only the first failing shader's duplicated
 discard diamond also compiled. These checks establish compilation, not visible
 game frames or performance. On-device execution is left to the user.
+
+The foveation adapter also remaps D3D11 fragment positions through the system
+rate-map decoder and binds identity maps on uniform passes. It is enabled only
+after the matching native transport installs. D3D12 root-signature shaders are
+excluded, and an existing fragment buffer 28 is a hard collision. See
+`docs/windows-vr-guest-foveation.md` for the complete contract, coverage limits
+and real Metal tests. The source transform is `WindowsVRAIRFoveation.h`.

@@ -1,0 +1,225 @@
+--- a/src/d3d11/d3d11_shader.hpp
++++ b/src/d3d11/d3d11_shader.hpp
+@@ -209,6 +209,7 @@
+   virtual sm50_shader_t handle() = 0;
+   /* FIXME: exposed implementation detail */
+   virtual MTL_SHADER_REFLECTION &reflection() = 0;
++  virtual bool allowsFoveatedRaster() const = 0;
+   virtual MTL_SM50_SHADER_ARGUMENT *constant_buffers_info() = 0;
+   virtual MTL_SM50_SHADER_ARGUMENT *arguments_info() = 0;
+   virtual CompiledShader *get_shader(ShaderVariant variant) = 0;
+--- a/src/d3d11/d3d11_pipeline_cache.cpp
++++ b/src/d3d11/d3d11_pipeline_cache.cpp
+@@ -10,6 +10,7 @@
+ #include "../d3d10/d3d10_shader.hpp"
+ #include "../d3d10/d3d10_input_layout.hpp"
+ #include <cstring>
++#include "DXBCParser/DXBCUtils.h"
+ #include <shared_mutex>
+ 
+ namespace dxmt {
+@@ -72,14 +73,28 @@
+     sm50_shader_t shader = nullptr;
+     Sha1Digest sha1_;
+     MTL_SHADER_REFLECTION reflection_;
++    bool foveation_safe_ = false;
+     MTL_SM50_SHADER_ARGUMENT *arguments_info_buffer;
+     std::unordered_map<ShaderVariant, std::unique_ptr<CompiledShader>> variants;
+ 
+   public:
+     CachedSM50Shader(PipelineCache *cache, sm50_shader_t shader_transferred,
+-                     const Sha1Digest &hash, MTL_SHADER_REFLECTION &reflection)
++                     const Sha1Digest &hash, MTL_SHADER_REFLECTION &reflection, const void *bytecode)
+         : cache(cache), shader(shader_transferred), sha1_(hash),
+           reflection_(reflection) {
++      microsoft::CSignatureParser input;
++      if (SUCCEEDED(microsoft::DXBCGetInputSignature(bytecode, &input))) {
++        const microsoft::D3D11_SIGNATURE_PARAMETER *parameters = nullptr;
++        const auto count = input.GetParameters(&parameters);
++        foveation_safe_ = true;
++        for (unsigned i = 0; i < count; ++i) {
++          // The companion AIR writer remaps SV_Position with the system map.
++          // Other built-ins remain uniform until their semantics are supported.
++          if (parameters[i].SystemValue != microsoft::D3D10_SB_NAME_UNDEFINED &&
++              parameters[i].SystemValue != microsoft::D3D10_SB_NAME_POSITION)
++            foveation_safe_ = false;
++        }
++      }
+       if (reflection_.NumConstantBuffers + reflection_.NumArguments) {
+         arguments_info_buffer = (MTL_SM50_SHADER_ARGUMENT *)malloc(
+             sizeof(MTL_SM50_SHADER_ARGUMENT) *
+@@ -106,6 +121,7 @@
+ 
+     virtual sm50_shader_t handle() { return shader; };
+     virtual MTL_SHADER_REFLECTION &reflection() { return reflection_; }
++    bool allowsFoveatedRaster() const override { return foveation_safe_; }
+     virtual MTL_SM50_SHADER_ARGUMENT *constant_buffers_info() {
+       return arguments_info_buffer;
+     };
+@@ -235,7 +251,7 @@
+       SM50FreeError(err);
+       return nullptr;
+     }
+-    auto shader = std::make_unique<CachedSM50Shader>(this, sm50, sha1, reflection);
++    auto shader = std::make_unique<CachedSM50Shader>(this, sm50, sha1, reflection, pBytecode);
+     {
+       std::unique_lock<std::shared_mutex> lock(mutex_shares);
+       auto result = shaders_.find(sha1);
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -4847,8 +4847,14 @@
+     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
+     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
+ 
++    const auto ps = pipelineDesc.PixelShader;
++    const auto vs = pipelineDesc.VertexShader;
++    const bool foveationSafe = ps && vs && !pipelineDesc.GeometryShader &&
++        ps->allowsFoveatedRaster() && !ps->reflection().UAVSlotMask &&
++        !vs->reflection().UAVSlotMask && !ps->reflection().PixelShader.HasCoverageOutput;
+     device->CreateGraphicsPipeline(&pipelineDesc, &pipeline);
+-    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext& enc) {
++    EmitST([pso = std::move(pipeline), foveationSafe](ArgumentEncodingContext& enc) {
++      enc.currentRenderEncoder()->foveation_safe &= foveationSafe;
+       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
+       pso->GetPipeline(&GraphicsPipeline); // may block
+       if (!GraphicsPipeline.PipelineState)
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -214,6 +214,8 @@
+   uint8_t dsv_planar_flags;
+   uint8_t dsv_readonly_flags;
+   uint8_t render_target_count;
++  bool foveation_safe = true;
++  uint32_t foveation_draw_calls = 0;
+   bool use_visibility_result = 0;
+   bool use_tessellation = 0;
+   bool use_geometry = 0;
+@@ -611,6 +613,11 @@
+   encodeRenderCommand() {
+     assert(encoder_current->type == EncoderType::Render);
+     auto encoder = static_cast<RenderEncoderData *>(encoder_current);
++    if constexpr (std::is_same_v<cmd_struct,wmtcmd_render_draw> ||
++                  std::is_same_v<cmd_struct,wmtcmd_render_draw_indexed> ||
++                  std::is_same_v<cmd_struct,wmtcmd_render_draw_indirect> ||
++                  std::is_same_v<cmd_struct,wmtcmd_render_draw_indexed_indirect>)
++      ++encoder->foveation_draw_calls;
+     auto storage = (cmd_struct *)allocate_cpu_heap(sizeof(cmd_struct), 16);
+     encoder->cmd_tail->next.set(storage);
+     encoder->cmd_tail = (wmtcmd_base *)storage;
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "dxmt_context.hpp"
++#include "WindowsVRGuestFoveation.h"
+ #include "Metal.hpp"
+ #include "dxmt_command_queue.hpp"
+ #include "dxmt_deptrack.hpp"
+@@ -957,12 +958,79 @@
+         render_pass_info.visibility_buffer = readbacks.visibility->visibility_result_heap;
+       }
+       auto gpu_buffer_ = data->allocated_argbuf;
+-      auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
++      WVRGuestFoveationPassV1 foveation{};
++      foveation.abiVersion = WVR_GUEST_FOVEATION_ABI;
++      foveation.structSize = sizeof(foveation);
++      foveation.status = -1;
++      foveation.operation = 1;
++      const auto &color = render_pass_info.colors[0];
++      bool eligible = data->foveation_safe && data->foveation_draw_calls && data->last_pso && !data->use_visibility_result &&
++          !data->use_geometry && !data->use_tessellation && !data->use_emulated_so &&
++          data->render_target_count >= 1 && data->render_target_count <= 8 &&
++          render_pass_info.default_raster_sample_count == 1 &&
++          render_pass_info.render_target_array_length == 1 && color.texture &&
++          color.store_action == WMTStoreActionStore && !color.resolve_texture &&
++          !color.level && !color.depth_plane &&
++          !render_pass_info.depth.level && !render_pass_info.depth.depth_plane &&
++          !render_pass_info.stencil.level && !render_pass_info.stencil.depth_plane;
++      for (unsigned i=1; i<data->render_target_count; ++i) {
++        const auto &attachment=render_pass_info.colors[i];
++        eligible &= !attachment.resolve_texture && !attachment.level && !attachment.depth_plane;
++      }
++      static const bool foveationPeer = [] {
++        WVRGuestFoveationPassV1 caps{}; caps.abiVersion=WVR_GUEST_FOVEATION_ABI;
++        caps.structSize=sizeof(caps); caps.status=-1;
++        WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&caps));
++        return caps.status==0;
++      }();
++      if (eligible && foveationPeer) {
++        foveation.colorCount=data->render_target_count;
++        for (unsigned i=1;i<data->render_target_count;++i) {
++          const auto &attachment=render_pass_info.colors[i];
++          auto &out=foveation.additionalColors[i-1];
++          out.texture=attachment.texture;out.slice=attachment.slice;out.load=attachment.load_action;
++          out.clearColor[0]=attachment.clear_color.r;out.clearColor[1]=attachment.clear_color.g;
++          out.clearColor[2]=attachment.clear_color.b;out.clearColor[3]=attachment.clear_color.a;
++        }
++        foveation.flags = WVR_GUEST_FOVEATION_SAFE_SHADER;
++        foveation.commandBuffer = cmdbuf.handle;
++        foveation.colorTexture = color.texture;
++        foveation.depthTexture = render_pass_info.depth.texture;
++        foveation.stencilTexture=render_pass_info.stencil.texture;
++        foveation.stencilSlice=render_pass_info.stencil.slice;
++        foveation.stencilLoad=render_pass_info.stencil.load_action;
++        foveation.stencilClear=render_pass_info.stencil.clear_stencil;
++        foveation.depthStencilReadOnlyMask=data->dsv_readonly_flags;
++        foveation.drawCalls=data->foveation_draw_calls;
++        foveation.colorSlice = color.slice; foveation.depthSlice = render_pass_info.depth.slice;
++        foveation.width = render_pass_info.render_target_width;
++        foveation.height = render_pass_info.render_target_height;
++        foveation.colorLoad = color.load_action;
++        foveation.depthLoad = render_pass_info.depth.load_action;
++        foveation.clearColor[0] = color.clear_color.r; foveation.clearColor[1] = color.clear_color.g;
++        foveation.clearColor[2] = color.clear_color.b; foveation.clearColor[3] = color.clear_color.a;
++        foveation.clearDepth = render_pass_info.depth.clear_depth;
++        WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&foveation));
++      }
++      WMT::RenderCommandEncoder encoder{};
++      if (foveation.status == 0 && foveation.encoder) encoder.handle = foveation.encoder;
++      else encoder = cmdbuf.renderCommandEncoder(render_pass_info);
++      if (foveationPeer && foveation.status != 0) {
++        WVRGuestFoveationPassV1 uniform{};
++        uniform.abiVersion=WVR_GUEST_FOVEATION_ABI; uniform.structSize=sizeof(uniform);
++        uniform.operation=3; uniform.encoder=encoder.handle;
++        WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&uniform));
++      }
+       data->fence_wait.forEach(
+           data->fence_wait_vertex, // if a fence is waited pre-raster, no need to wait again at fragment
+           [&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStagePreRaster); },
+           [&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); }
+       );
++      if (foveation.status==0 && foveation.encoder) {
++        foveation.operation=4;
++        WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&foveation));
++        encoder.handle=foveation.encoder;
++      }
+       encoder.setVertexBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_VERTEX_BUFFER);
+       encoder.setVertexBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_CONSTANT_BUFFER);
+       encoder.setVertexBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_ARGUMENT_TABLE);
+@@ -1041,6 +1109,16 @@
+         );
+       }
+       encoder.encodeCommands(&data->cmd_head);
++      if (foveation.status == 0 && foveation.encoder) {
++        encoder.endEncoding();
++        foveation.operation = 2;
++        foveation.status = -1;
++        WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&foveation));
++        encoder.handle = foveation.encoder;
++      }
++      // Signal dependencies only after the uniform color/depth resolve. The
++      // compressed intermediate is hazard-tracked; guest resources keep their
++      // existing DXMT fences, SRVs, copies and logical coordinates.
+       data->fence_update_vertex.forEach(
+           data->fence_update, // if a fence is updated at fragment, no need to update again pre-raster
+           [&](auto id) { encoder.updateFence(fence_pool_[id], WMTRenderStageFragment); },
+@@ -1413,6 +1491,8 @@
+         r0->cmd_tail = (wmtcmd_base *)&r0->cmd_head;
+       }
+       r1->use_tessellation = r0->use_tessellation || r1->use_tessellation;
++      r1->foveation_safe = r0->foveation_safe && r1->foveation_safe;
++      r1->foveation_draw_calls += r0->foveation_draw_calls;
+       r1->use_geometry = r0->use_geometry || r1->use_geometry;
+       r1->use_emulated_so = r0->use_emulated_so || r1->use_emulated_so;
+       std::move(

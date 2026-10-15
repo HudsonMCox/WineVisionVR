@@ -2,3 +2,10 @@ _wvr_*
 _OBJC_CLASS_$_WVRFrameLease
 _OBJC_METACLASS_$_WVRFrameLease
 _WindowsVRNativeBridgeVersion*
+
+_wvr_guest_foveation_install_v1
+_wvr_guest_foveation_reset_v1
+_wvr_guest_foveation_publish_maps_v1
+_wvr_guest_foveation_register_eye_v1
+_wvr_guest_foveation_process_v1
+_wvr_guest_foveation_copy_stats_v1

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "WindowsVRAIRWriter.h"
 #include "WindowsVRAIRCanonicalization.h"
+#include "WindowsVRAIRFoveation.h"
 #include "wvr_metallib_platform.h"
 #include "metallib_writer.hpp"
 #include "llvm/Bitcode/BitcodeReader.h"
@@ -8,9 +9,12 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+static std::atomic<bool> foveationEnabled{false};
 
 static uint64_t readLE(const uint8_t *p, unsigned bytes) {
   uint64_t result = 0;
@@ -54,6 +58,7 @@ extern "C" int wvr_air_reemit(const uint8_t *input, size_t length,
   const uint32_t sdk[] = {WVR_METALLIB_SDK_MAJOR, WVR_METALLIB_SDK_MINOR};
   module->setModuleFlag(llvm::Module::Warning, "SDK Version",
       llvm::ConstantAsMetadata::get(llvm::ConstantDataArray::get(context, sdk)));
+  if (foveationEnabled.load() && !wvr_foveate_fragment_position(*module, diagnostics)) return fail(diagnostics);
   wvr_canonicalize_air(*module);
   if (llvm::verifyModule(*module, &diagnosticStream)) return fail(diagnosticStream.str());
   llvm::SmallVector<char, 0> library;
@@ -68,3 +73,6 @@ extern "C" int wvr_air_reemit(const uint8_t *input, size_t length,
   *outputLength = library.size();
   return 1;
 }
+
+extern "C" unsigned wvr_air_foveation_abi_v1(void) { return 1; }
+extern "C" void wvr_air_enable_foveation_v1(void) { foveationEnabled.store(true); }

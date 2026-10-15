@@ -49,14 +49,14 @@ for label, text in [('baseline', baseline), ('patched', current.read_text())]:
 
 for name, probe, sources in [
     ('presentation', 'SimulatorPresentationProbe.mm', []),
-    ('compositor', 'SimulatorCompositorProbe.mm', ['WindowsVRCompositorBridge.mm']),
-    ('frame-transfer', 'SimulatorFrameTransferProbe.mm', ['WindowsVRCompositorBridge.mm']),
+    ('compositor', 'SimulatorCompositorProbe.mm', ['WindowsVRCompositorBridge.mm', 'WindowsVRGuestFoveation.mm']),
+    ('frame-transfer', 'SimulatorFrameTransferProbe.mm', ['WindowsVRCompositorBridge.mm', 'WindowsVRGuestFoveation.mm']),
     ('gpu-statistics', 'SimulatorGPUStatisticsProbe.mm', ['WindowsVRMetalDiagnostics.mm'])
 ]:
     exe = build / name
     run(name + '-build', clang + ['-fobjc-arc', '-DWVR_SOURCE_AIR_WRITER=0', '-I', include,
         *[str(root / 'windows-vr-native/Sources' / s) for s in sources],
-        str(root / 'windows-vr-native/Tests' / probe), '-framework', 'Foundation',
+        str(root / 'windows-vr-native/Tests' / probe), '-framework', 'QuartzCore', '-framework', 'Foundation',
         '-framework', 'Metal', '-framework', 'CoreFoundation', '-o', str(exe)])
     if name == 'presentation':
         for label in ['baseline', 'patched']:
