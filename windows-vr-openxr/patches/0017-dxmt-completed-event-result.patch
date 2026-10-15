@@ -1,0 +1,31 @@
+--- a/src/d3d11/d3d11_query.hpp
++++ b/src/d3d11/d3d11_query.hpp
+@@ -121,6 +121,7 @@
+   virtual void Issue(uint64_t current_seq_id) = 0;
+   virtual EventState CheckEventState(uint64_t coherent_seq_id) = 0;
+   virtual bool RequestFlush() = 0;
++  virtual bool IsSignaled() const = 0;
+ };
+ 
+ template <typename DataType>
+@@ -155,6 +156,8 @@
+     }
+     return EventState::Stall;
+   };
++
++  bool IsSignaled() const override { return state == QueryState::Signaled; }
+ 
+   bool RequestFlush() override {
+     // Once Flush submits this query's preceding commands and event, later
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -414,7 +414,8 @@
+     case D3D11_QUERY_EVENT:
+     case D3D11_QUERY_TIMESTAMP_DISJOINT: {
+       eventQuery = static_cast<MTLD3D11EventQuery *>(pAsync);
+-      switch (eventQuery->CheckEventState(cmd_queue.SignaledEventSeqId())) {
++      switch (eventQuery->IsSignaled() ? EventState::Signaled :
++              eventQuery->CheckEventState(cmd_queue.SignaledEventSeqId())) {
+       case EventState::Pending:
+         break;
+       case EventState::Stall:

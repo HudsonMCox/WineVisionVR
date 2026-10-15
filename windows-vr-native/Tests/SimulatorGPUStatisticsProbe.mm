@@ -5,6 +5,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <atomic>
+#include <thread>
+#include <vector>
 int main(){ @autoreleasepool {
     wvr_metal_gpu_statistics_install();
     id<MTLDevice> device=MTLCreateSystemDefaultDevice();
@@ -34,5 +37,22 @@ int main(){ @autoreleasepool {
     if(!window || sscanf(window,"window guest GPUms=%lf queueMs=%lf presentation GPUms=%lf queueMs=%lf snapshot GPUms=%lf queueMs=%lf",
           &guestWindow,&guestQueue,&presentationWindow,&presentationQueue,&snapshotWindow,&snapshotQueue)!=6)return 7;
     if(guestWindow!=0 || guestQueue!=0 || presentationWindow!=0 || presentationQueue!=0 || snapshotWindow!=0 || snapshotQueue!=0)return 8;
-    puts("PASS: actual Metal commits/completions classified; window timings retire once; GPU work unchanged");
+    std::atomic<bool> good{true};
+    std::vector<std::thread> workers;
+    for (unsigned thread=0;thread<8;++thread) workers.emplace_back([&] { @autoreleasepool {
+        id<MTLCommandQueue> q=[device newCommandQueue];
+        id<MTLBuffer> data=[device newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        for (unsigned n=0;n<32;++n) {
+            id<MTLCommandBuffer> command=[q commandBuffer];
+            id<MTLBlitCommandEncoder> encoder=[command blitCommandEncoder];
+            [encoder fillBuffer:data range:NSMakeRange(0,256) value:0x2a];[encoder endEncoding];
+            [command commit];[command waitUntilCompleted];
+            if(command.status!=MTLCommandBufferStatusCompleted || ((unsigned char*)data.contents)[0]!=0x2a)good=false;
+        }
+    }});
+    for(auto& worker:workers)worker.join();
+    if(!good || !wvr_metal_copy_gpu_statistics(report,sizeof(report)) ||
+       !strstr(report,"guest submitted=257 completed=257 failed=0") || !strstr(report,"untracked=0"))return 9;
+    puts(report);
+    puts("PASS: actual Metal commits/completions classified; window timings retire once; 256 concurrent slot reuses preserve GPU output");
 }}

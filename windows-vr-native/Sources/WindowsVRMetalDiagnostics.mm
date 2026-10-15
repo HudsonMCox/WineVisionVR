@@ -7,7 +7,7 @@
 #import "WindowsVRMetalDiagnostics.h"
 #include <mutex>
 #include <chrono>
-#include <unordered_map>
+#include <array>
 #include <cstdio>
 #ifndef WVR_SOURCE_AIR_WRITER
 #define WVR_SOURCE_AIR_WRITER 0
@@ -450,8 +450,16 @@ GPUCounts& CountsForStage(GPUStage stage) {
         default: return guestGPU;
     }
 }
-std::unordered_map<uint64_t,GPUPending> pendingGPU;
-uint64_t gpuSequence=0, pendingOverflow=0;
+// Fixed slots avoid an allocation/free for every observed command buffer.
+struct PendingGPUStorage {
+    std::array<GPUPending, 4096> entries{};
+    std::array<size_t, 4096> freeSlots{};
+    size_t freeCount = entries.size();
+    PendingGPUStorage() {
+        for (size_t i = 0; i < freeSlots.size(); ++i) freeSlots[i] = i;
+    }
+} pendingGPU;
+uint64_t pendingOverflow=0;
 typedef void (*CommitIMP)(id,SEL);
 CommitIMP originalCommit=nullptr;
 // Metal GPU timestamps and mach_absolute_time use seconds since boot.
@@ -467,13 +475,14 @@ void ObserveCommit(id object,SEL selector) {
     const GPUStage stage=[buffer.label hasPrefix:@"wvr.presentation"] ? GPUStage::Presentation :
         ([buffer.label hasPrefix:@"wvr.snapshot"] ? GPUStage::Snapshot : GPUStage::Guest);
     const double committedAt=GPUClock();
-    uint64_t sequence;
+    size_t slot = pendingGPU.entries.size();
     {
         std::lock_guard<std::mutex> lock(gpuStatisticsMutex);
-        sequence=++gpuSequence;
         CountsForStage(stage).submitted++;
-        if(pendingGPU.size()<4096) pendingGPU.emplace(sequence,GPUPending{GPUClock(),stage});
-        else pendingOverflow++;
+        if (pendingGPU.freeCount) {
+            slot = pendingGPU.freeSlots[--pendingGPU.freeCount];
+            pendingGPU.entries[slot] = {committedAt, stage};
+        } else pendingOverflow++;
     }
     [buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         std::lock_guard<std::mutex> lock(gpuStatisticsMutex);
@@ -485,7 +494,10 @@ void ObserveCommit(id object,SEL selector) {
             counts.timed++; counts.gpuMS+=duration*1000;
             counts.queueMS+=std::max(0.0,completed.GPUStartTime-committedAt)*1000;
         }
-        pendingGPU.erase(sequence);
+        if (slot < pendingGPU.entries.size()) {
+            pendingGPU.entries[slot].time = 0;
+            pendingGPU.freeSlots[pendingGPU.freeCount++] = slot;
+        }
     }];
     originalCommit(object,selector);
 }
@@ -503,10 +515,23 @@ void wvr_metal_gpu_statistics_install(void) {
 }
 int wvr_metal_copy_gpu_statistics(char *buffer,uint32_t capacity) {
     if(!buffer || !capacity) return 0;
-    std::lock_guard<std::mutex> lock(gpuStatisticsMutex);
-    if(!originalCommit){buffer[0]=0;return 0;}
-    double guestAge=0,snapshotAge=0,presentationAge=0;const double now=GPUClock();
-    for(const auto& record:pendingGPU){auto& age=record.second.stage==GPUStage::Presentation?presentationAge:(record.second.stage==GPUStage::Snapshot?snapshotAge:guestAge);age=std::max(age,now-record.second.time);}
+    GPUCounts guest, snapshot, presentation, previousGuest, previousSnapshot, previousPresentation;
+    double guestAge=0,snapshotAge=0,presentationAge=0;
+    uint64_t overflow=0;
+    {
+        std::lock_guard<std::mutex> lock(gpuStatisticsMutex);
+        if(!originalCommit){buffer[0]=0;return 0;}
+        const double now=GPUClock();
+        for (const auto& record : pendingGPU.entries) {
+            if (!record.time) continue;
+            auto& age=record.stage==GPUStage::Presentation?presentationAge:(record.stage==GPUStage::Snapshot?snapshotAge:guestAge);
+            age=std::max(age,now-record.time);
+        }
+        guest=guestGPU; snapshot=snapshotGPU; presentation=presentationGPU;
+        previousGuest=previousGuestGPU; previousSnapshot=previousSnapshotGPU; previousPresentation=previousPresentationGPU;
+        previousGuestGPU=guestGPU; previousPresentationGPU=presentationGPU; previousSnapshotGPU=snapshotGPU;
+        overflow=pendingOverflow;
+    } // Formatting cannot block commit/completion bookkeeping.
     auto windowGPU=[](const GPUCounts& counts,const GPUCounts& previous) {
         const uint64_t timed=counts.timed-previous.timed;
         return timed ? (counts.gpuMS-previous.gpuMS)/timed : 0.0;
@@ -516,12 +541,11 @@ int wvr_metal_copy_gpu_statistics(char *buffer,uint32_t capacity) {
         return timed ? (counts.queueMS-previous.queueMS)/timed : 0.0;
     };
     std::snprintf(buffer,capacity,"guest submitted=%llu completed=%llu failed=%llu meanGPUms=%.3f oldestPending=%.3fs | presentation submitted=%llu completed=%llu failed=%llu meanGPUms=%.3f oldestPending=%.3fs | snapshot submitted=%llu completed=%llu failed=%llu meanGPUms=%.3f oldestPending=%.3fs | untracked=%llu | window guest GPUms=%.3f queueMs=%.3f presentation GPUms=%.3f queueMs=%.3f snapshot GPUms=%.3f queueMs=%.3f",
-        (unsigned long long)guestGPU.submitted,(unsigned long long)guestGPU.completed,(unsigned long long)guestGPU.failed,guestGPU.timed?guestGPU.gpuMS/guestGPU.timed:0,guestAge,
-        (unsigned long long)presentationGPU.submitted,(unsigned long long)presentationGPU.completed,(unsigned long long)presentationGPU.failed,presentationGPU.timed?presentationGPU.gpuMS/presentationGPU.timed:0,presentationAge,
-        (unsigned long long)snapshotGPU.submitted,(unsigned long long)snapshotGPU.completed,(unsigned long long)snapshotGPU.failed,snapshotGPU.timed?snapshotGPU.gpuMS/snapshotGPU.timed:0,snapshotAge,(unsigned long long)pendingOverflow,
-        windowGPU(guestGPU,previousGuestGPU),windowQueue(guestGPU,previousGuestGPU),
-        windowGPU(presentationGPU,previousPresentationGPU),windowQueue(presentationGPU,previousPresentationGPU),
-        windowGPU(snapshotGPU,previousSnapshotGPU),windowQueue(snapshotGPU,previousSnapshotGPU));
-    previousGuestGPU=guestGPU; previousPresentationGPU=presentationGPU; previousSnapshotGPU=snapshotGPU;
+        (unsigned long long)guest.submitted,(unsigned long long)guest.completed,(unsigned long long)guest.failed,guest.timed?guest.gpuMS/guest.timed:0,guestAge,
+        (unsigned long long)presentation.submitted,(unsigned long long)presentation.completed,(unsigned long long)presentation.failed,presentation.timed?presentation.gpuMS/presentation.timed:0,presentationAge,
+        (unsigned long long)snapshot.submitted,(unsigned long long)snapshot.completed,(unsigned long long)snapshot.failed,snapshot.timed?snapshot.gpuMS/snapshot.timed:0,snapshotAge,(unsigned long long)overflow,
+        windowGPU(guest,previousGuest),windowQueue(guest,previousGuest),
+        windowGPU(presentation,previousPresentation),windowQueue(presentation,previousPresentation),
+        windowGPU(snapshot,previousSnapshot),windowQueue(snapshot,previousSnapshot));
     return 1;
 }

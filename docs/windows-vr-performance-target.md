@@ -88,3 +88,12 @@ The October 15 host comparison reports 87.832 ms before and 3.426 ms after for t
 Headset validation: enable JIT, run the same Moss scene for 60–90 seconds, including the second-page transition, then close the app. Record which title was used (Moss or Moss 2). Compare fresh-frame intervals and guest/presentation/snapshot GPU queue times with the same resolution and settings; distinguish first-run shader compilation from sustained rendering. Actual frame rate, audio stability and immersive-space lifetime remain unverified until that run.
 
 The signed Debug and optimized Release app builds pass. The Release app passes strict recursive signature verification and was installed successfully on the paired M2 headset running visionOS 27.2. The installed D3D11 SHA-256 matches the recorded ARM64EC build. Build output lives outside cloud-synced Documents because Finder metadata there prevented signing. No game was launched by the agent; headset FPS and stability validation remain pending.
+
+## Shared frame-path batch — October 15
+
+The follow-up [17-change FPS batch](windows-vr-fps-batch.md) reduces compositor
+allocation/matrix work, native bridge and diagnostic bookkeeping, presentation
+shader work, and repeated completed-event reads. It preserves 1888×1792 eye
+resolution and exact pending GPU progress. The BONEWORKS startup logger repair
+from commit `adfdf25` remains included. See the batch's validation record for
+actual checks and installation status; no post-batch headset FPS is claimed.

@@ -1,0 +1,93 @@
+{
+  "date": "2026-10-15",
+  "baselineCommit": "adfdf25",
+  "sourceRepository": "HudsonMCox/WineVisionVR",
+  "changes": 17,
+  "resolutionChanged": false,
+  "eyeSize": [
+    1888,
+    1792
+  ],
+  "guestArtifact": {
+    "artifact": "d3d11.dll",
+    "baselineSha256": "a1f6f2ce74a23d90c238f6841aae585c7a6566d187239d5e7a21810cfd69cc17",
+    "sha256": "27cc9ddbb2e159cb407ed0544e3820ee76c711c5b8515e2b7ef862664372711a",
+    "patch": "windows-vr-openxr/patches/0017-dxmt-completed-event-result.patch",
+    "patchSha256": "d34b99e08815dc507bbdb380a51dff5100ab48a9bbf98006bb8dac6ad6b9c866",
+    "nativeArchiveChanged": false,
+    "matchingImportExportContractVerified": true,
+    "gpuEventSemantics": "Only previously observed positive completion is reused; pending queries read the exact Metal event every poll; Issue invalidates completion",
+    "validation": "docs/windows-vr-fps-batch-validation.json"
+  },
+  "checks": {
+    "ticket-build": "pass",
+    "tickets": "pass",
+    "math-build": "pass",
+    "math": "pass",
+    "presentation-build": "pass",
+    "presentation-baseline": "pass",
+    "presentation-patched": "pass",
+    "compositor-build": "pass",
+    "compositor": "pass",
+    "frame-transfer-build": "pass",
+    "frame-transfer": "pass",
+    "gpu-statistics-build": "pass",
+    "gpu-statistics": "pass",
+    "pixel-comparison": {
+      "pixels": 4096,
+      "maxChannelDifference": 0,
+      "maxDepthDifference": 0.0
+    },
+    "signedReleaseBuild": "pass; visionOS 27 SDK, Swift -O and optimized native bridge",
+    "profileShellSyntax": "pass",
+    "productionPackageValidator": "pass; accepts actual bundle, rejects stale hash and missing DLL",
+    "strictCodeSignature": "pass",
+    "bundledGuestArtifactHashes": "pass; rebuilt D3D11 and both BONEWORKS-repaired OpenComposite copies verified"
+  },
+  "queryChecks": {
+    "pendingPolls": 250000,
+    "exactGPUReadsWhilePending": 250000,
+    "flushCallsWhilePending": 1,
+    "completedReads": 10000,
+    "additionalGPUReadsAfterObservedCompletion": 0,
+    "reissueAndDONOTFLUSH": "pass",
+    "exactSignalOrdering": "pass",
+    "readback": "pass",
+    "encoderBoundaries": "pass",
+    "queryPublicationThreadSanitizer": "pass"
+  },
+  "simulator": {
+    "runtime": "visionOS 27.0",
+    "presentation": "pass",
+    "compositorBridge": "pass",
+    "note": "Original simulator device disappeared during startup; isolated compatible device created for validation. Host GPU suite independently passed.",
+    "frameTransferOwnership": "pass",
+    "concurrentGPUStatistics": "pass; eight queues, 256 slot reuses"
+  },
+  "gameLaunchedByAgent": false,
+  "postChangeHeadsetFPSMeasured": false,
+  "installedOnHeadset": true,
+  "evidenceDirectory": ".build-fps-batch/",
+  "limitations": [
+    "CPU and synthetic GPU correctness checks do not establish game FPS or 120 FPS feasibility.",
+    "The native JIT framework and game binaries are preserved.",
+    "Pending event polls still cross the native Metal bridge; only confirmed completed results are cached."
+  ],
+  "sourceSha256": {
+    "visionos-windows-vr/Sources/Rendering/WindowsVRCompositorScene.swift": "2f802fc4b6f39bb77d087a96b73f7709a3b639f4be4abf6bfa97176f18c9a6cf",
+    "visionos-windows-vr/Sources/Rendering/WindowsVRPresentationMath.swift": "66778613c1b73777dcff740e48949266d534f6f5b673e7d8cb9f0afe3bc15350",
+    "visionos-windows-vr/Sources/Rendering/WindowsVRControllerProvider.swift": "1fd9e8ba005e1ed963e29b7f3209c45d9f53d8af71cb5aec81729fb6973f3181",
+    "windows-vr-native/Sources/WindowsVRCompositorBridge.mm": "21b832aa3099f1dd944ebf1dd8e41d836bb27747725ac7030c90d7903ca12887",
+    "windows-vr-native/Sources/WindowsVRMetalDiagnostics.mm": "e11e8af0507772ca17139f6e6568195a413c889f1612f85f1bab72919f8e0f9f",
+    "windows-vr-native/include/WindowsVRCompletionWindow.h": "f5e1643288fe1a4fce835a55171c43b976ce2a15e36a3acac27e299d1f727d58",
+    "windows-vr-openxr/patches/0017-dxmt-completed-event-result.patch": "d34b99e08815dc507bbdb380a51dff5100ab48a9bbf98006bb8dac6ad6b9c866"
+  },
+  "installation": {
+    "status": "success",
+    "bundleID": "org.avpplay.visionos-windows-vr",
+    "configuration": "Release",
+    "target": "visionOS 27.0",
+    "headset": "paired M2 Vision Pro",
+    "gameLaunchedByAgent": false
+  }
+}

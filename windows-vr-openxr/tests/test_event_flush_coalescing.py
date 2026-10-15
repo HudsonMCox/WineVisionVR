@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 import subprocess
 import tempfile
-p=argparse.ArgumentParser();p.add_argument('source',type=Path);p.add_argument('--baseline',action='store_true');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('source',type=Path);p.add_argument('--baseline',action='store_true');p.add_argument('--completed-cache',action='store_true');a=p.parse_args()
 s=(a.source/'src/d3d11/d3d11_query.hpp').read_text()
 enums=s[s.index('enum class QueryState'):s.index('template <typename DataType>\nclass MTLD3D11EventQueryImpl')]
 methods=s[s.index('  void Issue(uint64_t current_seq_id) override'):s.index('class MTLD3D11OcclusionQuery')]
@@ -55,6 +55,11 @@ int main(){
  // Signal is observable before the containing command chunk completes.
  bool chunkCompleted=false;c.cmd_queue.signal=10;assert(!chunkCompleted);
  assert(c.GetData(&q,nullptr,0,0)==S_OK);assert(c.flushes==expected);
+ // Once positively signaled, completed reads can reuse that exact answer.
+ const auto completedReads=c.cmd_queue.reads;
+ for(unsigned n=0;n<10000;++n)assert(c.GetData(&q,nullptr,0,0)==S_OK);
+ assert(c.cmd_queue.reads==completedReads+(COMPLETED_CACHE?0:10000));
+ std::printf("completed queries=10000 extra GPU reads=%llu\n",(unsigned long long)(c.cmd_queue.reads-completedReads));
  // A new issue must submit independently; no per-object permanent latch.
  q.Issue(11);assert(c.GetData(&q,nullptr,0,0)==S_FALSE);assert(c.flushes==expected+1);
  c.cmd_queue.signal=11;BOOL ready=0;assert(c.GetData(&q,&ready,sizeof ready,0)==S_OK&&ready);
@@ -76,5 +81,5 @@ int main(){
 '''
 with tempfile.TemporaryDirectory(prefix='winevision-event-flush-') as t:
  cpp=Path(t)/'test.cpp';exe=Path(t)/'test';cpp.write_text(code)
- subprocess.run(['xcrun','--sdk','macosx','clang++','-std=c++20','-O2',f'-DBASELINE={int(a.baseline)}',str(cpp),'-o',str(exe)],check=True)
+ subprocess.run(['xcrun','--sdk','macosx','clang++','-std=c++20','-O2',f'-DBASELINE={int(a.baseline)}',f'-DCOMPLETED_CACHE={int(a.completed_cache)}',str(cpp),'-o',str(exe)],check=True)
  subprocess.run([str(exe)],check=True,timeout=30)

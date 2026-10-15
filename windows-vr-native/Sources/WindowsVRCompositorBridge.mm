@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <set>
+#include "WindowsVRCompletionWindow.h"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -30,11 +30,14 @@ const char *const kCallNames[CallCount] = {
     "bind-metal-device", "publish-targets", "copy-targets", "copy-readiness", "submit-stereo-v1",
     "submit-stereo-v2", "copy-frame-tracking", "copy-controller-state", "publish-frame-tracking", "submit-v2-reject"};
 
-void traceBridgeCall(BridgeCall call, const char *detail) {
+uint32_t shouldTraceBridgeCall(BridgeCall call) {
     static const bool enabled = getenv("WVR_TRACE_BRIDGE") != nullptr;
-    if (!enabled) return;
+    if (!enabled) return false;
     const uint32_t count = g_callCounts[call].fetch_add(1, std::memory_order_relaxed) + 1;
-    if (count > 4 && (count & (count - 1)) != 0) return;
+    return (count <= 4 || (count & (count - 1)) == 0) ? count : 0;
+}
+
+void writeBridgeTrace(BridgeCall call, uint32_t count, const char *detail) {
     static NSString *path = [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)
         firstObject] stringByAppendingPathComponent:@"launcher-log.txt"];
     if (!path) return;
@@ -50,6 +53,18 @@ void traceBridgeCall(BridgeCall call, const char *detail) {
     close(fd);
 }
 
+void traceBridgeCall(BridgeCall call, const char *detail) {
+    if (const auto count = shouldTraceBridgeCall(call)) writeBridgeTrace(call, count, detail);
+}
+template<typename... Args>
+void traceBridgeCallf(BridgeCall call, const char *format, Args... args) {
+    const auto count = shouldTraceBridgeCall(call);
+    if (!count) return;
+    char detail[480];
+    std::snprintf(detail, sizeof(detail), format, args...);
+    writeBridgeTrace(call, count, detail);
+}
+
 /// A producer event is usable when Metal reports it as belonging to the compositor's device, or does not report a
 /// device at all. Shared events created by another component in this process (the guest graphics layer's queue
 /// event) can answer nil; the frame's textures are already required to belong to this device, so a nil answer
@@ -62,6 +77,7 @@ bool eventUsable(id<MTLSharedEvent> event, id<MTLDevice> device) {
 
 constexpr size_t kQueueCapacity = 3;
 constexpr uint64_t kMaxOutstandingTickets = kQueueCapacity * 2;
+static_assert(kMaxOutstandingTickets == kWVRCompletionWindowCapacity);
 
 struct QueuedFrame {
     uint64_t ticket = 0;
@@ -87,7 +103,7 @@ public:
     uint64_t nextTicket = 1;
     uint64_t lastSignaledTicket = 0;
     uint64_t outstandingLeases = 0;
-    std::set<uint64_t> completedTickets;
+    uint64_t completedTicketMask = 0;
     WVRRenderTargetInfoV1 targets = {
         WVR_COMPOSITOR_ABI_VERSION,
         sizeof(WVRRenderTargetInfoV1),
@@ -108,6 +124,7 @@ public:
     };
     std::array<WVRFrameTrackingV1, 512> trackingHistory{};
     size_t trackingHistoryNext = 0;
+    size_t trackingHistoryCount = 0;
     WVRCompositorStatsV1 stats = {
         WVR_COMPOSITOR_ABI_VERSION,
         sizeof(WVRCompositorStatsV1),
@@ -138,10 +155,14 @@ int newestReadyOffsetLocked(const BridgeState &bridge) {
 WVRFrameTrackingV1 trackingForTimestampLocked(const BridgeState &bridge, uint64_t timestamp) {
     WVRFrameTrackingV1 result{};
     uint64_t closest = 2'000'001; // Allow timestamp rounding, never substitute the current pose.
-    for (const auto &sample : bridge.trackingHistory) {
+    for (size_t index = 0; index < bridge.trackingHistoryCount; ++index) {
+        const auto &sample = bridge.trackingHistory[index];
         if (!(sample.flags & WVRDevicePoseTracked) || !sample.timestampNanoseconds) continue;
         const auto delta = timestamp >= sample.timestampNanoseconds ? timestamp - sample.timestampNanoseconds : sample.timestampNanoseconds - timestamp;
-        if (delta < closest) { closest = delta; result = sample; }
+        if (delta < closest) {
+            closest = delta; result = sample;
+            if (delta == 0) return result;
+        }
     }
     return result;
 }
@@ -152,12 +173,8 @@ void clearSlot(QueuedFrame &slot) {
 
 void markTicketCompleteLocked(BridgeState &bridge, uint64_t ticket) {
     if (ticket <= bridge.lastSignaledTicket) return;
-    bridge.completedTickets.insert(ticket);
-    while (bridge.lastSignaledTicket != UINT64_MAX &&
-           bridge.completedTickets.erase(bridge.lastSignaledTicket + 1) != 0) {
-        ++bridge.lastSignaledTicket;
-    }
-    if (bridge.consumerEvent) {
+    const bool advanced = wvrCompleteTicket(ticket, bridge.lastSignaledTicket, bridge.completedTicketMask);
+    if (advanced && bridge.consumerEvent) {
         bridge.consumerEvent.signaledValue = bridge.lastSignaledTicket;
     }
     ++bridge.stats.completedFrames;
@@ -236,6 +253,7 @@ void updateTargetsLocked(BridgeState &bridge,
 void clearTrackingLocked(BridgeState &bridge) {
     bridge.trackingHistory = {};
     bridge.trackingHistoryNext = 0;
+    bridge.trackingHistoryCount = 0;
     bridge.tracking.flags = 0;
     bridge.tracking.timestampNanoseconds = 0;
     std::fill_n(bridge.tracking.originFromDevice, 16, 0.0f);
@@ -363,7 +381,7 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_bind_metal_device_v1(voi
     if (bridge.device != device) {
         const bool targetsLive = bridge.drawableWidth[0] != 0 || bridge.drawableWidth[1] != 0;
         if (targetsLive || bridge.count != 0 || bridge.outstandingLeases != 0 ||
-            !bridge.completedTickets.empty()) {
+            bridge.completedTicketMask != 0) {
             os_unfair_lock_unlock(&bridge.lock);
             return WVRCompositorStatusIncompatibleTexture;
         }
@@ -444,10 +462,8 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_publish_targets_v1(
     uint32_t leftWidth, uint32_t leftHeight, uint32_t leftPixelFormat,
     uint32_t rightWidth, uint32_t rightHeight, uint32_t rightPixelFormat) {
     {
-        char detail[96];
-        std::snprintf(detail, sizeof(detail), "left=%ux%u fmt=%u right=%ux%u fmt=%u",
+        traceBridgeCallf(CallPublishTargets, "left=%ux%u fmt=%u right=%ux%u fmt=%u",
                       leftWidth, leftHeight, leftPixelFormat, rightWidth, rightHeight, rightPixelFormat);
-        traceBridgeCall(CallPublishTargets, detail);
     }
     const bool allZero = leftWidth == 0 && leftHeight == 0 && leftPixelFormat == 0 &&
                          rightWidth == 0 && rightHeight == 0 && rightPixelFormat == 0;
@@ -480,10 +496,8 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_copy_targets_v1(
     *outInfo = bridge.targets;
     os_unfair_lock_unlock(&bridge.lock);
     {
-        char detail[96];
-        std::snprintf(detail, sizeof(detail), "left=%ux%u right=%ux%u", outInfo->width[0], outInfo->height[0],
+        traceBridgeCallf(CallCopyTargets, "left=%ux%u right=%ux%u", outInfo->width[0], outInfo->height[0],
                       outInfo->width[1], outInfo->height[1]);
-        traceBridgeCall(CallCopyTargets, detail);
     }
     return WVRCompositorStatusOK;
 }
@@ -507,10 +521,8 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_copy_readiness_v1(
     outReadiness->trackingTimestampNanoseconds = bridge.tracking.timestampNanoseconds;
     os_unfair_lock_unlock(&bridge.lock);
     {
-        char detail[96];
-        std::snprintf(detail, sizeof(detail), "device=%u targets=%u headPose=%u", outReadiness->metalDeviceBound,
+        traceBridgeCallf(CallCopyReadiness, "device=%u targets=%u headPose=%u", outReadiness->metalDeviceBound,
                       outReadiness->stereoTargetsPublished, outReadiness->trackedHeadPoseAvailable);
-        traceBridgeCall(CallCopyReadiness, detail);
     }
     return WVRCompositorStatusOK;
 }
@@ -518,8 +530,7 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_copy_readiness_v1(
 extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_submit_stereo_frame_v1(
     const WVRSubmitStereoFrameV1 *frame, uint64_t *outCompositorTicket) {
     const int32_t status = submitStereoFrame(frame, 0, false, outCompositorTicket);
-    char detail[48]; std::snprintf(detail, sizeof(detail), "status=%d", status);
-    traceBridgeCall(CallSubmitV1, detail);
+    traceBridgeCallf(CallSubmitV1, "status=%d", status);
     return status;
 }
 
@@ -534,9 +545,7 @@ static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint
 extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_submit_stereo_frame_v2(
     const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket) {
     const int32_t status = submitStereoFrameV2Impl(frame, outCompositorTicket);
-    char detail[48]; std::snprintf(detail, sizeof(detail), "status=%d", status);
-    // Rejections are always worth a line; the traced call counter already bounds successes.
-    traceBridgeCall(CallSubmitV2, detail);
+    traceBridgeCallf(CallSubmitV2, "status=%d", status);
     return status;
 }
 
@@ -784,6 +793,7 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_publish_frame_tracking_v
     if ((flags & WVRDevicePoseTracked) && timestampNanoseconds) {
         bridge.trackingHistory[bridge.trackingHistoryNext] = bridge.tracking;
         bridge.trackingHistoryNext = (bridge.trackingHistoryNext + 1) % bridge.trackingHistory.size();
+        bridge.trackingHistoryCount = std::min(bridge.trackingHistoryCount + 1, bridge.trackingHistory.size());
     }
     os_unfair_lock_unlock(&bridge.lock);
     return WVRCompositorStatusOK;

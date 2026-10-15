@@ -173,15 +173,14 @@ final class WindowsVRControllerProvider: @unchecked Sendable {
         }
 
         let tracked = predictedAnchor?.isTracked == true
-        let matrix = tracked
-            ? matrixValues(predictedAnchor!.originFromAnchorTransform)
-            : matrixValues(matrix_identity_float4x4)
+        var matrix = tracked ? predictedAnchor!.originFromAnchorTransform : matrix_identity_float4x4
         let flags: UInt32 = (tracked ? 0b011 : 0) | (controller == nil ? 0 : 0b100)
         if LaunchDiagnostics.enabled && timestamp - (lastDiagnosticByRole[role] ?? 0) >= 5 {
             lastDiagnosticByRole[role] = timestamp
             LaunchLogFile.append("controllers", "role=\(role) connected=\(controller != nil) tracked=\(tracked) flags=\(flags) buttons=\(buttons) trigger=\(trigger) grip=\(grip) stick=\(stickX),\(stickY)")
         }
-        matrix.withUnsafeBufferPointer { buffer in
+        withUnsafeBytes(of: &matrix) { bytes in
+            let buffer = bytes.bindMemory(to: Float.self)
             _ = wvr_compositor_publish_controller_state_v1(
                 role, flags, UInt64(max(0, timestamp * 1.0e9)), buffer.baseAddress,
                 buttons, trigger, grip, stickX, stickY
@@ -258,8 +257,9 @@ final class WindowsVRControllerProvider: @unchecked Sendable {
     }
 
     private func publishUnavailable(role: UInt32) {
-        let identity = matrixValues(matrix_identity_float4x4)
-        identity.withUnsafeBufferPointer { buffer in
+        var identity = matrix_identity_float4x4
+        withUnsafeBytes(of: &identity) { bytes in
+            let buffer = bytes.bindMemory(to: Float.self)
             _ = wvr_compositor_publish_controller_state_v1(role, 0, 0, buffer.baseAddress, 0, 0, 0, 0, 0)
         }
     }
@@ -350,14 +350,7 @@ final class WindowsVRControllerProvider: @unchecked Sendable {
         names.lazy.compactMap(read).first ?? 0
     }
 
-    private func matrixValues(_ matrix: simd_float4x4) -> [Float] {
-        [
-            matrix.columns.0.x, matrix.columns.0.y, matrix.columns.0.z, matrix.columns.0.w,
-            matrix.columns.1.x, matrix.columns.1.y, matrix.columns.1.z, matrix.columns.1.w,
-            matrix.columns.2.x, matrix.columns.2.y, matrix.columns.2.z, matrix.columns.2.w,
-            matrix.columns.3.x, matrix.columns.3.y, matrix.columns.3.z, matrix.columns.3.w
-        ]
-    }
+
 
     deinit {
         anchorUpdatesTask?.cancel()
