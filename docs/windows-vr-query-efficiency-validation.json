@@ -1,0 +1,73 @@
+{
+  "date": "2026-10-15",
+  "sourceRevision": "e94c312f5c054263acf261cfa109edf13e757587",
+  "patch": "windows-vr-openxr/patches/0015-dxmt-query-readback-efficiency.patch",
+  "patchSha256": "f92ea6d7ab6fcc4a20818ae8208a09c8f5d5193a615d544863d00dcf4b1097c1",
+  "compiler": "Apple clang 21.0.0 (clang-2100.3.34.2), arm64 host, -O2",
+  "cachedReadAllocations": {
+    "readsPerType": 10000,
+    "types": [
+      "occlusion",
+      "occlusion-predicate",
+      "timestamp"
+    ],
+    "baselinePerType": 10000,
+    "patchedPerType": 0
+  },
+  "readbackMicrobenchmark": {
+    "rounds": 256,
+    "samplesPerRound": 65536,
+    "baselineMilliseconds": 87.832,
+    "patchedMilliseconds": 3.426,
+    "scope": "CPU summation of synthetic immutable samples using production query methods; not GPU time or game FPS"
+  },
+  "checks": {
+    "queryLifecycle": "pass",
+    "queryLifecycleThreadSanitizer": "pass with full Xcode DEVELOPER_DIR",
+    "queryLifecycleAddressAndUndefinedSanitizers": "pass with full Xcode DEVELOPER_DIR",
+    "queryPublication": "pass",
+    "queryPublicationThreadSanitizer": "pass with full Xcode DEVELOPER_DIR",
+    "exactGPUEventOrdering": "pass",
+    "vrEncoderBoundaries": "pass",
+    "visionOSProductionQuerySyntax": "pass using native compatibility headers; not an ARM64EC build",
+    "profileShellSyntax": "pass",
+    "arm64ecD3D11Build": "pass; Meson/Ninja production DLL and Wine builtin postprocessing",
+    "D3D11ImportsAndExports": "pass; identical 351 normalized import/export entries to baseline",
+    "signedDebugDeviceBuild": "pass",
+    "signedReleaseDeviceBuild": "pass; Swift -O, optimized native bridge, D3D11 -O3",
+    "strictCodeSignature": "pass; codesign --verify --deep --strict with development trust store access",
+    "productionPackageValidation": "pass; accepts actual package, rejects stale D3D11 hash and missing D3D12 DLL",
+    "profileStagingInputSet": "pass; current prepared patch set matches staging requirements"
+  },
+  "resolutionChanged": false,
+  "gpuEventSemanticsChanged": false,
+  "bundledDLLUpdated": true,
+  "installedOnHeadset": true,
+  "gameTested": false,
+  "moss2FPSMeasured": false,
+  "buildLimitation": null,
+  "sanitizerToolchainNote": "Default command-line-tools sanitizer startup failed on an empty probe; full Xcode DEVELOPER_DIR sanitizer checks passed.",
+  "dllSha256": "f84e0d73f09a478391a7637d4e838e4b9dc7d6300962ca49618fe591edf4a095",
+  "baselineDLLSha256": "22e0a6b406d866112ff99c9227c44f917cf08947168f6007c25f399895d2e63a",
+  "nativeJITFrameworkChanged": false,
+  "originalFullBuildReceiptPreserved": true,
+  "sourceRepository": "HudsonMCox/WineVisionVR",
+  "installation": {
+    "status": "success",
+    "bundleID": "org.avpplay.visionos-windows-vr",
+    "configuration": "Release",
+    "target": "visionOS 27.0; installed on paired visionOS 27.2 M2 headset",
+    "gameLaunchedByAgent": false
+  },
+  "evidence": [
+    "/private/tmp/winevision-cpu-d3d11-build.log",
+    "/private/tmp/winevision-cpu-query-baseline.log",
+    "/private/tmp/winevision-cpu-query-optimized.log",
+    "/private/tmp/winevision-cpu-query-asan.log",
+    "/private/tmp/winevision-cpu-query-publication-tsan.log",
+    "/private/tmp/winevision-cpu-package-check.log",
+    "/private/tmp/winevision-cpu-app-build.log",
+    "/private/tmp/winevision-cpu-app-release-build.log",
+    "/private/tmp/winevision-cpu-install.json"
+  ]
+}

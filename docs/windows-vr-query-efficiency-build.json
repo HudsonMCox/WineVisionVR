@@ -1,0 +1,25 @@
+{
+  "sourceRevision": "e94c312f5c054263acf261cfa109edf13e757587",
+  "preparedSourceSha256": "a44e551fcf932902fb7010c4d7d2db39724a0c9c384d889af02253fab63253f5",
+  "patchesSha256": {
+    "windows-vr-openxr/patches/0002-dxmt-d3d12-wvr-queue.patch": "415fe2af087e395d2eeab05277ba3b63918b7d4f8d81fa937732473fa2b0a5f8",
+    "windows-vr-openxr/patches/0003-dxmt-d3d12-visionos-native.patch": "d541c9bc75ad8940bb0094d640a9f06e13ffd1fc9dc613afc3e6a70db0e1c264",
+    "windows-vr-openxr/patches/0004-dxmt-modern-d3d11-wvr.patch": "bd129be52b06a664ad3e50db0c3c523fb9591b45a99fd37efe111af5e253c2c4",
+    "windows-vr-openxr/patches/0005-dxmt-xros-metallib-target.patch": "3a9dd0279c01c5b87874a72eb910ee0743306f2bfe59a0d73fcad0c54676d45c",
+    "windows-vr-openxr/patches/0006-dxmt-arm64ec-native-build.patch": "3008db5402ba769b8b763b0edb449c13d3709a51937dd36c11493fccbc0396af",
+    "windows-vr-openxr/patches/0007-dxmt-xros-air-container-validation.patch": "63cc1648a1a9d256a787dbea6f2d23e67f395ca75e085a24d07c7fb857dfe17e",
+    "windows-vr-openxr/patches/0008-dxmt-xros-sdk-metadata.patch": "4f1f2a520d944adafd2f871aaed1a74f54656ed2424c9cc3106511bb7d79165f",
+    "windows-vr-openxr/patches/0009-dxmt-xros-discard-cfg-canonicalization.patch": "7349ff0c42f0d81df8e08c13b917cd60fb907e58f33a21c9d2f1642b8b51b083",
+    "windows-vr-openxr/patches/0010-dxmt-query-publication.patch": "0f6efbe313ad3aac3de0384c2f3a546472dca3df2830d18105c65aa56e84027d",
+    "windows-vr-openxr/patches/0011-dxmt-empty-query-tail-completion.patch": "789174bd24e12e5f5786a3fcaa3a1e4f72d8b6ff3f048370b2382093f4b9cb03",
+    "windows-vr-openxr/patches/0012-dxmt-query-state-diagnostics.patch": "5840c6a153c1dc80edd0c80542e82b5eccd5f441dbc7f0515829a0c2014e780d",
+    "windows-vr-openxr/patches/0013-dxmt-vr-encoder-boundaries.patch": "dc2b98e9b7b1405669bed4d4c5a834d3236c809976836bd90334d17b48011d1c",
+    "windows-vr-openxr/patches/0015-dxmt-query-readback-efficiency.patch": "f92ea6d7ab6fcc4a20818ae8208a09c8f5d5193a615d544863d00dcf4b1097c1"
+  },
+  "outputSha256": "f84e0d73f09a478391a7637d4e838e4b9dc7d6300962ca49618fe591edf4a095",
+  "guestOnly": true,
+  "nativeCompilerTargetsBuilt": false,
+  "configurationOnlyNativeLLVMPath": "/opt/homebrew/opt/llvm@21",
+  "toolchainArchiveSha256": "bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7",
+  "buildLog": "/private/tmp/winevision-cpu-d3d11-build.log"
+}

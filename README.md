@@ -87,8 +87,11 @@ Headset-confirmed unless marked otherwise. The full engineering record is in `do
   sources, initial profile event) and controller discovery for visionOS 27 spatial accessories.
 - **Freezes:** DXMT's VR image-wait and frame-submit commands now close the active pass and take the context
   lock (patch 0013); visibility queries that end in an empty command chunk now complete (patch 0011); query
-  publication and event completion (patches 0010 and 0014); FEX address-translation caches (patch
+  publication (patch 0010), with exact GPU event completion preserved; FEX address-translation caches (patch
   `windows-runtime-plugin/patches/0003`).
+- **CPU optimization (headset validation pending):** patch 0015 removes repeated completed-query allocations
+  and per-sample atomic additions. Host lifecycle/race checks and the ARM64EC build pass; no game FPS gain
+  has been measured. The unsafe whole-buffer completion cache (retired patch 0014) is removed.
 - **Shaders:** AIR container, SDK metadata and discard-CFG fixes (patches 0007 to 0009).
 - **Race fix:** a lock around OpenXR action state, which had crashed the game.
 - **Steam:** a native Steam library (password, Steam Guard or QR sign-in, depot downloads, Keychain tokens),

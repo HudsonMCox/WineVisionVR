@@ -72,6 +72,7 @@ patches=[
  "windows-vr-openxr/patches/0011-dxmt-empty-query-tail-completion.patch",
  "windows-vr-openxr/patches/0012-dxmt-query-state-diagnostics.patch",
  "windows-vr-openxr/patches/0013-dxmt-vr-encoder-boundaries.patch",
+ "windows-vr-openxr/patches/0015-dxmt-query-readback-efficiency.patch",
 ]
 subprocess.run(["git","init","--quiet"],cwd=dest,check=True)
 for rel in patches:

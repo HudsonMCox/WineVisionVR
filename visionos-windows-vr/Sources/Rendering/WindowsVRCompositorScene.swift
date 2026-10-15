@@ -249,6 +249,7 @@ private final class WindowsVRCompositorRenderer {
 
         var trackingStarted = false
         defer {
+            LaunchLogFile.append("lifecycle", "Render task ended; cancelled=\(Task.isCancelled)")
             arSession.stop()
             controllerTracking.reset()
             wvr_compositor_pause_v1()
@@ -258,6 +259,7 @@ private final class WindowsVRCompositorRenderer {
             switch layerRenderer.state {
             case .paused:
                 Self.log.notice("Layer renderer paused")
+                LaunchLogFile.append("lifecycle", "Layer renderer paused")
                 wvr_compositor_pause_v1()
                 if trackingStarted {
                     arSession.stop()
@@ -274,6 +276,7 @@ private final class WindowsVRCompositorRenderer {
                 renderNextFrame()
             case .invalidated:
                 Self.log.notice("Layer renderer invalidated")
+                LaunchLogFile.append("lifecycle", "Layer renderer invalidated")
                 return
             @unknown default:
                 return

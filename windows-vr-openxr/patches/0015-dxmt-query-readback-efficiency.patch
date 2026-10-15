@@ -1,0 +1,43 @@
+--- a/src/d3d11/d3d11_query.cpp
++++ b/src/d3d11/d3d11_query.cpp
+@@ -28,7 +28,10 @@
+       } else {
+         *((uint64_t *)data) = accumulated_value_;
+       }
+-      query_ = new VisibilityResultQuery();
++      // Prepare the next issue once. Repeated reads of a completed query
++      // return the cached result without allocating/discarding query objects.
++      if (state_ != QueryState::Signaled)
++        query_ = new VisibilityResultQuery();
+       state_ = QueryState::Signaled;
+       pending_polls_ = 0;
+       return S_OK;
+@@ -109,7 +112,8 @@
+   GetData(void *data) override {
+     if (state_ == QueryState::Signaled || query_->getValue(&latest_value_)) {
+       *((uint64_t *)data) = latest_value_;
+-      query_ = new TimestampQuery();
++      if (state_ != QueryState::Signaled)
++        query_ = new TimestampQuery();
+       state_ = QueryState::Signaled;
+       return S_OK;
+     }
+--- a/src/dxmt/dxmt_occlusion_query.hpp
++++ b/src/dxmt/dxmt_occlusion_query.hpp
+@@ -133,10 +133,15 @@
+     uint64_t const *start = seqId == seq_id_begin ? readbackBuffer + occlusion_counter_begin : readbackBuffer;
+     uint64_t const *end = seqId == seq_id_end ? readbackBuffer + occlusion_counter_end : readbackBuffer + numResults;
+     assert(start <= end);
++    // The ordered finish thread owns this readback. Sum its immutable GPU
++    // samples locally, then publish one contribution before its completion
++    // sequence. Preserve the existing atomic publication ordering.
++    uint64_t contribution = 0;
+     while (start != end) {
+-      accumulated_value_ += *start;
++      contribution += *start;
+       start++;
+     }
++    accumulated_value_ += contribution;
+     seq_id_issued = seqId;
+   }
+ 
