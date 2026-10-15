@@ -1,0 +1,727 @@
+diff --git a/meson.options b/meson.options
+--- a/meson.options
++++ b/meson.options
+@@ -1,4 +1,6 @@
++option('visionos_native', type : 'boolean', value : false)
+ option('native_llvm_path', type : 'string', value: '/usr/local/opt/llvm@15')
++option('native_llvm_source_path', type : 'string', value: '')
+ option('build_airconv_for_windows', type : 'boolean', value : false)
+ option('dxmt_debug', type : 'boolean', value : false)
+ option('dxmt_native', type : 'boolean', value : false, deprecated : true)
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -114,15 +114,39 @@
+ 
+ xcrun = find_program('xcrun')
+ 
+-metalir_generator = generator(xcrun,
+-  output    : [ '@BASENAME@.air'],
+-  arguments : [ '-sdk', 'macosx', 'metal', '-o', '@OUTPUT@', '-c', '@INPUT@', '@EXTRA_ARGS@'],
+-)
+-
+-metallib_generator = generator(xcrun,
+-  output    : [ '@BASENAME@.metallib'],
+-  arguments : [ '-sdk', 'macosx', 'metallib', '-o', '@OUTPUT@', '@INPUT@'],
+-)
++if get_option('visionos_native')
++  dxmt_xros_sdk = run_command(xcrun, '--sdk', 'xros', '--show-sdk-path', check: true).stdout().strip()
++  add_project_arguments('-DDXMT_VISIONOS=1', language : 'c')
++  dxmt_metal_sdk = 'xros'
++  dxmt_metal_target = 'air64-apple-xros2.0'
++  add_project_arguments('-DDXMT_VISIONOS=1', language : 'cpp')
++else
++  dxmt_metal_sdk = 'macosx'
++  dxmt_metal_target = 'air64-apple-macos14.0'
++endif
++
++if get_option('visionos_native')
++  metal_compiler = find_program('metal')
++  metallib_compiler = find_program('metallib')
++  metal_module_cache = join_paths(meson.project_build_root(), 'metal-module-cache')
++  metalir_generator = generator(metal_compiler,
++    output    : [ '@BASENAME@.air'],
++    arguments : [ '-isysroot', dxmt_xros_sdk, '-fmodules-cache-path=' + metal_module_cache, '-o', '@OUTPUT@', '-c', '@INPUT@', '@EXTRA_ARGS@'],
++  )
++  metallib_generator = generator(metallib_compiler,
++    output    : [ '@BASENAME@.metallib'],
++    arguments : [ '-o', '@OUTPUT@', '@INPUT@'],
++  )
++else
++  metalir_generator = generator(xcrun,
++    output    : [ '@BASENAME@.air'],
++    arguments : [ '-sdk', dxmt_metal_sdk, 'metal', '-o', '@OUTPUT@', '-c', '@INPUT@', '@EXTRA_ARGS@'],
++  )
++  metallib_generator = generator(xcrun,
++    output    : [ '@BASENAME@.metallib'],
++    arguments : [ '-sdk', dxmt_metal_sdk, 'metallib', '-o', '@OUTPUT@', '@INPUT@'],
++  )
++endif
+ 
+ xxd = find_program('xxd')
+ 
+@@ -190,6 +214,19 @@
+ 
+ native_compiler_arch = cpu_family == 'aarch64' ? 'arm64' : 'x86_64'
+ 
++if dxmt_crossbuild and get_option('visionos_native')
++  dxmt_xros_native_args = [
++    '-target', 'arm64-apple-xros27.0', '-isysroot', dxmt_xros_sdk,
++    '-DDXMT_VISIONOS=1',
++    '-D__wine_unix_call_funcs=dxmt_winemetal_unix_call_funcs',
++    '-D__wine_unix_call_wow64_funcs=dxmt_winemetal_unix_call_wow64_funcs',
++  ]
++  add_project_arguments(dxmt_xros_native_args, language: 'c', native: true)
++  add_project_arguments(dxmt_xros_native_args, language: 'cpp', native: true)
++  add_project_link_arguments(dxmt_xros_native_args, language: 'c', native: true)
++  add_project_link_arguments(dxmt_xros_native_args, language: 'cpp', native: true)
++endif
++
+ add_project_arguments(cpp.get_supported_arguments(compiler_args), language: 'cpp')
+ add_project_arguments(clangpp.get_supported_arguments(native_compiler_args), language: 'cpp', native: true)
+ add_project_arguments(cc.get_supported_arguments(compiler_args), language: 'c')
+diff --git a/src/airconv/meson.build b/src/airconv/meson.build
+--- a/src/airconv/meson.build
++++ b/src/airconv/meson.build
+@@ -70,7 +70,7 @@
+ 
+ airconv_shaders_ir = metalir_generator.process(
+   airconv_shaders,
+-  extra_args: ['-std=metal3.1', '--target=air64-apple-macos14.0'],
++  extra_args: ['-std=metal3.1', '--target=' + dxmt_metal_target],
+ )
+ airconv_shaders_header = hexdump_generator.process(airconv_shaders_ir)
+ 
+@@ -81,10 +81,12 @@
+ if build_airconv_for_windows
+ 
+ llvm_include_path = include_directories('../../toolchains/llvm/include') # FIXME: in favor of path relative to project
++native_llvm_source_path = get_option('native_llvm_source_path')
++native_llvm_source_args = native_llvm_source_path == '' ? [] : ['-I' + join_paths(native_llvm_source_path, 'include')]
+ 
+ airconv_lib = static_library('airconv', airconv_src,
+   include_directories : [ dxmt_include_path, llvm_include_path ],
+-  cpp_args            : [ airconv_args, '-DWIN_EXPORT' ],
++  cpp_args            : airconv_args + native_llvm_source_args + ['-DWIN_EXPORT'],
+   dependencies        : [ dxbc_parser_dep ],
+   link_args           : llvm_ld_flags
+ )
+@@ -99,7 +101,7 @@
+ 
+ executable('airconv', airconv_src + airconv_cli_src,
+   include_directories : [ dxmt_include_path, llvm_include_path ],
+-  cpp_args            : [ airconv_args, '-DWIN_EXPORT' ],
++  cpp_args            : airconv_args + native_llvm_source_args + ['-DWIN_EXPORT'],
+   dependencies        : [ dxbc_parser_dep, lib_d3dcompiler ],
+   link_args           : [ llvm_ld_flags, llvm_deps ]
+ )
+diff --git a/src/dxmt/meson.build b/src/dxmt/meson.build
+--- a/src/dxmt/meson.build
++++ b/src/dxmt/meson.build
+@@ -29,7 +29,10 @@
+   'dxmt_command.metal'
+ ]
+ 
+-dxmt_shaders_ir = metalir_generator.process(dxmt_shaders)
++dxmt_shaders_ir = metalir_generator.process(
++  dxmt_shaders,
++  extra_args: ['--target=' + dxmt_metal_target],
++)
+ 
+ dxmt_shaders_lib = metallib_generator.process(dxmt_shaders_ir)
+ 
+diff --git a/src/airconv/airconv_context.cpp b/src/airconv/airconv_context.cpp
+--- a/src/airconv/airconv_context.cpp
++++ b/src/airconv/airconv_context.cpp
+@@ -39,7 +39,11 @@
+ 
+ void initializeModule(llvm::Module &M) {
+   M.setSourceFileName("airconv_generated.metal");
++#if defined(DXMT_VISIONOS)
++  M.setTargetTriple("air64-apple-xros2.0");
++#else
+   M.setTargetTriple("air64-apple-macosx14.0.0");
++#endif
+   M.setDataLayout(
+     "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:"
+     "64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-"
+diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -219,7 +219,11 @@
+     airLangVersion->addOperand(MDTuple::get(
+         context, {createString("Metal"), createUnsignedInteger(3), createUnsignedInteger(2), createUnsignedInteger(0)}
+     ));
++#if defined(DXMT_VISIONOS)
++    module.setTargetTriple("air64-apple-xros2.0");
++#else
+     module.setTargetTriple("air64-apple-macosx15.0.0");
++#endif
+     break;
+   }
+   default: {
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index e57c194..6902483 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -1,14 +1,30 @@
+ #include <stdatomic.h>
++#include <stddef.h>
++#include <string.h>
+ #include <dlfcn.h>
++#include <TargetConditionals.h>
++#if TARGET_OS_IOS || TARGET_OS_VISION
++#define DXMT_MOBILE_APPLE 1
++#import <Foundation/Foundation.h>
++#import <UIKit/UIKit.h>
++#else
+ #import <Cocoa/Cocoa.h>
++#endif
++#if !defined(DXMT_MOBILE_APPLE)
+ #import <ColorSync/ColorSync.h>
++#include <bootstrap.h>
++#include <mach/mach_port.h>
++#endif
+ #import <CoreFoundation/CFRunLoop.h>
+ #import <Metal/Metal.h>
+ #import <MetalFX/MetalFX.h>
+ #import <QuartzCore/QuartzCore.h>
++#if defined(DXMT_MOBILE_APPLE)
++#include <objc/message.h>
++#include <objc/runtime.h>
++#else
+ #include "objc/objc-runtime.h"
+-#include <bootstrap.h>
+-#include <mach/mach_port.h>
++#endif
+ #define WINEMETAL_API
+ #include "../winemetal_thunks.h"
+ #include "../airconv_thunks.h"
+@@ -26,6 +42,7 @@
+ typedef int NTSTATUS;
+ #define STATUS_SUCCESS 0
+ #define STATUS_UNSUCCESSFUL 0xC0000001
++#define STATUS_NOT_SUPPORTED ((NTSTATUS)0xC00000BB)
+ #define STATUS_INVALID_ADDRESS ((NTSTATUS)0xC0000141)
+ 
+ struct unixcall_windows_vr_bridge_v1 {
+@@ -174,6 +191,18 @@ _MTLCommandBuffer_encodeSignalEvent(void *obj) {
+   return STATUS_SUCCESS;
+ }
+ 
++static MTLResourceOptions
++to_metal_resource_options(enum WMTResourceOptions options) {
++#if defined(DXMT_MOBILE_APPLE)
++  uint64_t raw = (uint64_t)options;
++  if ((raw & 0x30u) == WMTResourceStorageModeManaged)
++    raw = (raw & ~0x30ull) | WMTResourceStorageModeShared;
++  return (MTLResourceOptions)raw;
++#else
++  return (MTLResourceOptions)options;
++#endif
++}
++
+ static NTSTATUS
+ _MTLDevice_newBuffer(void *obj) {
+   struct unixcall_mtldevice_newbuffer *params = obj;
+@@ -183,10 +212,10 @@ _MTLDevice_newBuffer(void *obj) {
+   if (info->memory.ptr) {
+     buffer = [device newBufferWithBytesNoCopy:info->memory.ptr
+                                        length:info->length
+-                                      options:(enum MTLResourceOptions)info->options
++                                      options:to_metal_resource_options(info->options)
+                                   deallocator:NULL];
+   } else {
+-    buffer = [device newBufferWithLength:info->length options:(enum MTLResourceOptions)info->options];
++    buffer = [device newBufferWithLength:info->length options:to_metal_resource_options(info->options)];
+     info->memory.ptr = [buffer storageMode] == MTLStorageModePrivate ? NULL : [buffer contents];
+   }
+   params->ret = (obj_handle_t)buffer;
+@@ -271,7 +300,7 @@ fill_texture_descriptor(MTLTextureDescriptor *desc, struct WMTTextureInfo *info)
+   desc.mipmapLevelCount = info->mipmap_level_count;
+   desc.sampleCount = info->sample_count;
+   desc.usage = (MTLTextureUsage)info->usage;
+-  desc.resourceOptions = (MTLResourceOptions)info->options;
++  desc.resourceOptions = to_metal_resource_options(info->options);
+ };
+ 
+ void
+@@ -1317,9 +1346,14 @@ _MTLTexture_replaceRegion(void *obj) {
+ 
+ static NTSTATUS
+ _MTLBuffer_didModifyRange(void *obj) {
++#if defined(DXMT_MOBILE_APPLE)
++  (void)obj;
++  return STATUS_NOT_SUPPORTED;
++#else
+   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
+   [(id<MTLBuffer>)params->handle didModifyRange:NSMakeRange(params->arg, params->ret)];
+   return STATUS_SUCCESS;
++#endif
+ }
+ 
+ static NTSTATUS
+@@ -1439,6 +1473,7 @@ static const int SIGNALS[] = {
+ #endif
+ };
+ 
++#if !defined(DXMT_MOBILE_APPLE)
+ static NTSTATUS
+ _MTLDevice_newTemporalScaler(void *obj) {
+   struct unixcall_mtldevice_newfxtemporalscaler *params = obj;
+@@ -1535,6 +1570,34 @@ _MTLCommandBuffer_encodeSpatialScale(void *obj) {
+   return STATUS_SUCCESS;
+ }
+ 
++#else
++static NTSTATUS
++_MTLDevice_newTemporalScaler(void *obj) {
++  struct unixcall_mtldevice_newfxtemporalscaler *params = obj;
++  params->ret = 0;
++  return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS
++_MTLDevice_newSpatialScaler(void *obj) {
++  struct unixcall_mtldevice_newfxspatialscaler *params = obj;
++  params->ret = 0;
++  return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS
++_MTLCommandBuffer_encodeTemporalScale(void *obj) {
++  (void)obj;
++  return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS
++_MTLCommandBuffer_encodeSpatialScale(void *obj) {
++  (void)obj;
++  return STATUS_NOT_SUPPORTED;
++}
++#endif
++
+ static NTSTATUS
+ _NSString_string(void *obj) {
+   struct unixcall_nsstring_string *params = obj;
+@@ -1631,15 +1694,25 @@ _MetalLayer_nextDrawable(void *obj) {
+ static NTSTATUS
+ _MTLDevice_supportsFXSpatialScaler(void *obj) {
+   struct unixcall_generic_obj_uint64_ret *params = obj;
++#if defined(DXMT_MOBILE_APPLE)
++  params->ret = false;
++  return STATUS_NOT_SUPPORTED;
++#else
+   params->ret = [MTLFXSpatialScalerDescriptor supportsDevice:(id<MTLDevice>)params->handle];
+   return STATUS_SUCCESS;
++#endif
+ }
+ 
+ static NTSTATUS
+ _MTLDevice_supportsFXTemporalScaler(void *obj) {
+   struct unixcall_generic_obj_uint64_ret *params = obj;
++#if defined(DXMT_MOBILE_APPLE)
++  params->ret = false;
++  return STATUS_NOT_SUPPORTED;
++#else
+   params->ret = [MTLFXTemporalScalerDescriptor supportsDevice:(id<MTLDevice>)params->handle];
+   return STATUS_SUCCESS;
++#endif
+ }
+ 
+ static NTSTATUS
+@@ -1652,11 +1725,17 @@ _MetalLayer_setProps(void *obj) {
+     layer.opaque = props->opaque;
+     layer.framebufferOnly = props->framebuffer_only;
+     layer.contentsScale = props->contents_scale;
++#if !defined(DXMT_MOBILE_APPLE)
+     layer.displaySyncEnabled = props->display_sync_enabled;
++#endif
+     layer.drawableSize = CGSizeMake(props->drawable_width, props->drawable_height);
+     layer.pixelFormat = to_metal_pixel_format(props->pixel_format);
+   });
++#if defined(DXMT_MOBILE_APPLE)
++  return props->display_sync_enabled ? STATUS_NOT_SUPPORTED : STATUS_SUCCESS;
++#else
+   return STATUS_SUCCESS;
++#endif
+ }
+ 
+ static NTSTATUS
+@@ -1668,7 +1747,11 @@ _MetalLayer_getProps(void *obj) {
+   props->opaque = layer.opaque;
+   props->framebuffer_only = layer.framebufferOnly;
+   props->contents_scale = layer.contentsScale;
++#if !defined(DXMT_MOBILE_APPLE)
+   props->display_sync_enabled = layer.displaySyncEnabled;
++#else
++  props->display_sync_enabled = false;
++#endif
+   props->drawable_height = layer.drawableSize.height;
+   props->drawable_width = layer.drawableSize.width;
+   props->pixel_format = layer.pixelFormat;
+@@ -1877,7 +1960,10 @@ _MTLCommandEncoder_setLabel(void *args) {
+ static NTSTATUS
+ _MTLDevice_setShouldMaximizeConcurrentCompilation(void *args) {
+   struct unixcall_generic_obj_uint64_noret *params = args;
+-  [(id<MTLDevice>)params->handle setShouldMaximizeConcurrentCompilation:(BOOL)params->arg];
++  id device = (id)params->handle;
++  SEL selector = @selector(setShouldMaximizeConcurrentCompilation:);
++  if (![device respondsToSelector:selector]) return STATUS_NOT_SUPPORTED;
++  ((void (*)(id, SEL, BOOL))objc_msgSend)(device, selector, (BOOL)params->arg);
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -2252,6 +2338,7 @@ _MTLLogContainer_enumerate(void *obj) {
+   return STATUS_SUCCESS;
+ }
+ 
++#if !defined(DXMT_MOBILE_APPLE)
+ CFStringRef
+ GetColorSpaceName(enum WMTColorSpace colorspace) {
+   switch (colorspace) {
+@@ -2305,41 +2392,78 @@ _MetalLayer_setColorSpace(void *obj) {
+   return STATUS_SUCCESS;
+ }
+ 
++#else
++static NTSTATUS
++_CGColorSpace_checkColorSpaceSupported(void *obj) {
++  struct unixcall_generic_obj_uint64_ret *params = obj;
++  params->ret = false;
++  return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS
++_MetalLayer_setColorSpace(void *obj) {
++  (void)obj;
++  return STATUS_NOT_SUPPORTED;
++}
++#endif
++
+ static NTSTATUS
+ _WMTGetPrimaryDisplayId(void *obj) {
++#if defined(DXMT_MOBILE_APPLE)
++  (void)obj;
++  return STATUS_NOT_SUPPORTED;
++#else
+   struct unixcall_generic_obj_ret *params = obj;
+   params->ret = CGMainDisplayID();
+   return STATUS_SUCCESS;
++#endif
+ }
+ 
+ static NTSTATUS
+ _WMTGetSecondaryDisplayId(void *obj) {
++#if defined(DXMT_MOBILE_APPLE)
++  (void)obj;
++  return STATUS_NOT_SUPPORTED;
++#else
+   struct unixcall_generic_obj_ret *params = obj;
+   params->ret = kCGNullDirectDisplay;
+ 
+   uint32_t count = 0;
+   CGGetOnlineDisplayList(0, NULL, &count);
+-
+-  if (count == 0)
+-    return STATUS_SUCCESS;
++  if (count == 0) return STATUS_SUCCESS;
+ 
+   CGDirectDisplayID main_display = CGMainDisplayID();
+   CGDirectDisplayID displays[count];
+   CGGetOnlineDisplayList(count, displays, &count);
+-
+   for (uint32_t i = 0; i < count; i++) {
+     CGDirectDisplayID id = displays[i];
+-    if (id == main_display)
+-      continue;
+-    if (CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay)
+-      continue;
++    if (id == main_display || CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay) continue;
+     params->ret = id;
+     break;
+   }
++  return STATUS_SUCCESS;
++#endif
++}
++
++static NTSTATUS
++_MTLLibrary_newFunctionWithConstants(void *obj) {
++  struct unixcall_mtllibrary_newfunction_with_constants *params = obj;
++  id<MTLLibrary> library = (id<MTLLibrary>)params->library;
++  NSString *name = [[NSString alloc] initWithCString:(char *)params->name.ptr encoding:NSUTF8StringEncoding];
++  struct WMTFunctionConstant *constants = (struct WMTFunctionConstant *)params->constants.ptr;
++  NSError *err = NULL;
++  MTLFunctionConstantValues *values = [[MTLFunctionConstantValues alloc] init];
++  for (uint64_t i = 0; i < params->num_constants; i++)
++    [values setConstantValue:constants[i].data.ptr type:(MTLDataType)constants[i].type atIndex:constants[i].index];
+ 
++  params->ret = (obj_handle_t)[library newFunctionWithName:name constantValues:values error:&err];
++  params->ret_error = (obj_handle_t)err;
++  [name release];
++  [values release];
+   return STATUS_SUCCESS;
+ }
+ 
++#if !defined(DXMT_MOBILE_APPLE)
+ typedef struct icc_XYZ_t {
+   uint32_t sig;      // 0x205a5958
+   uint32_t reserved; // 0
+@@ -2451,24 +2575,6 @@ _MetalLayer_getEDRValue(void *obj) {
+   return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS
+-_MTLLibrary_newFunctionWithConstants(void *obj) {
+-  struct unixcall_mtllibrary_newfunction_with_constants *params = obj;
+-  id<MTLLibrary> library = (id<MTLLibrary>)params->library;
+-  NSString *name = [[NSString alloc] initWithCString:(char *)params->name.ptr encoding:NSUTF8StringEncoding];
+-  struct WMTFunctionConstant *constants = (struct WMTFunctionConstant *)params->constants.ptr;
+-  NSError *err = NULL;
+-  MTLFunctionConstantValues *values = [[MTLFunctionConstantValues alloc] init];
+-  for (uint64_t i = 0; i < params->num_constants; i++)
+-    [values setConstantValue:constants[i].data.ptr type:(MTLDataType)constants[i].type atIndex:constants[i].index];
+-
+-  params->ret = (obj_handle_t)[library newFunctionWithName:name constantValues:values error:&err];
+-  params->ret_error = (obj_handle_t)err;
+-  [name release];
+-  [values release];
+-  return STATUS_SUCCESS;
+-}
+-
+ static NTSTATUS
+ _WMTQueryDisplaySetting(void *obj) {
+   struct unixcall_query_display_setting *params = obj;
+@@ -2528,9 +2634,20 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
+       layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
+   params->edr_value.maximum_potential_edr_color_component_value =
+       screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+-
+   return STATUS_SUCCESS;
+ }
++#else
++static NTSTATUS
++_WMTGetDisplayDescription(void *obj) { (void)obj; return STATUS_NOT_SUPPORTED; }
++static NTSTATUS
++_MetalLayer_getEDRValue(void *obj) { (void)obj; return STATUS_NOT_SUPPORTED; }
++static NTSTATUS
++_WMTQueryDisplaySetting(void *obj) { (void)obj; return STATUS_NOT_SUPPORTED; }
++static NTSTATUS
++_WMTUpdateDisplaySetting(void *obj) { (void)obj; return STATUS_NOT_SUPPORTED; }
++static NTSTATUS
++_WMTQueryDisplaySettingForLayer(void *obj) { (void)obj; return STATUS_NOT_SUPPORTED; }
++#endif
+ 
+ static NTSTATUS
+ _MTLCommandBuffer_encodeWaitForEvent(void *obj) {
+@@ -2663,8 +2780,10 @@ static NTSTATUS
+ _MTLBuffer_updateContents(void *obj) {
+   struct unixcall_mtlbuffer_updatecontents *params = obj;
+   memcpy((void *)((char *)[(id<MTLBuffer>)params->buffer contents] + params->offset), params->data.ptr, params->length);
++#if !defined(DXMT_MOBILE_APPLE)
+   if ([(id<MTLBuffer>)params->buffer storageMode] == MTLStorageModeManaged)
+     [(id<MTLBuffer>)params->buffer didModifyRange:NSMakeRange(params->offset, params->length)];
++#endif
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -2755,6 +2874,7 @@ _MTLDevice_newSharedTexture(void *obj) {
+   return STATUS_SUCCESS;
+ }
+ 
++#if !defined(DXMT_MOBILE_APPLE)
+ /* Private API to register a mach port with the bootstrap server */
+ extern kern_return_t bootstrap_register2(mach_port_t bp, name_t service_name, mach_port_t sp, int flags);
+ 
+@@ -2785,6 +2905,17 @@ _WMTBootstrapLookUp(void *obj) {
+   return ret;
+ }
+ 
++#else
++static NTSTATUS
++_WMTBootstrapRegister(void *obj) { (void)obj; return STATUS_NOT_SUPPORTED; }
++static NTSTATUS
++_WMTBootstrapLookUp(void *obj) {
++  struct unixcall_bootstrap *params = obj;
++  params->mach_port = 0;
++  return STATUS_NOT_SUPPORTED;
++}
++#endif
++
+ @protocol MTLDeviceSPI <MTLDevice>
+ 
+ - (id<MTLSharedEvent>)newSharedEventWithMachPort:(mach_port_t)machPort;
+@@ -3028,7 +3159,7 @@ _MTLDevice_newHeap(void *obj) {
+   id<MTLDevice> device = (id<MTLDevice>)params->device;
+   struct WMTHeapInfo const *info = params->info.ptr;
+   MTLHeapDescriptor *desc = [[MTLHeapDescriptor alloc] init];
+-  desc.resourceOptions = (MTLResourceOptions)info->options;
++  desc.resourceOptions = to_metal_resource_options(info->options);
+   desc.sparsePageSize = (MTLSparsePageSize)info->sparse_page_size;
+   desc.type = (MTLHeapType)info->type;
+   desc.size = info->size;
+@@ -3044,7 +3175,7 @@ _MTLDevice_heapBufferSizeAndAlign(void *obj) {
+   struct unixcall_mtldevice_heapbuffersizeandalign *params = obj;
+   id<MTLDevice> device = (id<MTLDevice>)params->device;
+   MTLSizeAndAlign ret =
+-      [device heapBufferSizeAndAlignWithLength:params->length options:(MTLResourceOptions)params->options];
++      [device heapBufferSizeAndAlignWithLength:params->length options:to_metal_resource_options(params->options)];
+   params->ret_size = ret.size;
+   params->ret_align = ret.align;
+   return STATUS_SUCCESS;
+@@ -3071,10 +3202,10 @@ _MTLHeap_newBuffer(void *obj) {
+   struct WMTBufferInfo *info = params->info.ptr;
+   id<MTLBuffer> buffer;
+   if (~params->offset == 0)
+-    buffer = [heap newBufferWithLength:info->length options:(enum MTLResourceOptions)info->options];
++    buffer = [heap newBufferWithLength:info->length options:to_metal_resource_options(info->options)];
+   else
+     buffer =
+-        [heap newBufferWithLength:info->length options:(enum MTLResourceOptions)info->options offset:params->offset];
++        [heap newBufferWithLength:info->length options:to_metal_resource_options(info->options) offset:params->offset];
+   info->memory.ptr = [heap storageMode] == MTLStorageModePrivate ? NULL : [buffer contents];
+ 
+   params->ret = (obj_handle_t)buffer;
+@@ -3140,7 +3271,7 @@ _MTLDevice_newIndirectCommandBuffer(void *obj) {
+   id<MTLIndirectCommandBuffer> icb =
+       [device newIndirectCommandBufferWithDescriptor:desc
+                                      maxCommandCount:params->max_count
+-                                             options:(MTLResourceOptions)params->options];
++                                             options:to_metal_resource_options(params->options)];
+   params->ret = (obj_handle_t)icb;
+   info->gpu_resource_id = [icb gpuResourceID]._impl;
+   [desc release];
+@@ -3266,7 +3397,10 @@ NTSTATUS _CacheWriter_alloc_init(void *obj);
+ NTSTATUS _CacheWriter_set(void *obj);
+ NTSTATUS _WMTSetMetalShaderCachePath(void *obj);
+ 
+-const void *__wine_unix_call_funcs[] = {
++#if TARGET_OS_IOS || TARGET_OS_VISION
++#define __wine_unix_call_funcs dxmt_winemetal_unix_call_funcs
++#endif
++__attribute__((visibility("default"))) const void *__wine_unix_call_funcs[] = {
+     &_NSObject_retain,
+     &_NSObject_release,
+     &_NSArray_object,
+@@ -3417,8 +3551,19 @@ const void *__wine_unix_call_funcs[] = {
+     &_WMTWindowsVRBridgeCallV2, /* 147 */
+ };
+ 
+-#ifndef DXMT_NATIVE
+-const void *__wine_unix_call_wow64_funcs[] = {
++#if !defined(DXMT_NATIVE) || TARGET_OS_IOS || TARGET_OS_VISION
++#if TARGET_OS_IOS || TARGET_OS_VISION
++#define __wine_unix_call_wow64_funcs dxmt_winemetal_unix_call_wow64_funcs
++#endif
++
++__attribute__((visibility("default"))) size_t
++wvr_dxmt_d3d12_unix_call_count_v1(void) {
++  return sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]);
++}
++
++__attribute__((visibility("default"))) unsigned int
++wvr_dxmt_d3d12_transport_abi_v1(void) { return 1; }
++__attribute__((visibility("default"))) const void *__wine_unix_call_wow64_funcs[] = {
+     &_NSObject_retain,
+     &_NSObject_release,
+     &_NSArray_object,
+diff --git a/src/winemetal/unix/meson.build b/src/winemetal/unix/meson.build
+--- a/src/winemetal/unix/meson.build
++++ b/src/winemetal/unix/meson.build
+@@ -13,15 +13,26 @@
+   error('One of the options -Dwine_build_path or -Dwine_install_path is required')
+ endif
+ 
+-winemetal_unix_ld_args = [
+-  '-Wl,-install_name,@rpath/winemetal.so',
+-  winemac_so, ntdll_so,
+-  '-weak_framework', 'CoreFoundation', '-weak_framework', 'Metal',
+-  '-framework', 'MetalFX', '-weak_framework', 'Foundation',
+-  '-weak_framework', 'CoreGraphics', '-weak_framework', 'QuartzCore',
+-  '-weak_framework', 'ColorSync',  '-weak_framework', 'Cocoa',
+-  '-lsqlite3',
+-]
++if get_option('visionos_native')
++  winemetal_unix_ld_args = [
++    '-Wl,-install_name,@rpath/winemetal.so',
++    winemac_so, ntdll_so,
++    '-framework', 'Foundation', '-framework', 'UIKit',
++    '-weak_framework', 'Metal', '-framework', 'MetalFX',
++    '-weak_framework', 'CoreGraphics', '-weak_framework', 'QuartzCore',
++    '-lsqlite3',
++  ]
++else
++  winemetal_unix_ld_args = [
++    '-Wl,-install_name,@rpath/winemetal.so',
++    winemac_so, ntdll_so,
++    '-weak_framework', 'CoreFoundation', '-weak_framework', 'Metal',
++    '-framework', 'MetalFX', '-weak_framework', 'Foundation',
++    '-weak_framework', 'CoreGraphics', '-weak_framework', 'QuartzCore',
++    '-weak_framework', 'ColorSync',  '-weak_framework', 'Cocoa',
++    '-lsqlite3',
++  ]
++endif
+ winemetal_unix_link_depends = []
+ 
+ shared_library('winemetal', winemetal_unix_src,
+diff --git a/src/nativemetal/meson.build b/src/nativemetal/meson.build
+--- a/src/nativemetal/meson.build
++++ b/src/nativemetal/meson.build
+@@ -5,13 +5,22 @@
+ ]
+ winemetal_link_depends = []
+ 
+-winemetal_ld_args = [
+-  '-weak_framework', 'CoreFoundation', '-weak_framework', 'Metal',
+-  '-framework', 'MetalFX', '-weak_framework', 'Foundation',
+-  '-weak_framework', 'CoreGraphics', '-weak_framework', 'QuartzCore',
+-  '-weak_framework', 'ColorSync',   '-weak_framework', 'Cocoa',
+-  '-lsqlite3',
+-]
++if get_option('visionos_native')
++  winemetal_ld_args = [
++    '-weak_framework', 'CoreFoundation', '-weak_framework', 'Metal',
++    '-framework', 'MetalFX', '-framework', 'Foundation', '-framework', 'UIKit',
++    '-weak_framework', 'CoreGraphics', '-weak_framework', 'QuartzCore',
++    '-lsqlite3',
++  ]
++else
++  winemetal_ld_args = [
++    '-weak_framework', 'CoreFoundation', '-weak_framework', 'Metal',
++    '-framework', 'MetalFX', '-weak_framework', 'Foundation',
++    '-weak_framework', 'CoreGraphics', '-weak_framework', 'QuartzCore',
++    '-weak_framework', 'ColorSync',   '-weak_framework', 'Cocoa',
++    '-lsqlite3',
++  ]
++endif
+ 
+ winemetal_dll = shared_library('winemetal', winemetal_src,
+   name_prefix         : '',
+diff --git a/src/airconv/darwin/meson.build b/src/airconv/darwin/meson.build
+--- a/src/airconv/darwin/meson.build
++++ b/src/airconv/darwin/meson.build
+@@ -1,4 +1,6 @@
+ native_llvm_path = get_option('native_llvm_path')
++native_llvm_source_path = get_option('native_llvm_source_path')
++native_llvm_source_args = native_llvm_source_path == '' ? [] : ['-I' + join_paths(native_llvm_source_path, 'include')]
+ 
+ if not native_llvm_path.startswith('/')
+   # Meson only allows relative include paths in case the toolchains are located inside
+@@ -24,7 +26,7 @@
+ 
+ airconv_lib_darwin = static_library('airconv', airconv_src,
+   include_directories : [ dxmt_include_path, llvm_include_path_darwin ],
+-  cpp_args            : [ airconv_args ],
++  cpp_args            : airconv_args + native_llvm_source_args,
+   dependencies        : [ dxbc_parser_native_dep ],
+   link_args           : llvm_ld_flags_darwin,
+   native              : dxmt_crossbuild
+@@ -38,7 +40,7 @@
+ 
+ executable('airconv', airconv_src + airconv_cli_src,
+   include_directories : [ dxmt_include_path, llvm_include_path_darwin ],
+-  cpp_args            : [ airconv_args ],
++  cpp_args            : airconv_args + native_llvm_source_args,
+   dependencies        : [ dxbc_parser_native_dep ],
+   link_args           : [ llvm_ld_flags_darwin, llvm_deps ],
+   native              : dxmt_crossbuild

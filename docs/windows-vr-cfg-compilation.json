@@ -1,0 +1,84 @@
+{
+  "date": "2026-10-13",
+  "target": "Vision Pro M2, visionOS 27",
+  "gpuArchitecture": "applegpu_g14g",
+  "verification": "offline compilation only; no shader execution or game launch",
+  "implementation": "LLVM 15 CFG simplification with common-instruction hoisting and sinking, shared native/offline source helper",
+  "backendOptimization": "enabled",
+  "shaderHashExceptions": false,
+  "gameSpecificArchivesPackaged": false,
+  "pipelines": [
+    {
+      "capture": "2BB7311E-B530-46D9-B50B-EBFABBB75DA6",
+      "exitCode": 0,
+      "inputVertexSha256": "3795a7f64d336a1bc202bd856262daebc1b2976d0157b646e37145e66fcd9add",
+      "inputFragmentSha256": "df13b699e83f49d9371a02b0b44582201423d534a4f6566ce4071ae57789a692",
+      "descriptorSha256": "5a53c8667fbab50716197015cc1bbc06b13d8127694e13dc76b1838686c10da5",
+      "outputVertexSha256": "3353c5d06a35edf2e9981e06db93811b731f931ffb954371f54391afeeb0e7ef",
+      "outputFragmentSha256": "2eafb91dc99414bb27e471866aab3e57830cdc22ae98f2c6d01aa10ec3ea1944"
+    },
+    {
+      "capture": "43D483ED-5EF3-4E4B-8CB9-D2ABDF225176",
+      "exitCode": 0,
+      "inputVertexSha256": "3795a7f64d336a1bc202bd856262daebc1b2976d0157b646e37145e66fcd9add",
+      "inputFragmentSha256": "7dc10b12dbf544f43f9bdb3f7172fac9822f3d292e1481c9cd5e5ca938a96908",
+      "descriptorSha256": "d426a3e95de0df2ebbd3e02888ee68019872c2c3a01c7534367f824fceeec1f6",
+      "outputVertexSha256": "3353c5d06a35edf2e9981e06db93811b731f931ffb954371f54391afeeb0e7ef",
+      "outputFragmentSha256": "d1b426d21d4fff53036a88258b80807d8782e2842b98fe5948ea3031dca61a3a"
+    },
+    {
+      "capture": "4804BA52-C23D-4D20-A73E-3842BA183548",
+      "exitCode": 0,
+      "inputVertexSha256": "ec7691c2f84e130d60382eef946e64a0b110a314ee4579cf3dd126d2288cfcfd",
+      "inputFragmentSha256": "5567e17ac6b496ef1d7f77d8eaef5cf03a1f06a5e8faba4d6584dbe877ebe0e3",
+      "descriptorSha256": "29244baf1905401ecc45368032517d4732826230d2dfc3c374be51d2ce22a994",
+      "outputVertexSha256": "e9327d84f3ee919d0b6b00ab08f111a74badf6c714b1111d29577c23c3975640",
+      "outputFragmentSha256": "3dc81adcd402056df91e69f6fffd776d188970a3172d7e6fbda03086df89bf89"
+    },
+    {
+      "capture": "9CDF4702-EEC2-40A8-9803-23CE52AC4D98",
+      "exitCode": 0,
+      "inputVertexSha256": "ec7691c2f84e130d60382eef946e64a0b110a314ee4579cf3dd126d2288cfcfd",
+      "inputFragmentSha256": "0c6b1841a30dcd96064f91749c67a1ed0e9f3d5f70c6a71abf31d56f2d354f14",
+      "descriptorSha256": "566a2c8ef426bbe6245d6a64779f8a46609359640769231c1f182fbb19452d58",
+      "outputVertexSha256": "e9327d84f3ee919d0b6b00ab08f111a74badf6c714b1111d29577c23c3975640",
+      "outputFragmentSha256": "7d0876d5bf8598fb30358377e0d78e2a195106e3ea598d2fde1e49d1d45bf634"
+    },
+    {
+      "capture": "B677191D-E7C6-4315-9B23-5C66EF20345B",
+      "exitCode": 0,
+      "inputVertexSha256": "3795a7f64d336a1bc202bd856262daebc1b2976d0157b646e37145e66fcd9add",
+      "inputFragmentSha256": "9fcb37c4fdf514719b5f819de4a187f59a5c4bf94592129c919ccf8ea0befc65",
+      "descriptorSha256": "5febebcf719f7199cd97533625fe9d69c4d613f7516d78f4b1fc6bc780e121e9",
+      "outputVertexSha256": "3353c5d06a35edf2e9981e06db93811b731f931ffb954371f54391afeeb0e7ef",
+      "outputFragmentSha256": "7cdf46d4c09c2e157e37bcf993e3258a52ebd65f799f48d7d9501a5117508e66"
+    },
+    {
+      "capture": "DBB8BBB4-B5E7-4AE7-9970-08B1F7A15990",
+      "exitCode": 0,
+      "inputVertexSha256": "60009d2ea39a4c94ad4302eaceb149f7367ad458c312ddb95e8f68c97e816372",
+      "inputFragmentSha256": "d52795c1b067c0bf625ee690853c6d57ec2ed1a0a18b95cc738f3a207270f522",
+      "descriptorSha256": "bbb68051c91ff460828cc55af7e393c1fa386b8d863f884d97beb0adc0123bb5",
+      "outputVertexSha256": "966c04a92145e2e74820bed495d53c375eb507d8490e5f94d99020170a9ea449",
+      "outputFragmentSha256": "7404be129d04f5bffe79fa844cb2b85e5898d1bddba13ef6e054b8586c4e2437"
+    },
+    {
+      "capture": "DBCF412A-1986-4E49-BB39-89B432BC5D2E",
+      "exitCode": 0,
+      "inputVertexSha256": "3795a7f64d336a1bc202bd856262daebc1b2976d0157b646e37145e66fcd9add",
+      "inputFragmentSha256": "c1dfcda682652c66419e22042d95eb359b08323db62b1f8c2896217457698bfb",
+      "descriptorSha256": "d6c76d08db5979b4acc08200e6ebf8de07d957de0f80018b16f5cbf87187612a",
+      "outputVertexSha256": "3353c5d06a35edf2e9981e06db93811b731f931ffb954371f54391afeeb0e7ef",
+      "outputFragmentSha256": "02fc1158fe98d46e6b998fab2184e2e774ac3ac7681c7061564b69955a15b5ab"
+    },
+    {
+      "capture": "F521E920-BA42-4F45-B134-6C3ACE6237DA",
+      "exitCode": 0,
+      "inputVertexSha256": "3795a7f64d336a1bc202bd856262daebc1b2976d0157b646e37145e66fcd9add",
+      "inputFragmentSha256": "d692297f44137a9c09057587779e294f90965d6a29b5e3ae5e8ec100ab5100fd",
+      "descriptorSha256": "92bcfe6ae40503610a6675d00a826b6cd2091e6655294ac63c2b30ea4c8e8a63",
+      "outputVertexSha256": "3353c5d06a35edf2e9981e06db93811b731f931ffb954371f54391afeeb0e7ef",
+      "outputFragmentSha256": "aa9b1d4f00375ed7909bc77319b1014606ab24bc2fdfa413633e5d088af82bb2"
+    }
+  ]
+}

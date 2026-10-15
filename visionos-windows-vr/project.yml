@@ -1,0 +1,230 @@
+name: VisionOSWindowsVR
+options:
+  minimumXcodeGenVersion: 2.38.0
+  deploymentTarget:
+    visionOS: "27.0"
+packages:
+  WindowsVRCore:
+    path: ../windows-vr
+  WindowsVRMetal:
+    path: ../windows-vr-metal
+targets:
+  VisionOSWindowsVR:
+    type: application
+    platform: visionOS
+    dependencies:
+      - package: WindowsVRCore
+      - package: WindowsVRMetal
+        embed: true
+      - target: WindowsVRNativeBridge
+      - target: WindowsRuntimePlugin
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.avpplay.visionos-windows-vr
+        PRODUCT_NAME: WineVision VR
+        TARGETED_DEVICE_FAMILY: "7"
+        XROS_DEPLOYMENT_TARGET: "27.0"
+        SWIFT_VERSION: "6.0"
+        OTHER_LDFLAGS: ["$(inherited)", "-lz", "-llzma"]
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: Apple Development
+        # Increased Memory Limit, the same single memory entitlement Madeira ships (its
+        # "Memory+" badge). Extended Virtual Addressing is deliberately not requested:
+        # personal development teams cannot provision it, and Madeira runs without it.
+        CODE_SIGN_ENTITLEMENTS: Resources/VisionOSWindowsVR.entitlements
+        CODE_SIGNING_REQUIRED: YES
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/WindowsVR-Bridging-Header.h
+        INFOPLIST_KEY_NSWorldSensingUsageDescription: Head tracking places the game's stereo views in your surroundings.
+        INFOPLIST_KEY_NSAccessoryTrackingUsageDescription: Tracked controllers provide poses and controls to your VR game.
+    info:
+      path: Generated-Info.plist
+      properties:
+        LSApplicationQueriesSchemes: [stikdebug, stikjit]
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        GCSupportsControllerUserInteraction: true
+        GCSupportedGameControllers:
+          - ProfileName: SpatialGamepad
+    sources:
+      - path: Sources
+      - path: ${AVPPLAY_RUNTIME_SOURCE}/app/Madeira/madeira-jit.js
+        buildPhase: resources
+      - path: Resources/Runtime
+        type: folder
+        buildPhase: resources
+      # Required at bundle root by Wine's bootstrap loader.
+      - path: Resources/Runtime/aarch64-windows/ntdll.dll
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: aarch64-windows
+      - path: Resources/Runtime/aarch64-windows/apisetschema.dll
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: aarch64-windows
+      - path: Resources/Runtime/arm64ec-windows/ntdll.dll
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: arm64ec-windows
+      - path: Resources/Runtime/arm64ec-windows/apisetschema.dll
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: arm64ec-windows
+      - path: Resources/WindowsVR
+        type: folder
+        buildPhase: resources
+      # Copy helper files individually: a folder resource would replace the
+      # loader directory and delete ntdll/apisetschema on incremental builds.
+      - path: Resources/arm64ec-windows/dockhost.exe
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: arm64ec-windows
+      - path: Resources/arm64ec-windows/dock-notices.txt
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: arm64ec-windows
+      - path: Resources/arm64ec-windows/dock-build.json
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: arm64ec-windows
+      - path: ../third-party/steam-native
+        type: folder
+        buildPhase: resources
+    postBuildScripts:
+      - name: Verify Wine bootstrap bundle
+        script: 'bash "$SRCROOT/../windows-vr-tools/verify_wine_bundle.sh" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"'
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(SRCROOT)/../windows-vr-tools/verify_wine_bundle.sh
+          - $(SRCROOT)/../windows-vr-tools/verify_dxmt_bundle.py
+          - $(SRCROOT)/../windows-vr-tools/verify_openvr_bundle.py
+          - $(SRCROOT)/../windows-runtime-plugin/WindowsVRRuntimePlugin.mm
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)
+  WindowsVRNativeBridge:
+    type: framework
+    platform: visionOS
+    dependencies:
+      - sdk: Metal.framework
+    sources:
+      - path: ../windows-vr-native/Sources
+      - path: ../windows-vr-native/include
+        headerVisibility: public
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.avpplay.windows-vr.native-bridge
+        GENERATE_INFOPLIST_FILE: YES
+        CLANG_ENABLE_OBJC_ARC: YES
+        CLANG_CXX_LANGUAGE_STANDARD: c++20
+        HEADER_SEARCH_PATHS: $(SRCROOT)/../windows-vr-native/include
+        CODE_SIGN_STYLE: Automatic
+  WindowsRuntimePlugin:
+    type: framework
+    platform: visionOS
+    sources:
+      - path: ../windows-runtime-plugin/WindowsVRRuntimePlugin.mm
+      - path: ../windows-vr/include/WindowsVRRuntimePlugin.h
+        headerVisibility: public
+      - path: ${AVPPLAY_RUNTIME_SOURCE}/app/Madeira/WineProcessBridge.m
+      - path: ${AVPPLAY_RUNTIME_SOURCE}/app/Madeira/WineServerBridge.m
+      - path: ${AVPPLAY_RUNTIME_SOURCE}/app/Madeira/FEXBridge.mm
+      - path: ${AVPPLAY_RUNTIME_SOURCE}/app/Madeira/JITAllocator.c
+      - path: ${AVPPLAY_RUNTIME_SOURCE}/app/Madeira/PrefixExtractor.c
+      - path: ${AVPPLAY_RUNTIME_SOURCE}/app/Madeira/AVPPlayWineBuild.c
+      - path: ${AVPPLAY_RUNTIME_SOURCE}/app/Madeira/IOSDisplayShim.m
+      - path: ${AVPPLAY_RUNTIME_SOURCE}/app/Madeira/Winios
+    dependencies:
+      - target: WindowsVRNativeBridge
+      - package: WindowsVRMetal
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.avpplay.windows-vr.runtime
+        PRODUCT_NAME: WindowsRuntimePlugin
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        CLANG_ENABLE_OBJC_ARC: YES
+        CLANG_CXX_LANGUAGE_STANDARD: c++20
+        MADEIRA_FEX_BUILD_DIR: ${AVPPLAY_RUNTIME_SOURCE}/FEX/build-ios
+        MADEIRA_WINE_BUILD_DIR: ${AVPPLAY_RUNTIME_SOURCE}/app/Madeira
+        MADEIRA_DXMT_BUILD_DIR: ${AVPPLAY_RUNTIME_SOURCE}/app/Madeira
+        AVPPLAY_DXMT_LINK_FLAG: ${AVPPLAY_DXMT_LINK_FLAG}
+        HEADER_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/../windows-vr/include
+          - $(SRCROOT)/../windows-vr-native/include
+          - $(SRCROOT)/../windows-vr-openxr/include
+          - $(SRCROOT)/../windows-vr-metal/Sources/WindowsVRMetalABI/include
+          - ${AVPPLAY_RUNTIME_SOURCE}/app/Madeira
+          - ${AVPPLAY_RUNTIME_SOURCE}/build
+          - ${AVPPLAY_RUNTIME_SOURCE}/FEX/FEXCore/include
+          - ${AVPPLAY_RUNTIME_SOURCE}/FEX/FEXHeaderUtils
+          - ${AVPPLAY_RUNTIME_SOURCE}/FEX/CodeEmitter
+          - ${AVPPLAY_RUNTIME_SOURCE}/FEX/External/fmt/include
+          - ${AVPPLAY_RUNTIME_SOURCE}/FEX/External/range-v3/include
+          - ${AVPPLAY_RUNTIME_SOURCE}/FEX/External/unordered_dense/include
+          - $(MADEIRA_FEX_BUILD_DIR)
+          - $(MADEIRA_FEX_BUILD_DIR)/include
+          - $(MADEIRA_FEX_BUILD_DIR)/FEXCore/Source
+        LIBRARY_SEARCH_PATHS:
+          - $(inherited)
+          - $(MADEIRA_WINE_BUILD_DIR)
+          - $(MADEIRA_DXMT_BUILD_DIR)
+          - $(MADEIRA_FEX_BUILD_DIR)/FEXCore/Source
+          - $(MADEIRA_FEX_BUILD_DIR)/External/fmt
+          - $(MADEIRA_FEX_BUILD_DIR)/External/cephes
+          - $(MADEIRA_FEX_BUILD_DIR)/External/xxhash/cmake_unofficial
+          - $(MADEIRA_FEX_BUILD_DIR)/External/SoftFloat-3e
+        OTHER_LDFLAGS:
+          - $(inherited)
+          - -lFEXCore
+          - -lFEXCore_Base
+          - -lJemallocLibs
+          - -lfmt
+          - -lcephes_128bit
+          - -lxxhash
+          - -lsoftfloat_3e
+          - -lntdll_unix
+          - -lwineserver
+          - -lwin32u_unix
+          - $(AVPPLAY_DXMT_LINK_FLAG)
+          - -lgnutls
+          - -lhogweed
+          - -lnettle
+          - -lgmp
+          - -lavformat
+          - -lavcodec
+          - -lswresample
+          - -lavutil
+          - -lz
+          - -lsqlite3
+          - -llzma
+          # Optional legacy DXMT release diagnostics are absent in the modern
+          # backend; preserve the existing weak-import/null-check semantics.
+          - -Wl,-U,_madeira_wmt_released_class
+          - -framework
+          - IOKit
+          - -framework
+          - CoreText
+          - -framework
+          - AVFoundation
+          - -framework
+          - AudioToolbox
+          - -framework
+          - VideoToolbox
+          - -framework
+          - CoreMedia
+          - -framework
+          - CoreVideo
+          - -framework
+          - Metal
+          - -framework
+          - MetalFX
+          - -framework
+          - QuartzCore

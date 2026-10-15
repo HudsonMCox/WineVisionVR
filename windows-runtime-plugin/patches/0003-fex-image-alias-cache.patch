@@ -1,0 +1,98 @@
+--- a/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp
++++ b/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp
+@@ -49,6 +49,10 @@
+  * runtime) are registered late, so oldest-first cost ~150 iterations per
+  * x64->EC call at up to a million calls a second. */
+ IosAliasEntry* volatile IosAliasLast = nullptr;
++// Entry pointers only: every hit rechecks the live range/Size. Retirement and
++// slot reuse retain the authoritative table's existing publication protocol.
++IosAliasEntry* volatile IosAliasForwardCache[256] = {};
++IosAliasEntry* volatile IosAliasReverseCache[256] = {};
+ }
+ 
+ namespace {
+--- a/FEX/Source/Windows/ARM64EC/Module.S
++++ b/FEX/Source/Windows/ARM64EC/Module.S
+@@ -324,13 +324,28 @@
+   // x64 R10 (volatile at this call/ret boundary) and is clobbered by the
+   // entry-thunk path below. NZCV is clobbered by the cmp at check_thunk
+   // regardless.
+-  // ml1116: last-hit entry first, then the table newest-first.
+-  adrp x16, IosAliasLast
+-  ldr x16, [x16, #:lo12:IosAliasLast]
++  // Native targets already in a live executable alias need no translation.
++  // Keep a separate cache for each direction so inter-module calls do not
++  // evict one shared last-hit pointer on every crossing.
++  adrp x16, IosAliasReverseCache
++  add x16, x16, #:lo12:IosAliasReverseCache
++  ubfx x17, x9, #16, #8
++  ldr x16, [x16, x17, lsl #3]
++  cbz x16, ios_ec_xlate_forward_cache
++  ldr x23, [x16, #8]
++  sub x23, x9, x23
++  ldr x4, [x16, #16]
++  cmp x23, x4
++  b.lo ios_ec_xlate_done
++ios_ec_xlate_forward_cache:
++  adrp x16, IosAliasForwardCache
++  add x16, x16, #:lo12:IosAliasForwardCache
++  ubfx x17, x9, #16, #8
++  ldr x16, [x16, x17, lsl #3]
+   cbz x16, ios_ec_xlate_walk
+-  ldr x23, [x16]        // Entry.PeBase
++  ldr x23, [x16]
+   sub x23, x9, x23
+-  ldr x4, [x16, #16]    // Entry.Size
++  ldr x4, [x16, #16]
+   cmp x23, x4
+   b.lo ios_ec_xlate_hit
+ ios_ec_xlate_walk:
+@@ -340,7 +355,7 @@
+   add x16, x16, #:lo12:IosAliasEntries
+   add x16, x16, x17, lsl #5   // one past the last entry
+ ios_ec_xlate_loop:
+-  cbz w17, ios_ec_xlate_done
++  cbz w17, ios_ec_reverse_walk
+   sub x16, x16, #32
+   sub w17, w17, #1
+   ldr x23, [x16]        // Entry.PeBase
+@@ -350,11 +365,37 @@
+   b.lo ios_ec_xlate_hit_walk
+   b ios_ec_xlate_loop
+ ios_ec_xlate_hit_walk:
+-  adrp x4, IosAliasLast
+-  str x16, [x4, #:lo12:IosAliasLast]
++  adrp x4, IosAliasForwardCache
++  add x4, x4, #:lo12:IosAliasForwardCache
++  ubfx x17, x9, #16, #8
++  str x16, [x4, x17, lsl #3]
+ ios_ec_xlate_hit:
+   ldr x4, [x16, #8]     // Entry.JitBase
+   add x9, x4, x23
++  b ios_ec_xlate_done
++ios_ec_reverse_walk:
++  // A direct alias target may not have passed through the forward translator.
++  // Warm its reverse cache from the same authoritative table on the first miss.
++  adrp x17, IosAliasCount
++  ldr w17, [x17, #:lo12:IosAliasCount]
++  adrp x16, IosAliasEntries
++  add x16, x16, #:lo12:IosAliasEntries
++  add x16, x16, x17, lsl #5
++ios_ec_reverse_loop:
++  cbz w17, ios_ec_xlate_done
++  sub x16, x16, #32
++  sub w17, w17, #1
++  ldr x23, [x16, #8]
++  sub x23, x9, x23
++  ldr x4, [x16, #16]
++  cmp x23, x4
++  b.lo ios_ec_reverse_hit
++  b ios_ec_reverse_loop
++ios_ec_reverse_hit:
++  adrp x4, IosAliasReverseCache
++  add x4, x4, #:lo12:IosAliasReverseCache
++  ubfx x17, x9, #16, #8
++  str x16, [x4, x17, lsl #3]
+ ios_ec_xlate_done:
+ #endif
+   // Either return to an exit thunk (return to ARM64EC function) or call an entry thunk (call to ARM64EC function).

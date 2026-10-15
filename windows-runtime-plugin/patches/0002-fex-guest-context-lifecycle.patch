@@ -1,0 +1,116 @@
+--- a/FEX/Source/Windows/ARM64EC/Module.cpp
++++ b/FEX/Source/Windows/ARM64EC/Module.cpp
+@@ -181,6 +181,8 @@
+ };
+ 
+ namespace {
++// Outlive every context owner and the final callback-disabling destructor.
++std::atomic<bool> ContextCallbacksEnabled {false};
+ fextl::unique_ptr<FEXCore::Context::Context> CTX;
+ fextl::unique_ptr<FEX::DummyHandlers::DummySignalDelegator> SignalDelegator;
+ fextl::unique_ptr<Exception::ECSyscallHandler> SyscallHandler;
+@@ -456,6 +458,17 @@
+ void HandleImageUnmap(uint64_t Address, uint64_t Size) {
+   ImageTracker->HandleImageUnmap(Address, Size);
+ }
++// Declared after the context owners so this destructor runs before theirs.
++// Optional/unique_ptr storage can still appear engaged while CRT teardown is
++// invoking its destructors; callbacks must use explicit lifecycle state.
++struct ContextCallbackStopper {
++  ~ContextCallbackStopper() { ContextCallbacksEnabled.store(false, std::memory_order_release); }
++};
++ContextCallbackStopper ContextCallbackStopperState;
++
++bool ContextCallbacksActive() {
++  return ContextCallbacksEnabled.load(std::memory_order_acquire) && CTX;
++}
+ } // namespace
+ 
+ namespace Exception {
+@@ -1107,10 +1120,15 @@
+     std::this_thread::sleep_for(std::chrono::seconds(StartupSleep()));
+   }
+ 
++  ContextCallbacksEnabled.store(true, std::memory_order_release);
+   return STATUS_SUCCESS;
+ }
+ 
+-void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
++void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
++  if (!After && (!Handle || Handle == NtCurrentProcess())) {
++    ContextCallbacksEnabled.store(false, std::memory_order_release);
++  }
++}
+ 
+ class ScopedCallbackDisable {
+ private:
+@@ -1130,6 +1148,7 @@
+ 
+ // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
+ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
++  if (!ContextCallbacksActive()) return false;
+   auto Thread = CPUArea.ThreadState();
+   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedSignalTime);
+   /* ml1039: an access violation is only diagnosable with its DATA address. "Address" is the faulting PC; the
+@@ -1362,6 +1381,7 @@
+ }
+ 
+ NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
++  if (!ContextCallbacksActive()) return STATUS_SUCCESS;
+   bool Cont {};
+   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
+@@ -1418,7 +1438,7 @@
+  * required for its correctness. Drop the BEFORE/AFTER mutex entirely
+  * and just call into the tracker directly on AFTER. */
+ void NotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL After, NTSTATUS Status) {
+-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
++  if (!ContextCallbacksActive() || !InvalidationTracker || !GetCPUArea().ThreadState()) {
+     return;
+   }
+ 
+@@ -1431,7 +1451,7 @@
+ }
+ 
+ void NotifyMemoryFree(void* Address, SIZE_T Size, ULONG FreeType, BOOL After, NTSTATUS Status) {
+-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
++  if (!ContextCallbacksActive() || !InvalidationTracker || !GetCPUArea().ThreadState()) {
+     return;
+   }
+ 
+@@ -1443,7 +1463,7 @@
+ }
+ 
+ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, NTSTATUS Status) {
+-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
++  if (!ContextCallbacksActive() || !InvalidationTracker || !GetCPUArea().ThreadState()) {
+     return;
+   }
+ 
+@@ -1552,7 +1572,7 @@
+ }
+ 
+ void FlushInstructionCacheHeavy(const void* Address, SIZE_T Size) {
+-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
++  if (!ContextCallbacksActive() || !InvalidationTracker || !GetCPUArea().ThreadState()) {
+     return;
+   }
+ 
+@@ -1561,7 +1581,7 @@
+ }
+ 
+ void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
+-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
++  if (!ContextCallbacksActive() || !InvalidationTracker || !GetCPUArea().ThreadState()) {
+     return;
+   }
+ 
+@@ -1570,7 +1590,7 @@
+ }
+ 
+ void BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size) {
+-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
++  if (!ContextCallbacksActive() || !InvalidationTracker || !GetCPUArea().ThreadState()) {
+     return;
+   }
+ 

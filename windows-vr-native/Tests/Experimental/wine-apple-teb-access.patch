@@ -1,0 +1,75 @@
+--- a/wine/include/winnt.h
++++ b/wine/include/winnt.h
+@@ -2574,6 +2574,14 @@
+ {
+     return (struct _TEB *)__readfsdword( 0x18 );
+ }
++#elif (defined(__aarch64__) || defined(__arm64ec__)) && defined(MADEIRA_APPLE_TEB)
++/* Darwin owns x18. All Wine C callers obtain the TEB through the same
++ * ntdll helper, including address arithmetic that cannot fault at x18. */
++NTSYSAPI struct _TEB * WINAPI __wine_ios_current_teb(void);
++static FORCEINLINE struct _TEB * WINAPI NtCurrentTeb(void)
++{
++    return __wine_ios_current_teb();
++}
+ #elif (defined(__aarch64__) || defined(__arm64ec__)) && defined(__GNUC__)
+ register struct _TEB *__wine_current_teb __asm__("x18");
+ static FORCEINLINE struct _TEB * WINAPI NtCurrentTeb(void)
+--- a/wine/dlls/ntdll/thread.c
++++ b/wine/dlls/ntdll/thread.c
+@@ -37,6 +37,23 @@
+ 
+ struct _KUSER_SHARED_DATA *user_shared_data = (void *)0x7ffe0000;
+ 
++#if defined(__aarch64__) || defined(__arm64ec__)
++TEB * WINAPI __wine_ios_current_teb(void)
++{
++#ifdef MADEIRA_APPLE_TEB
++    extern unsigned int ios_teb_tsd_offset;
++    ULONG_PTR base;
++    __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(base));
++    /* The unix loader publishes the actual pthread TSD slot before PE entry.
++     * Never hard-code a slot or recover it from Darwin's reserved x18. */
++    if (!ios_teb_tsd_offset) return NULL;
++    return *(TEB **)((base & ~(ULONG_PTR)7) + ios_teb_tsd_offset);
++#else
++    return NtCurrentTeb();
++#endif
++}
++#endif
++
+ struct debug_info
+ {
+     unsigned int str_pos;       /* current position in strings buffer */
+--- a/wine/dlls/ntdll/ntdll.spec
++++ b/wine/dlls/ntdll/ntdll.spec
+@@ -205,6 +205,7 @@
+ @ stdcall -syscall NtCreateUserProcess(ptr ptr long long ptr ptr long long ptr ptr ptr)
+ # @ stub NtCreateWaitablePort
+ @ stdcall -arch=i386 NtCurrentTeb()
++@ stdcall -arch=arm64,arm64ec __wine_ios_current_teb()
+ @ stdcall -syscall NtDebugActiveProcess(long long)
+ @ stdcall -syscall NtDebugContinue(long ptr long)
+ @ stdcall -syscall=0x0034 NtDelayExecution(long ptr)
+--- a/build/wine-pe/build-ntdll.sh
++++ b/build/wine-pe/build-ntdll.sh
+@@ -15,7 +15,7 @@
+ export PATH="$TC:$PATH"
+ B="$R/wine/build-arm64ec"
+ if [ ! -f "$B/config.status" ]; then
+-    mkdir -p "$B" && cd "$B" && ../configure --enable-archs=arm64ec --without-x --disable-tests --enable-winegstreamer
++    mkdir -p "$B" && cd "$B" && CFLAGS="${CFLAGS:-} -DMADEIRA_APPLE_TEB" ../configure --enable-archs=arm64ec --without-x --disable-tests --enable-winegstreamer
+ fi
+ cd "$B" && make -C dlls/ntdll
+ SRC="$B/dlls/ntdll/arm64ec-windows/ntdll.dll"; OUT="$R/app/Madeira/arm64ec-windows/ntdll.dll"
+--- a/build/wine-pe/build-modules.sh
++++ b/build/wine-pe/build-modules.sh
+@@ -58,7 +58,7 @@
+ done
+ 
+ if [ ! -f "$B/config.status" ]; then
+-    mkdir -p "$B" && (cd "$B" && ../configure --enable-archs=arm64ec --without-x --disable-tests --enable-winegstreamer)
++    mkdir -p "$B" && (cd "$B" && CFLAGS="${CFLAGS:-} -DMADEIRA_APPLE_TEB" ../configure --enable-archs=arm64ec --without-x --disable-tests --enable-winegstreamer)
+ fi
+ # widl looks for stdole2.tlb under aarch64-windows/ when it builds an ARM64EC
+ # typelib import (shell32 and others); this tree builds it into arm64ec-windows/.

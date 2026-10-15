@@ -1,0 +1,31 @@
+{
+  "target": "Vision Pro M2 / visionOS 27",
+  "baselineMovingGuestFPS": [
+    29.14,
+    29.73
+  ],
+  "baselinePredatesQueryRepair": true,
+  "optimization": "release guest images after owned copy instead of after full presentation",
+  "resolutionChanged": false,
+  "copiesEliminated": false,
+  "fourfoldGainEstablished": false,
+  "gameLaunchedByAgent": false,
+  "checks": {
+    "signedBuild": "passed",
+    "wineBootstrap": "passed",
+    "simulatorOwnershipAndEarlyRelease": "passed; actual producer overwrite while display pending",
+    "GPUStageClassification": "passed"
+  },
+  "physicalValidationPending": [
+    "FPS comparison",
+    "producer reuse latency",
+    "freeze recovery"
+  ],
+  "evidence": [
+    "/private/tmp/avpplay-frame-transfer-test.log",
+    "/private/tmp/avpplay-transfer-gpu-statistics-test.log",
+    "/private/tmp/avpplay-transfer-performance-build.log",
+    "/private/tmp/avpplay-transfer-performance-install.json"
+  ],
+  "installOutcome": "success"
+}

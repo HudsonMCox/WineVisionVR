@@ -1,0 +1,29 @@
+{
+  "date": "2026-10-13",
+  "diagnosis": "Final game color textures contained opaque visible pixels, but presentation cleared every depth pixel to zero after the color pass.",
+  "repair": "Write opaque game color and a finite projection-plane reverse-Z depth together in the presentation pass; predict device anchors at presentation time.",
+  "simulatorGPUResult": "passed",
+  "checks": [
+    "Production Metal shaders compile",
+    "2D and array source pipelines build with Depth32Float",
+    "Zero-alpha game input produces opaque game color",
+    "Crop/scaling preserves source colors",
+    "Game viewport writes nonzero depth",
+    "Unused viewport remains zero depth",
+    "Negative control retains readable color with zero depth"
+  ],
+  "headsetVisualResult": "Awaiting user verification; no game launched by this test",
+  "limitations": [
+    "Finite focal-plane depth until guest per-pixel composition depth is implemented",
+    "Simulator does not establish headset compositor visibility or performance"
+  ],
+  "sources": [
+    "https://developer.apple.com/videos/play/wwdc2024/10092/",
+    "https://github.com/alvr-org/alvr-visionos/blob/main/ALVRClient/Renderer.swift"
+  ],
+  "sourceSha256": {
+    "visionos-windows-vr/Sources/Rendering/WindowsVRCompositorScene.swift": "8d16ee13ed0352ef1ea78bb87cc67397559d9a0d9b000ac62a0a8c174e9753f1",
+    "windows-vr-native/Tests/SimulatorPresentationProbe.mm": "f35ee9b420e5b3704f204e2a30910979410efab8cc69a96950860f2169ddd245",
+    "windows-vr-tools/test_simulator_presentation.sh": "32f8c155206df43d3fbebb30bd924ab195f56b0c491e254c566660f245c8fe77"
+  }
+}

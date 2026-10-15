@@ -1,0 +1,39 @@
+{
+  "date": "2026-10-13",
+  "deviceRunBeforeRepair": {
+    "approximateGameFPS": 27,
+    "trackedHeadSamplesPresent": true,
+    "diagnosticLog": "/private/tmp/avpplay-motion-launcher.log"
+  },
+  "changes": [
+    "Immutable render-pose metadata retained with submitted stereo frames",
+    "OpenXR view poses use the frame wait/begin snapshot for requested display time",
+    "Cached images rotationally reprojected into current per-eye views",
+    "Only GPU-ready frames acquired so guest event waits cannot block display refresh",
+    "Controller discovery supports GCSpatialAccessory and GCController with reconnection updates",
+    "Controller input polled as complete snapshots instead of resetting held buttons on empty transition queue",
+    "Controller support declared in app Info.plist",
+    "Expensive GPU frame readback and PNG diagnostics require explicit WVRFrameCapture flag"
+  ],
+  "validation": {
+    "simulatorBridge": "passed including delayed GPU producer and historical pose identity",
+    "simulatorPresentation": "passed including reprojection sampling in 2D and array textures",
+    "guestOpenXRBuild": "passed",
+    "signedVisionOS27Build": "passed",
+    "physicalControllerAndHeadsetMotion": "awaiting user verification"
+  },
+  "limitations": [
+    "Rotational reprojection cannot reconstruct scene-dependent translation without guest depth",
+    "No claim that the game render rate reaches display refresh rate",
+    "Physical PSVR inputs and tracking are not tested in Simulator"
+  ],
+  "sourceSha256": {
+    "visionos-windows-vr/Sources/Rendering/WindowsVRCompositorScene.swift": "2b2d035d72e5973c36402c18b86b32557ff18a2e72d9ed94d41ff04f75de7bc6",
+    "visionos-windows-vr/Sources/Rendering/WindowsVRControllerProvider.swift": "090c664966a1f567f8a6234563818de20ac51a3e58a2b99fcc8f42b118007853",
+    "windows-vr-native/Sources/WindowsVRCompositorBridge.mm": "0cf8f5a115c5a2c984322ad9c108ec285a43b589ccde61bf1a3d9299050dd999",
+    "windows-vr-native/include/WindowsVRCompositorBridge.h": "07b5c575243ffac4479b214fe2cdb692f57940c4451103842e5e5b9bc9449381",
+    "windows-vr-openxr/src/WindowsVROpenXR.cpp": "d65bc7f3cf91f7ac0a62682f2da5c36f8e4806b474c395699cfe1ed554c944c6",
+    "windows-vr-native/Tests/SimulatorCompositorProbe.mm": "f51a481c84df3d866f2f2cbce20a263258c35e078bfbe6c52a8fd8da496b6dfb",
+    "windows-vr-native/Tests/SimulatorPresentationProbe.mm": "ef73b0afe1f6403d26157dbbec4946bd97ec0ab5fd721cd9bca93aa4dbb999c1"
+  }
+}

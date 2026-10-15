@@ -1,0 +1,86 @@
+--- a/StikDebug/Device/TunnelDiagnostics.swift
++++ b/StikDebug/Device/TunnelDiagnostics.swift
+@@ -59,8 +59,27 @@
+     /// fifteen minutes, because universal.js had sent `c` and the target had
+     /// not raised a `brk`.  The watchdog in `JITEnableContext` reads this to
+     /// tell "still working" from "wedged".
++    private var preparedArenas: Set<UInt> = []
+     private var lastScriptActivity: Date = .distantPast
+     private let activityLock = NSLock()
++
++    func hasPreparedArena(for proxy: OpaquePointer) -> Bool {
++        activityLock.lock()
++        defer { activityLock.unlock() }
++        return preparedArenas.contains(UInt(bitPattern: proxy))
++    }
++
++    func markArenaPrepared(for proxy: OpaquePointer) {
++        activityLock.lock()
++        preparedArenas.insert(UInt(bitPattern: proxy))
++        activityLock.unlock()
++    }
++
++    func clearPreparedArena(for proxy: OpaquePointer) {
++        activityLock.lock()
++        preparedArenas.remove(UInt(bitPattern: proxy))
++        activityLock.unlock()
++    }
+ 
+     var secondsSinceScriptActivity: TimeInterval {
+         activityLock.lock()
+--- a/StikDebug/JSSupport/JSDebugSupport.swift
++++ b/StikDebug/JSSupport/JSDebugSupport.swift
+@@ -272,6 +272,7 @@
+         return nil
+     }
+ 
++    TunnelDiagnostics.shared.markArenaPrepared(for: debugProxy)
+     let elapsed = Date().timeIntervalSince(started)
+     let pagesPerSecond = elapsed > 0 ? Double(commandCount) / elapsed : 0
+     TunnelDiagnostics.shared.ok("arena", String(format: "0x%llx served in %.2f s (%.0f pages/s, %.1f MiB/s of arena), verified, %d replies / %d errors",
+--- a/StikDebug/Device/JITEnableContext.swift
++++ b/StikDebug/Device/JITEnableContext.swift
+@@ -29,7 +29,8 @@
+     /// twenty seconds of silence after that means the target has not raised
+     /// its `brk` and probably never will while it is in the background.
+     static let jitIdleWarningSeconds: TimeInterval = 20
+-    /// Hard cap on the whole script run.
++    /// Setup deadline only. An established JIT service remains attached until
++    /// the script returns or the target exits; ordinary game time is not failure.
+     static let jitScriptTimeoutSeconds: TimeInterval = 120
+     /// How long to let the script unwind after the interrupt that unwedges it.
+     static let jitScriptGraceSeconds: TimeInterval = 10
+@@ -732,6 +733,8 @@
+             TunnelDiagnostics.shared.step("attach", "handing pid \(pid) to the script; universal.js issues its own vAttach")
+             let semaphore = DispatchSemaphore(value: 0)
+             TunnelDiagnostics.shared.markScriptActivity()
++            TunnelDiagnostics.shared.clearPreparedArena(for: debugProxy)
++            defer { TunnelDiagnostics.shared.clearPreparedArena(for: debugProxy) }
+             callback(pid, debugProxy, remoteServer, semaphore)
+ 
+             // The script blocks in `send_command("c")` until the target raises
+@@ -749,7 +752,8 @@
+                 }
+ 
+                 let idle = TunnelDiagnostics.shared.secondsSinceScriptActivity
+-                if !warnedIdle && idle >= Self.jitIdleWarningSeconds {
++                let jitPrepared = TunnelDiagnostics.shared.hasPreparedArena(for: debugProxy)
++                if !jitPrepared && !warnedIdle && idle >= Self.jitIdleWarningSeconds {
+                     warnedIdle = true
+                     let message = "app has not requested JIT memory yet — switch back to the app"
+                     TunnelDiagnostics.shared.fail("jit", message)
+@@ -759,12 +763,12 @@
+                         userInfo: ["message": message]
+                     )
+                 }
+-                if warnedIdle && idle < Self.jitIdleWarningSeconds {
++                if warnedIdle && (jitPrepared || idle < Self.jitIdleWarningSeconds) {
+                     warnedIdle = false
+                     TunnelDiagnostics.shared.ok("jit", "script activity resumed")
+                 }
+ 
+-                if Date().timeIntervalSince(scriptStart) >= Self.jitScriptTimeoutSeconds {
++                if !jitPrepared && Date().timeIntervalSince(scriptStart) >= Self.jitScriptTimeoutSeconds {
+                     let message = String(
+                         format: "script never finished after %.0f s (last activity %.0f s ago) — interrupting pid %d and giving up",
+                         Self.jitScriptTimeoutSeconds, idle, pid

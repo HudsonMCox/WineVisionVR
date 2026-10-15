@@ -1,0 +1,25 @@
+diff --git a/src/airconv/airconv_context.cpp b/src/airconv/airconv_context.cpp
+--- a/src/airconv/airconv_context.cpp
++++ b/src/airconv/airconv_context.cpp
+@@ -25,6 +25,9 @@
+ #include "llvm/Transforms/Utils/Mem2Reg.h"
+ 
+ #include "airconv_context.hpp"
++#if defined(DXMT_VISIONOS)
++#include "wvr_metallib_platform.h"
++#endif
+ 
+ #include "air_msad.h"
+ #include "air_samplepos.h"
+@@ -50,7 +53,11 @@
+     "v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:"
+     "16:32"
+   );
++#if defined(DXMT_VISIONOS)
++  M.setSDKVersion(VersionTuple(WVR_METALLIB_SDK_MAJOR, WVR_METALLIB_SDK_MINOR));
++#else
+   M.setSDKVersion(VersionTuple(15, 0));
++#endif
+   M.addModuleFlag(Module::ModFlagBehavior::Error, "wchar_size", 4);
+   M.addModuleFlag(Module::ModFlagBehavior::Max, "frame-pointer", 2);
+   M.addModuleFlag(Module::ModFlagBehavior::Max, "air.max_device_buffers", 31);

@@ -1,0 +1,72 @@
+--- a/src/dxmt/dxmt_occlusion_query.hpp
++++ b/src/dxmt/dxmt_occlusion_query.hpp
+@@ -3,6 +3,7 @@
+ #include "Metal.hpp"
+ #include "rc/util_rc_ptr.hpp"
+ #include "wsi_platform.hpp"
++#include <algorithm>
+ #include <atomic>
+ #include <cassert>
+ #include <cstdint>
+@@ -117,6 +118,12 @@
+   issue(uint64_t seqId, uint64_t const *readbackBuffer, unsigned numResults) {
+     assert(seqId >= seq_id_begin);
+     assert(seqId <= seq_id_end);
++    if (!numResults) {
++      // No samples in this chunk: publish its completion, not a fabricated
++      // visibility value. Earlier readback contributions remain accumulated.
++      seq_id_issued = seqId;
++      return;
++    }
+     uint64_t const *start = seqId == seq_id_begin ? readbackBuffer + occlusion_counter_begin : readbackBuffer;
+     uint64_t const *end = seqId == seq_id_end ? readbackBuffer + occlusion_counter_end : readbackBuffer + numResults;
+     assert(start <= end);
+@@ -165,6 +172,7 @@
+       seq_id(seq_id),
+       num_results(num_results),
+       queries(queries) {
++        if (!num_results) return; // Metal cannot allocate a zero-length buffer.
+         visibility_result_heap_info.options = WMTResourceHazardTrackingModeUntracked;
+         visibility_result_heap_info.memory.set(nullptr);
+ #ifdef __i386__
+@@ -188,10 +196,23 @@
+   uint64_t seq_id;
+   uint64_t num_results;
+   std::vector<Rc<VisibilityResultQuery>> queries;
+-  WMTBufferInfo visibility_result_heap_info;
++  WMTBufferInfo visibility_result_heap_info{};
+   WMT::Reference<WMT::Buffer> visibility_result_heap;
+ };
+ 
++// Preserve an ended query's final completion barrier even when that chunk
++// contains no visibility samples. Readback destruction runs on the ordered
++// finish thread after GPU completion, so earlier real samples are retained.
++inline std::unique_ptr<VisibilityResultReadback>
++FlushVisibilityQueries(WMT::Device device, uint64_t seqId, uint64_t count,
++                       std::vector<Rc<VisibilityResultQuery>> &queries) {
++  std::unique_ptr<VisibilityResultReadback> readback;
++  if (count || !queries.empty())
++    readback = std::make_unique<VisibilityResultReadback>(device, seqId, count, queries);
++  std::erase_if(queries, [=](const auto &query) { return query->queryEndAt() == seqId; });
++  return readback;
++}
++
+ /**
+  * TODO: rename the whole file to dxmt_query.hpp
+  */
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -896,12 +896,7 @@
+ 
+   QueryReadbacks readbacks{};
+ 
+-  if (auto count = vro_state_.reset()) {
+-    readbacks.visibility = std::make_unique<VisibilityResultReadback>(
+-        device_, seqId, count, pending_queries_
+-    );
+-  }
+-  std::erase_if(pending_queries_, [=](auto &query) -> bool { return query->queryEndAt() == seqId; });
++  readbacks.visibility = FlushVisibilityQueries(device_, seqId, vro_state_.reset(), pending_queries_);
+ 
+   readbacks.timestamp = timestamp_state_.flush(cmdbuf);
+ 

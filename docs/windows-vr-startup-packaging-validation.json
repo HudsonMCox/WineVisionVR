@@ -1,0 +1,29 @@
+{
+  "date": "2026-10-13",
+  "failingRun": "22:53:36\u201322:56:02 America/Indianapolis",
+  "cause": "Steam helper folder copy replaced arm64ec-windows and removed Wine bootstrap DLLs; guest thread exited through load_ntdll fatal error, leaving stale running status.",
+  "evidence": [
+    "Recorded guest pthread_exit at __wine_main+0x2288",
+    "Call site resolves to fatal_error(\"failed to load %s error %x\")",
+    "Broken app lacks root arm64ec-windows/ntdll.dll while Runtime copy exists",
+    "No OpenXR/game frame submission",
+    "PSVR2 controllers connected/tracked with changing button inputs"
+  ],
+  "validation": {
+    "brokenBundleCheck": "rejected as expected",
+    "correctedSignedBuild": "passed",
+    "incrementalHelperResourceUpdate": "passed",
+    "headsetGameLaunch": "not performed"
+  },
+  "bundledLoaderSha256": {
+    "aarch64-windows/ntdll.dll": "e97f6511d260ad50c8307ab00ea26e2e7b223786ef5c7220b5c564cbd74a1961",
+    "aarch64-windows/apisetschema.dll": "678533718e811293367b8d82374d7dee3673cdf25f179e06d0152011425d0d19",
+    "arm64ec-windows/ntdll.dll": "f5e5ef7c230ddf23ed3d62d2701143ab3f7768bd197f2cc973159cd6c6a61561",
+    "arm64ec-windows/apisetschema.dll": "515f37514dd996b39deb86393ea5fd0c93bcf411e7d591351cc448d6221334b4"
+  },
+  "sourceSha256": {
+    "visionos-windows-vr/project.yml": "099d743a1d654346ffafcccd6dabdcd69bcda2915ee95a5cfb9929c1d5177d96",
+    "visionos-windows-vr/project.prebuilt.yml": "3bff120a0470d4155992418f6f4be7fe19611c849048cf9114985594e5951cb7",
+    "windows-vr-tools/verify_wine_bundle.sh": "348f0595ea025c74673ebdcba13dc38aee40c332436bbce6065fb0abbecdd6cb"
+  }
+}

@@ -1,0 +1,43 @@
+--- a/src/dxmt/dxmt_occlusion_query.hpp
++++ b/src/dxmt/dxmt_occlusion_query.hpp
+@@ -113,6 +113,12 @@
+   uint64_t queryEndAt() {
+     return seq_id_end;
+   };
++
++  struct Progress { uint64_t begin, end, issued, samples; };
++  Progress progress() const {
++    return {seq_id_begin.load(), seq_id_end.load(), seq_id_issued.load(), accumulated_value_.load()};
++  }
++
+ 
+   void
+   issue(uint64_t seqId, uint64_t const *readbackBuffer, unsigned numResults) {
+--- a/src/d3d11/d3d11_query.cpp
++++ b/src/d3d11/d3d11_query.cpp
+@@ -10,6 +10,7 @@
+ 
+   Rc<VisibilityResultQuery> query_ = new VisibilityResultQuery();
+   uint64_t accumulated_value_ = 0;
++  uint64_t pending_polls_ = 0;
+ 
+   virtual UINT STDMETHODCALLTYPE
+   GetDataSize() override {
+@@ -29,7 +30,17 @@
+       }
+       query_ = new VisibilityResultQuery();
+       state_ = QueryState::Signaled;
++      pending_polls_ = 0;
+       return S_OK;
++    }
++    ++pending_polls_;
++    if (pending_polls_ == 1024 ||
++        (pending_polls_ >= 1048576 && (pending_polls_ & (pending_polls_ - 1)) == 0)) {
++      const auto progress = query_->progress();
++      WARN("wvr-occlusion-state object=", this, " result=", query_.ptr(),
++           " begin=", progress.begin, " end=", progress.end,
++           " issued=", progress.issued, " samples=", progress.samples,
++           " polls=", pending_polls_);
+     }
+     return S_FALSE;
+   }

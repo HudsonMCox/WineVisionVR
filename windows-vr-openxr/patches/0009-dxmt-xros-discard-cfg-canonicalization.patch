@@ -1,0 +1,17 @@
+--- a/src/airconv/airconv_context.cpp
++++ b/src/airconv/airconv_context.cpp
+@@ -157,6 +157,14 @@
+     GlobalCleanupPM.addPass(air::Lower16BitTexReadPass());
+     GlobalCleanupPM.addPass(air::SimdgroupImplicitMemBarrierPass());
+ 
++#ifdef DXMT_VISIONOS
++    // Merge equivalent side effects and their PHIs before Metal backend optimization.
++    // In particular, duplicated discard branches otherwise survive the default
++    // cleanup and trigger the visionOS fragment compiler's PHI-removal failure.
++    GlobalCleanupPM.addPass(SimplifyCFGPass(
++      SimplifyCFGOptions().hoistCommonInsts(true).sinkCommonInsts(true)));
++#endif
++
+     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(GlobalCleanupPM), true /* ? */));
+   }
+ 

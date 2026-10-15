@@ -1,0 +1,72 @@
+{
+  "target": {
+    "hardware": "Vision Pro M2",
+    "visionOS": "27"
+  },
+  "moss": {
+    "latestGuestFrames": 806,
+    "observedGPUCompleted": 5494,
+    "observedGPUFailures": 0,
+    "movingGuestFPSApproximate": 27,
+    "freezeRootCauseConfirmed": false
+  },
+  "boneworks": {
+    "unityLog": "/private/tmp/avpplay-boneworks-unity.log",
+    "error": "VRInitError_Init_PathRegistryNotFound (110)",
+    "repair": "stable OpenComposite user path registration",
+    "physicalRepairVerified": false
+  },
+  "checks": {
+    "swiftOpenVRAndOpenXRRegistration": "passed; actual Swift helper run twice in synthetic prefix",
+    "inputMenuAndOpenXRHaptics": "passed; production input/apply/stop functions with synthetic controller state",
+    "simulatorHapticQueue": "passed; hand isolation, replacement, explicit stop, duration, pause",
+    "originalQueryHelpersThreadSanitizer": "failed with data races, as expected",
+    "repairedQueryHelpersThreadSanitizer": "passed; actual production classes",
+    "arm64ecD3D11Build": "passed",
+    "D3D11ImportsAndExports": "identical contract to previously installed DLL",
+    "simulatorPresentation": "passed; production MSL, crop, array input, opaque alpha, reprojection and reverse-Z depth",
+    "signedDeviceBuild": "passed",
+    "wineBootstrapBundle": "passed; both architectures",
+    "graphicsPackageReceipt": "passed; real runtime validator accepts all four DLLs and rejects stale D3D11 hash/missing D3D12; mandatory build check added"
+  },
+  "physicalValidationPending": [
+    "Moss freeze repair",
+    "BONEWORKS later startup/gameplay",
+    "menu press/release in games",
+    "controller vibration/cancellation",
+    "real FPS and latency comparison"
+  ],
+  "changes": [
+    "query result publication synchronization and pending-query diagnostics",
+    "OpenVR prefix registration",
+    "Share menu button mapping",
+    "retained haptic players and stop/replacement/interruption lifecycle",
+    "five-second haptic duration bound and explicit zero stop",
+    "merged presentation clear/draw passes"
+  ],
+  "gameLaunchedByAgent": false,
+  "foveationEnabled": false,
+  "temporalReconstructionEnabled": false,
+  "frameGenerationEnabled": false,
+  "plan": "docs/windows-vr-performance-foveation-plan.md",
+  "evidence": [
+    "/private/tmp/avpplay-query-baseline-tsan.log",
+    "/private/tmp/avpplay-query-build.log",
+    "/private/tmp/avpplay-menu-haptic-simulator.log",
+    "/private/tmp/avpplay-merged-presentation-test.log",
+    "/private/tmp/avpplay-query-menu-haptic-build.log",
+    "/private/tmp/avpplay-query-menu-haptic-install.json"
+  ],
+  "installation": {
+    "status": "success",
+    "bundleID": "org.avpplay.visionos-windows-vr",
+    "launchPerformed": false
+  },
+  "packageReceiptRegression": {
+    "cause": "D3D11-only query rebuild updated runtime resource receipts but omitted shared DXMT profile DLL hash",
+    "fixed": true,
+    "nativePackageCheckBypassed": false,
+    "originalFullBuildReceiptPreserved": true,
+    "localOverrideRecorded": true
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "upstreamRevision": "8a7fc130b033dc1803313269ec3f9388cb63b7c7",
+  "baseline": "locally ported visionOS helper, before lifecycle correction",
+  "sourceFilesSha256": {
+    "StikDebug/Device/JITEnableContext.swift": "0e2e78cfc69ec815b136e95f39b2ebcc3159aa6b7decf6a9aebe2cc1851b4a1e",
+    "StikDebug/Device/TunnelDiagnostics.swift": "08066d64a27df33413662a2ba36540cb81d63404d103d9f183675aada30e32c6",
+    "StikDebug/JSSupport/JSDebugSupport.swift": "74c9424acd087c853e5e843b7ff01a4c6180d299e046b44b38b8bd542af04ef6"
+  }
+}

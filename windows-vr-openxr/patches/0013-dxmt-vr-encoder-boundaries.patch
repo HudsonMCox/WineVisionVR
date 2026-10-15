@@ -1,0 +1,48 @@
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -5130,6 +5130,18 @@
+     }
+   }
+ 
++  // VR waits and submissions are encoder boundaries, just like D3D11
++  // flush/present. Serialize command recording and close the current pass
++  // before inserting a standalone event encoder or committing a chunk.
++  template <CommandWithContext<ArgumentEncodingContext> cmd>
++  void EmitWindowsVROperation(cmd &&fn, bool commit) {
++    std::lock_guard<mutex_t> lock(mutex);
++    InvalidateCurrentPass(true);
++    EmitOP(std::forward<cmd>(fn));
++    if (commit)
++      Commit();
++  }
++
+   void ResetEncodingContextState() {
+     InvalidateCurrentPass(true);
+     // TODO: optimize by clearing only bound resource
+@@ -5548,12 +5560,11 @@
+     layout.rightSlice = frame->rightArraySlice; layout.rightX = frame->rightX; layout.rightY = frame->rightY;
+     layout.rightWidth = frame->rightWidth; layout.rightHeight = frame->rightHeight;
+     auto result = std::make_shared<WindowsVRSubmissionResult>();
+-    ctx_->EmitOP([leftTexture = std::move(leftTexture), rightTexture = std::move(rightTexture),
++    ctx_->EmitWindowsVROperation([leftTexture = std::move(leftTexture), rightTexture = std::move(rightTexture),
+                   frameCopy = layout, result](ArgumentEncodingContext &enc) mutable {
+       enc.queueWindowsVRSubmission(leftTexture->current()->texture(), rightTexture->current()->texture(),
+                                      frameCopy, result);
+-    });
+-    ctx_->Commit();
++    }, true);
+     std::unique_lock<std::mutex> resultLock(result->mutex);
+     if (!result->changed.wait_for(resultLock, std::chrono::seconds(2), [&] { return result->completed; })) {
+       result->cancelled = true;
+@@ -5585,9 +5596,9 @@
+       ticket = found->second.ticket; windows_vr_leases_.erase(found);
+     }
+     WMT::Reference<WMT::Event> waitEvent(event);
+-    ctx_->EmitOP([event = std::move(waitEvent), retainedResource = std::move(retainedResource), ticket](ArgumentEncodingContext &enc) mutable {
++    ctx_->EmitWindowsVROperation([event = std::move(waitEvent), retainedResource = std::move(retainedResource), ticket](ArgumentEncodingContext &enc) mutable {
+       enc.waitEvent(std::move(event), ticket);
+-    });
++    }, false);
+     return S_OK;
+   }
+ 

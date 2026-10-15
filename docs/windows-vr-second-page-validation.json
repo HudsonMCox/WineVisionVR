@@ -1,0 +1,21 @@
+{
+  "trigger": "Moss second book page",
+  "confirmedBlockingPath": "D3D11 occlusion GetData polls",
+  "freezeFrames": 793,
+  "observedGPUCompleted": 5402,
+  "observedGPUFailures": 0,
+  "specificAssetOrShaderRuledOut": false,
+  "queryTailDefectConfirmedInSource": true,
+  "physicalFreezeFixConfirmed": false,
+  "queryRepairUsesRealCompletion": true,
+  "syntheticQueryFactoryReadbackTest": "passed under Thread Sanitizer",
+  "boneworksFault": "OpenComposite basic_ofstream::open invalid stream vtable",
+  "x64SharedCXXDependencyRemoved": true,
+  "boneworksPhysicalFixConfirmed": false,
+  "VRDLLExportContractsUnchanged": true,
+  "launcherUI": "selected game/artwork/Play first; advanced controls in separate options page",
+  "signedBuild": "passed",
+  "bundleChecks": "passed; bootstrap, actual DXMT validator, x64 C++ import closure",
+  "gameLaunchedByAgent": false,
+  "installOutcome": "success"
+}

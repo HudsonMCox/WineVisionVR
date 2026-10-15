@@ -1,0 +1,399 @@
+diff --git a/src/airconv/airconv_cli.cpp b/src/airconv/airconv_cli.cpp
+index e9e6573..1cb08a0 100644
+--- a/src/airconv/airconv_cli.cpp
++++ b/src/airconv/airconv_cli.cpp
+@@ -395,7 +395,11 @@ int main(int argc, char **argv) {
+     M.print(Out->os(), nullptr, PreserveAssemblyUseListOrder);
+   } else if (EmitMetallib) {
+     dxmt::metallib::MetallibWriter writer;
+-    writer.Write(M, Out->os());
++    std::string writer_error;
++    if (!writer.Write(M, Out->os(), writer_error)) {
++      errs() << writer_error << '\n';
++      return 1;
++    }
+   } else {
+     WriteBitcodeToFile(
+       M, Out->os(), PreserveBitcodeUseListOrder, nullptr, true
+diff --git a/src/airconv/airconv_context.cpp b/src/airconv/airconv_context.cpp
+index 831d5d9..4bd6bca 100644
+--- a/src/airconv/airconv_context.cpp
++++ b/src/airconv/airconv_context.cpp
+@@ -149,7 +149,7 @@ runOptimizationPasses(llvm::Module &M) {
+     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(GlobalCleanupPM), true /* ? */));
+   }
+ 
+-  // MPM.addPass(VerifierPass());
++  MPM.addPass(VerifierPass());
+ 
+   // Optimize the IR!
+   MPM.run(M, MAM);
+diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
+index a4efb86..a03de11 100644
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -1389,8 +1389,13 @@ AIRCONV_API int SM50Compile(
+   raw_svector_ostream OS(compiled->vec);
+ 
+   metallib::MetallibWriter writer;
+-
+-  writer.Write(*pModule, OS);
++  std::string writer_error;
++  if (!writer.Write(*pModule, OS, writer_error)) {
++    errorOut << writer_error;
++    delete compiled;
++    *ppError = (sm50_error_t)errorObj;
++    return 1;
++  }
+ 
+   pModule.reset();
+ 
+@@ -1453,8 +1458,13 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
+   raw_svector_ostream OS(compiled->vec);
+ 
+   metallib::MetallibWriter writer;
+-
+-  writer.Write(*pModule, OS);
++  std::string writer_error;
++  if (!writer.Write(*pModule, OS, writer_error)) {
++    errorOut << writer_error;
++    delete compiled;
++    *ppError = (sm50_error_t)errorObj;
++    return 1;
++  }
+ 
+   pModule.reset();
+ 
+@@ -1518,8 +1528,13 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
+   raw_svector_ostream OS(compiled->vec);
+ 
+   metallib::MetallibWriter writer;
+-
+-  writer.Write(*pModule, OS);
++  std::string writer_error;
++  if (!writer.Write(*pModule, OS, writer_error)) {
++    errorOut << writer_error;
++    delete compiled;
++    *ppError = (sm50_error_t)errorObj;
++    return 1;
++  }
+ 
+   pModule.reset();
+ 
+@@ -1581,8 +1596,13 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
+   raw_svector_ostream OS(compiled->vec);
+ 
+   metallib::MetallibWriter writer;
+-
+-  writer.Write(*pModule, OS);
++  std::string writer_error;
++  if (!writer.Write(*pModule, OS, writer_error)) {
++    errorOut << writer_error;
++    delete compiled;
++    *ppError = (sm50_error_t)errorObj;
++    return 1;
++  }
+ 
+   pModule.reset();
+ 
+@@ -1645,8 +1665,13 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
+   raw_svector_ostream OS(compiled->vec);
+ 
+   metallib::MetallibWriter writer;
+-
+-  writer.Write(*pModule, OS);
++  std::string writer_error;
++  if (!writer.Write(*pModule, OS, writer_error)) {
++    errorOut << writer_error;
++    delete compiled;
++    *ppError = (sm50_error_t)errorObj;
++    return 1;
++  }
+ 
+   pModule.reset();
+ 
+diff --git a/src/airconv/metallib_writer.cpp b/src/airconv/metallib_writer.cpp
+index e079944..97c5875 100644
+--- a/src/airconv/metallib_writer.cpp
++++ b/src/airconv/metallib_writer.cpp
+@@ -2,8 +2,12 @@
+ #if defined(DXMT_VISIONOS)
+ #include "wvr_metallib_platform.h"
+ #endif
++#include "llvm/ADT/ArrayRef.h"
++#include "llvm/ADT/Twine.h"
+ #include "llvm/Bitcode/BitcodeWriter.h"
+ #include "llvm/IR/Constants.h"
++#include "llvm/Support/Endian.h"
++#include <string>
+ 
+ using namespace llvm;
+ 
+@@ -20,8 +24,143 @@ struct InputAttribute {
+   // TODO: extend patch/control point here
+ };
+ 
+-void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
++namespace {
+ 
++struct MetallibVersions {
++  uint16_t air_major;
++  uint16_t air_minor;
++  uint16_t language_major;
++  uint16_t language_minor;
++};
++
++bool readVersionTuple(const Module &module, StringRef name,
++                      unsigned expected_operands, unsigned value_offset,
++                      uint16_t &major, uint16_t &minor, std::string &error) {
++  auto *metadata = module.getNamedMetadata(name);
++  if (!metadata || metadata->getNumOperands() == 0) {
++    error = (Twine("missing AIR module metadata '") + name + "'").str();
++    return false;
++  }
++
++  bool found = false;
++  for (const MDNode *entry : metadata->operands()) {
++    if (!entry || entry->getNumOperands() != expected_operands) {
++      error = (Twine("invalid AIR module metadata '") + name + "': expected " +
++               Twine(expected_operands) + " operands per tuple")
++                  .str();
++      return false;
++    }
++    if (value_offset == 1) {
++      auto *language = dyn_cast<MDString>(entry->getOperand(0));
++      if (!language || language->getString() != "Metal") {
++        error = "invalid AIR language metadata: expected 'Metal'";
++        return false;
++      }
++    }
++    uint16_t current[2] = {};
++    for (unsigned i = 0; i < 3; ++i) {
++      auto *constant = dyn_cast<ConstantAsMetadata>(entry->getOperand(value_offset + i));
++      auto *integer = constant ? dyn_cast<ConstantInt>(constant->getValue()) : nullptr;
++      if (!integer || integer->getValue().getActiveBits() > 16) {
++        error = (Twine("invalid AIR module metadata '") + name +
++                 "': version components must be 16-bit integers")
++                    .str();
++        return false;
++      }
++      if (i == 2) {
++        if (integer->getZExtValue() != 0) {
++          error = (Twine("unsupported revision in AIR module metadata '") +
++                   name + "'").str();
++          return false;
++        }
++        continue;
++      }
++      current[i] = static_cast<uint16_t>(integer->getZExtValue());
++    }
++    if (!found) {
++      major = current[0];
++      minor = current[1];
++      found = true;
++    } else if (major != current[0] || minor != current[1]) {
++      error = (Twine("conflicting AIR module metadata '") + name + "'").str();
++      return false;
++    }
++  }
++  return found;
++}
++
++bool getMetallibVersions(const Module &module, MetallibVersions &versions,
++                         std::string &error) {
++  if (!readVersionTuple(module, "air.version", 3, 0,
++                        versions.air_major, versions.air_minor, error) ||
++      !readVersionTuple(module, "air.language_version", 4, 1,
++                        versions.language_major, versions.language_minor, error))
++    return false;
++  return true;
++}
++
++uint32_t readLE32(const char *bytes) {
++  return support::endian::read32le(reinterpret_cast<const uint8_t *>(bytes));
++}
++
++void appendLE32(SmallVectorImpl<char> &bytes, uint32_t value) {
++  for (unsigned shift = 0; shift < 32; shift += 8)
++    bytes.push_back(static_cast<char>((value >> shift) & 0xff));
++}
++
++bool wrapDarwinBitcode(ArrayRef<char> raw, SmallVectorImpl<char> &wrapped,
++                       std::string &error) {
++  constexpr uint32_t magic = 0x0b17c0de;
++  constexpr uint32_t header_size = 20;
++  constexpr size_t alignment = 16;
++  if (raw.size() >= 4 && readLE32(raw.data()) == magic) {
++    if (raw.size() < header_size || readLE32(raw.data() + 4) != 0 ||
++        readLE32(raw.data() + 8) != header_size ||
++        readLE32(raw.data() + 16) != UINT32_MAX) {
++      error = "invalid Darwin AIR bitcode wrapper header";
++      return false;
++    }
++    const uint32_t payload_size = readLE32(raw.data() + 12);
++    const size_t unpadded_size = header_size + static_cast<size_t>(payload_size);
++    const size_t expected_size = (unpadded_size + alignment - 1) & ~(alignment - 1);
++    if (expected_size != raw.size()) {
++      error = "Darwin AIR bitcode wrapper size does not match its payload";
++      return false;
++    }
++    for (size_t i = unpadded_size; i < expected_size; ++i) {
++      if (raw[i] != 0) {
++        error = "Darwin AIR bitcode wrapper has nonzero alignment padding";
++        return false;
++      }
++    }
++    wrapped.append(raw.begin(), raw.end());
++    return true;
++  }
++
++  if (raw.size() > UINT32_MAX) {
++    error = "AIR bitcode payload exceeds Darwin wrapper size limit";
++    return false;
++  }
++  appendLE32(wrapped, magic);
++  appendLE32(wrapped, 0);
++  appendLE32(wrapped, header_size);
++  appendLE32(wrapped, static_cast<uint32_t>(raw.size()));
++  appendLE32(wrapped, UINT32_MAX);
++  wrapped.append(raw.begin(), raw.end());
++  while (wrapped.size() % alignment)
++    wrapped.push_back(0);
++  return true;
++}
++
++} // namespace
++
++bool MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS,
++                           std::string &error) {
++  MetallibVersions versions{};
++  if (!getMetallibVersions(module, versions, error))
++    return false;
++
++  SmallVector<char, 0> raw_bitcode;
+   SmallVector<char, 0> bitcode;
+   SmallVector<char, 0> public_metadata;
+   SmallVector<char, 0> private_metadata;
+@@ -29,8 +168,14 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
+ 
+   uint32_t fn_count = 0;
+ 
+-  raw_svector_ostream bitcode_stream(bitcode);
++  raw_svector_ostream bitcode_stream(raw_bitcode);
+   WriteBitcodeToFile(module, bitcode_stream, false, nullptr, true);
++#if defined(DXMT_VISIONOS)
++  if (!wrapDarwinBitcode(raw_bitcode, bitcode, error))
++    return false;
++#else
++  bitcode = std::move(raw_bitcode);
++#endif
+ 
+   auto hash =
+     compute_sha256_hash((const uint8_t *)bitcode.data(), bitcode.size());
+@@ -64,10 +209,10 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
+           .BitcodeOffset = 0, // ??
+         });
+         function_def_stream << value(MTLB_VERS_TAG{
+-          .airVersionMajor = 2,
+-          .airVersionMinor = 6,
+-          .languageVersionMajor = 3,
+-          .languageVersionMinor = 1,
++          .airVersionMajor = versions.air_major,
++          .airVersionMinor = versions.air_minor,
++          .languageVersionMajor = versions.language_major,
++          .languageVersionMinor = versions.language_minor,
+         });
+         while (fn->getNumOperands() > 3 && isa<MDTuple>(fn->getOperand(3).get())
+         ) {
+@@ -183,10 +328,10 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
+           .BitcodeOffset = 0, // ??
+         });
+         function_def_stream << value(MTLB_VERS_TAG{
+-          .airVersionMajor = 2,
+-          .airVersionMinor = 6,
+-          .languageVersionMajor = 3,
+-          .languageVersionMinor = 1,
++          .airVersionMajor = versions.air_major,
++          .airVersionMinor = versions.air_minor,
++          .languageVersionMajor = versions.language_major,
++          .languageVersionMinor = versions.language_minor,
+         });
+         function_def_stream << "ENDT";
+         public_metadata_stream << value(4);
+@@ -217,10 +362,10 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
+           .BitcodeOffset = 0, // ??
+         });
+         function_def_stream << value(MTLB_VERS_TAG{
+-          .airVersionMajor = 2,
+-          .airVersionMinor = 6,
+-          .languageVersionMajor = 3,
+-          .languageVersionMinor = 1,
++          .airVersionMajor = versions.air_major,
++          .airVersionMinor = versions.air_minor,
++          .languageVersionMajor = versions.language_major,
++          .languageVersionMinor = versions.language_minor,
+         });
+         function_def_stream << "ENDT";
+ 
+@@ -311,10 +456,10 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
+           .BitcodeOffset = 0, // ??
+         });
+         function_def_stream << value(MTLB_VERS_TAG{
+-          .airVersionMajor = 2,
+-          .airVersionMinor = 6,
+-          .languageVersionMajor = 3,
+-          .languageVersionMinor = 1,
++          .airVersionMajor = versions.air_major,
++          .airVersionMinor = versions.air_minor,
++          .languageVersionMajor = versions.language_major,
++          .languageVersionMinor = versions.language_minor,
+         });
+         function_def_stream << "ENDT";
+ 
+@@ -352,10 +497,10 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
+           .BitcodeOffset = 0, // ??
+         });
+         function_def_stream << value(MTLB_VERS_TAG{
+-          .airVersionMajor = 2,
+-          .airVersionMinor = 6,
+-          .languageVersionMajor = 3,
+-          .languageVersionMinor = 1,
++          .airVersionMajor = versions.air_major,
++          .airVersionMinor = versions.air_minor,
++          .languageVersionMajor = versions.language_major,
++          .languageVersionMinor = versions.language_minor,
+         });
+         function_def_stream << "ENDT";
+ 
+@@ -418,6 +563,7 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
+   OS << public_metadata;
+   OS << private_metadata;
+   OS << bitcode;
++  return true;
+ }
+ 
+ } // namespace dxmt::metallib
+\ No newline at end of file
+diff --git a/src/airconv/metallib_writer.hpp b/src/airconv/metallib_writer.hpp
+index e51a29d..15dc332 100644
+--- a/src/airconv/metallib_writer.hpp
++++ b/src/airconv/metallib_writer.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ #include "llvm/IR/Module.h"
+ #include <cstdint>
++#include <string>
+ #include "sha256.hpp"
+ 
+ namespace dxmt::metallib {
+@@ -117,7 +118,8 @@ static_assert(sizeof(MTLB_VATY) == 2, "");
+ class MetallibWriter {
+ 
+ public:
+-  void Write(const llvm::Module &module, llvm::raw_ostream &OS);
++  bool Write(const llvm::Module &module, llvm::raw_ostream &OS,
++             std::string &error);
+ };
+ 
+ } // namespace dxmt::metallib
+\ No newline at end of file

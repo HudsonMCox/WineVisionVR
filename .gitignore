@@ -1,0 +1,35 @@
+# build products
+.build*/
+/dist/
+*.xcodeproj
+.DS_Store
+
+# never part of this repository: game content, toolchain archives, credentials
+*.apk
+*.obb
+*.pk4
+*.pak
+*.bundle
+*.so
+*.tar.gz
+*.dmg
+
+# Pinned runtime source caches, acquired by windows-vr-tools/fetch_sources.py.
+# Their revisions and licenses are recorded separately; do not add embedded Git repos.
+/third-party/madeira/
+/third-party/openvr/
+/third-party/openxr/
+/third-party/alvr-visionos/
+/third-party/opencomposite/
+/third-party/dxmt-d3d12-experimental/
+/runtime-source
+/runtime-source-d3d12-experimental
+/visionos-windows-vr/Resources/Runtime/
+/visionos-windows-vr/Resources/WindowsVR/
+/visionos-windows-vr/Resources/arm64ec-windows/
+/visionos-windows-vr/.compile-only.yml
+/visionos-windows-vr/Generated-Info.plist
+__pycache__/
+/.swiftpm/
+/windows-vr/.swiftpm/
+/windows-vr-metal/.swiftpm/

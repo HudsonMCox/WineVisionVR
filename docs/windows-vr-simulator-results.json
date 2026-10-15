@@ -1,0 +1,62 @@
+{
+  "date": "2026-10-13",
+  "platform": "visionOS 27 Simulator, arm64",
+  "result": "passed",
+  "productionComponent": "WindowsVRCompositorBridge",
+  "producer": "synthetic frames with real Metal textures, GPU command buffers and shared events",
+  "passed": [
+    "simulator supplies a real Metal device",
+    "bind Metal device",
+    "publish stereo targets",
+    "publish target generation",
+    "allocate stereo textures and shared event",
+    "complete stereo GPU work and signal readiness",
+    "enqueue stereo frame",
+    "enqueue stereo frame",
+    "enqueue stereo frame",
+    "enqueue stereo frame",
+    "enqueue stereo frame",
+    "acquire newest frame after queue overflow",
+    "preserve eye texture ownership",
+    "preserve distinct left/right GPU output",
+    "acquired lease survives pause",
+    "complete dropped and consumed tickets in order",
+    "paused queue contains no stale frames",
+    "republish targets after pause",
+    "reject stale target generation",
+    "publish cropped-eye targets",
+    "read new array-frame generation",
+    "allocate stereo texture array",
+    "submit array slices and eye subrectangles",
+    "V1 refuses array frame without discarding it",
+    "V2 preserves eye slices and crop geometry"
+  ],
+  "sourceSha256": {
+    "windows-vr-native/Sources/WindowsVRCompositorBridge.mm": "892a508f0cdc714754b1eff58d02d67859333876e25cf22b6efca0e4032801d9",
+    "windows-vr-native/include/WindowsVRCompositorBridge.h": "dfca4ef1974e98d6f0aea674b23b518387363bef1a768e59d0e361b9c4e6ca9b",
+    "windows-vr-native/Tests/SimulatorCompositorProbe.mm": "165e2aa5278a91c3690d70bff0c05f0a60ad1629d377c794686e7b7770ea386d",
+    "windows-vr-tools/test_simulator_compositor.sh": "d051064a5b78937bb6f178cf831e411cbda57f8d1e0cc11642dbb6b9f33f5f9a"
+  },
+  "limitations": [
+    "No successful Windows guest execution established yet",
+    "No OpenXR game or CompositorServices immersive-space rendering tested",
+    "Does not establish headset GPU behavior or performance"
+  ],
+  "libraryInjectionProbe": [
+    "Original runtime rejected: visionOS binary, visionOS-simulator required",
+    "Isolated retagged copy rejected: MetalFX framework absent from Simulator",
+    "Isolated copy loaded after unused MetalFX load dependency became optional and WindowsVRMetal was built for Simulator"
+  ],
+  "launcherUITest": {
+    "result": "passed",
+    "tests": 1,
+    "failures": 0,
+    "durationSeconds": 43.526,
+    "assertions": [
+      "Launcher launches",
+      "Steam library button exists",
+      "Steam library button enabled"
+    ],
+    "resultBundle": "/private/tmp/avpplay-simulator-launcher-tests.xcresult"
+  }
+}

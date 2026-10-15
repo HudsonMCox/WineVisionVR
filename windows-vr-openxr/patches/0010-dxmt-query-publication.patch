@@ -1,0 +1,98 @@
+--- a/src/dxmt/dxmt_occlusion_query.hpp
++++ b/src/dxmt/dxmt_occlusion_query.hpp
+@@ -105,7 +105,7 @@
+     seq_id_end = seqId;
+     occlusion_counter_end = offset;
+     if (seq_id_begin == seq_id_end && occlusion_counter_begin == occlusion_counter_end) {
+-      seq_id_issued = seq_id_end;
++      seq_id_issued = seq_id_end.load();
+     }
+   }
+ 
+@@ -129,7 +129,8 @@
+ 
+   bool
+   getValue(uint64_t *value) {
+-    if (seq_id_end <= seq_id_issued) {
++    const uint64_t end = seq_id_end.load();
++    if (end != ~0ull && end <= seq_id_issued.load()) {
+       *value = accumulated_value_;
+       return true;
+     }
+@@ -147,12 +148,12 @@
+   };
+ 
+ private:
+-  uint64_t accumulated_value_ = 0;
+-  uint64_t seq_id_begin = ~0uLL;
+-  uint64_t occlusion_counter_begin = ~0uLL;
+-  uint64_t seq_id_end = ~0uLL;
+-  uint64_t occlusion_counter_end = ~0uLL;
+-  uint64_t seq_id_issued = 0;
++  std::atomic<uint64_t> accumulated_value_{0};
++  std::atomic<uint64_t> seq_id_begin{~0uLL};
++  std::atomic<uint64_t> occlusion_counter_begin{~0uLL};
++  std::atomic<uint64_t> seq_id_end{~0uLL};
++  std::atomic<uint64_t> occlusion_counter_end{~0uLL};
++  std::atomic<uint64_t> seq_id_issued{0};
+   std::atomic<uint32_t> refcount_ = {0u};
+ };
+ 
+@@ -209,20 +210,22 @@
+ 
+   bool
+   getValue(uint64_t *value) {
+-    if (cached_value_ == ~0ull)
++    // The finish thread publishes the result; the game thread polls it.
++    const uint64_t result = cached_value_.load(std::memory_order_acquire);
++    if (result == ~0ull)
+       return false;
+ 
+-    *value = cached_value_;
++    *value = result;
+     return true;
+   }
+ 
+   void
+   issue(uint64_t sampled_data) {
+-    cached_value_ = sampled_data;
++    cached_value_.store(sampled_data, std::memory_order_release);
+   }
+ 
+ private:
+-  uint64_t cached_value_ = ~0ull;
++  std::atomic<uint64_t> cached_value_{~0ull};
+   std::atomic<uint32_t> refcount_ = {0u};
+ };
+ 
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -468,7 +468,28 @@
+     default:
+       ERR("Unknown query type ", desc.Query);
+       return E_FAIL;
++    }
++    // Log exponentially spaced pending polls rather than every spin. This
++    // identifies the exact query type without altering its completion result.
++    thread_local ID3D11Asynchronous *diagnostic_query = nullptr;
++    thread_local uint64_t diagnostic_polls = 0;
++    if (diagnostic_query != pAsync) {
++      diagnostic_query = pAsync;
++      diagnostic_polls = 0;
+     }
++    if (hr == S_FALSE) {
++      ++diagnostic_polls;
++      if (diagnostic_polls == 1024 ||
++          (diagnostic_polls >= 1048576 && (diagnostic_polls & (diagnostic_polls - 1)) == 0))
++        WARN("wvr-query pending type=", desc.Query, " query=", pAsync,
++             " polls=", diagnostic_polls, " flags=", GetDataFlags,
++             " signaled=", cmd_queue.SignaledEventSeqId());
++    } else {
++      if (diagnostic_polls >= 1024)
++        WARN("wvr-query resolved type=", desc.Query, " query=", pAsync,
++             " polls=", diagnostic_polls, " result=", hr);
++      diagnostic_polls = 0;
++    }
+     if (hr == S_FALSE && (GetDataFlags & D3D11_ASYNC_GETDATA_DONOTFLUSH) == 0) {
+       cmd_queue.CurrentFrameStatistics().event_stall++;
+       Flush();

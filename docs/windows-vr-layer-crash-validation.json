@@ -1,0 +1,29 @@
+{
+  "crash": {
+    "report": "/private/tmp/avpplay-233620.ips",
+    "time": "2026-10-13 23:36:20 -0400",
+    "incident": "A67E32E6-2D62-4FFC-A0E1-4D10062B9719",
+    "signal": "SIGABRT",
+    "thread": "main",
+    "frame": "-[CPImmersiveScene layer]",
+    "message": "Layer configuration not supported %@"
+  },
+  "cause": "Render quality explicitly configured with foveation disabled; unsupported by Compositor Services.",
+  "repair": [
+    "Remove maxRenderQuality override",
+    "Remove runtime renderQuality override",
+    "Remove unsupported Sharper rendering toggle",
+    "Restore viewport-based guest dimensions"
+  ],
+  "preserved": [
+    "Guest input mapping repairs",
+    "Upper-limb and system-overlay hiding"
+  ],
+  "build": {
+    "passed": true,
+    "log": "/private/tmp/avpplay-layer-crash-fix-build.log",
+    "bootstrap_check_passed": true
+  },
+  "headset_game_launched_by_agent": false,
+  "physical_crash_resolution_verified": false
+}

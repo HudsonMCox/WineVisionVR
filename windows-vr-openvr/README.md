@@ -1,0 +1,103 @@
+# OpenComposite guest package
+
+This directory packages the upstream OpenComposite OpenXR branch as an
+OpenVR-to-OpenXR compatibility layer. It does not implement or copy OpenVR
+interface vtables. Source is pinned in `opencomposite.lock.json` to
+[`znixian/OpenOVR`](https://gitlab.com/znixian/OpenOVR), commit
+`cff07db75c4823afe93ed7027b03d5f7bc86f164` on the `openxr` branch. OpenComposite
+is GPL-3.0-or-later; its generated OpenVR headers retain their upstream MIT
+license. Preserve upstream notices and include the GPL license when
+redistributing the resulting package.
+
+The pinned upstream source contains concrete Windows D3D12 support: its
+`CMakeLists.txt` enables `SUPPORT_DX12`, and `DrvOpenXR.cpp` enables
+`XR_KHR_D3D12_enable` when the runtime advertises it. See the [pinned CMake
+source](https://gitlab.com/znixian/OpenOVR/-/raw/cff07db75c4823afe93ed7027b03d5f7bc86f164/CMakeLists.txt)
+and [pinned OpenXR driver source](https://gitlab.com/znixian/OpenOVR/-/raw/cff07db75c4823afe93ed7027b03d5f7bc86f164/DrvOpenXR/DrvOpenXR.cpp).
+The default still applies the D3D11-only overlay to preserve the baseline DLL
+imports. `WINDOWS_VR_ENABLE_D3D12=ON` selects the D3D11/D3D12-only overlay,
+excluding Vulkan/OpenGL dependencies rather than enabling unsupported backends.
+Use a fresh build directory when changing profiles. The macOS llvm-mingw x64
+package has been compiled with this profile. This is build and staging evidence
+only; it has not been loaded by Wine/FEX or exercised with a headset or game.
+
+## Package shape
+
+The CMake packaging target stages the upstream output at:
+
+```text
+stage/WindowsVR/Guest/x64/OpenComposite/bin/vrclient_x64.dll
+```
+
+An optional ARM64EC build uses a separate root:
+
+```text
+stage/WindowsVR/Guest/arm64ec/OpenComposite/bin/vrclient_x64.dll
+```
+
+The two files have the same upstream filename and must never share a directory.
+The Wine launcher must inspect the guest executable's PE machine type and select
+the matching package. It must fail closed when that architecture's package is
+absent; do not load the x64 DLL into an ARM64EC guest or silently fall back.
+ARM64EC packaging is opt-in with `WINDOWS_VR_BUILD_ARM64EC=ON` and depends on a
+Visual Studio/CMake toolchain that supports the ARM64EC generator platform.
+
+The project-owned `wvr_openxr.dll` and its runtime JSON are supplied by the
+separate WindowsVR OpenXR runtime package, not by this upstream build. At guest
+launch, the runtime integration maps the selected package root to
+`C:\\windows-vr-runtime\\x64` (or the architecture-specific equivalent),
+provides its runtime manifest through `XR_RUNTIME_JSON`, and sets
+`VR_OVERRIDE=C:\\windows-vr-runtime\\x64\\OpenComposite`. These are internal
+per-process Wine environment values. Do not write host-wide OpenXR registry
+settings. Do not put reserved runtime-selection variables in user-editable game
+manifest environment values.
+
+`VR_OVERRIDE` points at the `OpenComposite` root whose `bin` directory contains
+`vrclient_x64.dll`; `XR_RUNTIME_JSON` points at the exact project-owned OpenXR
+runtime manifest. The runtime package must verify both the architecture-specific
+OpenComposite DLL and runtime manifest before launch.
+
+## Building on Windows or macOS
+
+The default build uses a Windows host with Visual Studio C++ tools, CMake 3.25
+or newer, Git, and the upstream OpenComposite submodule dependencies. Configure
+this directory with the Visual Studio generator and build the
+`package_opencomposite` target. Enable `WINDOWS_VR_BUILD_ARM64EC=ON` only when
+the selected Visual Studio toolchain supports ARM64EC.
+
+An opt-in x64 cross-build from macOS uses the same LLVM-MinGW release and
+toolchain file described in the OpenXR runtime README. Set
+`OPENCOMPOSITE_SOURCE_ROOT` to an initialized checkout at the pinned commit;
+the cross path verifies the commit and required submodules and does not fetch
+source. `WINDOWS_VR_ENABLE_D3D12=ON` builds the D3D11/D3D12 profile, matching
+the project runtime's graphics support. Example:
+
+```sh
+cmake -S windows-vr-openvr -B build/opencomposite-mingw -G Ninja \
+  -DWINDOWS_VR_USE_LLVM_MINGW=ON \
+  -DLLVM_MINGW_ROOT="$PWD/toolchains/llvm-mingw-20260421-ucrt-macos-universal" \
+  -DOPENCOMPOSITE_SOURCE_ROOT="$PWD/third-party/opencomposite" \
+  -DWINDOWS_VR_ENABLE_D3D12=ON
+cmake --build build/opencomposite-mingw --target package_opencomposite --config Release
+```
+
+The upstream `RuntimeSwitcher.csproj` is included only by CMake's
+`include_external_msproject`, which CMake ignores for non-Visual Studio
+generators. The cross-build therefore packages the OpenComposite DLL without
+its optional Windows GUI switcher. ARM64EC remains on the Visual Studio route.
+
+For a one-off game that does not honor `VR_OVERRIDE`, an experienced user may
+choose to deploy a matching OpenComposite `openvr_api.dll` beside their own game
+executable following upstream guidance. This project does not modify game
+directories, download game files, bypass Steam purchase checks, or provide
+proprietary content.
+
+## Runtime status
+
+This package is a compatibility bridge, not a Windows execution environment.
+It does not include Wine/FEX binaries, a Windows OpenXR runtime, or proprietary
+games. Actual Windows VR game execution depends on the separate Wine/FEX process
+launcher, the project-owned OpenXR runtime, the visionOS compositor bridge, and
+the required native dependencies. Until those pieces are present and report
+their state, a packaged DLL must not be presented as proof that a game launched,
+rendered, or is running.

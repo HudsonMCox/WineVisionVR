@@ -1,0 +1,19 @@
+{
+  "game_fps": 27.53743760399068,
+  "tracking_hz": 89.99999999999129,
+  "steady_seconds": 60.10000000000582,
+  "median_cpu_percent": 591,
+  "process_freeze_seconds": 54.0,
+  "trigger_evidence": "xrSyncActions count=1536 right trigger=1.00; count=1280 left grip=1.00",
+  "trigger_action_delivery_verified": false,
+  "repairs": [
+    "500-metre ALVR-style synthetic color plane (bounded by compositor far plane)",
+    "xrLocateSpace uses requested display-time tracking snapshot"
+  ],
+  "validation": {
+    "gpu_shader_far_depth_probe": "passed",
+    "input_contract": "passed",
+    "signed_build": "passed",
+    "headset_game_launched_by_agent": false
+  }
+}

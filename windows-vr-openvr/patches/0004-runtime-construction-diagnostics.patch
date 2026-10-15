@@ -1,0 +1,94 @@
+--- a/OpenOVR/logging.cpp
++++ b/OpenOVR/logging.cpp
+@@ -135,7 +135,36 @@
+ #ifdef ANDROID
+ #include <android/log.h>
+ #else
++// Avoid dependence on C++ streams or the guest CRT stderr handle while
++// diagnosing DLL construction. No dynamically initialized storage is used.
++void wvr_log_construction_marker(const char *message) {
++#ifdef _WIN32
++    HANDLE file = CreateFileW(L"C:\\windows-vr-runtime\\opencomposite-init.txt",
++        FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
++        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (file == INVALID_HANDLE_VALUE) return;
++    DWORD written = 0;
++    WriteFile(file, message, static_cast<DWORD>(strlen(message)), &written, nullptr);
++    CloseHandle(file);
++#endif
++}
++static std::atomic<unsigned> stream_constructor_phase{0};
++struct StreamConstructorBefore {
++    StreamConstructorBefore() {
++        stream_constructor_phase = 1;
++        wvr_log_construction_marker("[wvr-cxx-init] logging TU entered before stream construction\n");
++    }
++};
++static StreamConstructorBefore stream_before;
+ static std::ofstream stream;
++struct StreamConstructorAfter {
++    StreamConstructorAfter() {
++        stream_constructor_phase = 2;
++        wvr_log_construction_marker("[wvr-cxx-init] logging stream constructed\n");
++    }
++};
++static StreamConstructorAfter stream_after;
++static std::atomic<bool> stream_diagnostic_written{false};
+ 
+ #ifdef __GLIBCXX__
+ #include <ext/stdio_filebuf.h>
+@@ -164,6 +193,14 @@
+ 
+ static void init_stream()
+ {
++    if (!stream_diagnostic_written.exchange(true)) {
++        void *vtable = nullptr;
++        memcpy(&vtable, &stream, sizeof(vtable));
++        char diagnostic[192];
++        snprintf(diagnostic, sizeof(diagnostic), "[wvr-cxx-init] first logging call phase=%u object=%p vtable=%p\n",
++                stream_constructor_phase.load(), (void *)&stream, vtable);
++        wvr_log_construction_marker(diagnostic);
++    }
+ 	if (!stream.is_open()) {
+ 		string outputFilePath = "opencomposite.log";
+ 
+--- a/OCOVR/windows.cpp
++++ b/OCOVR/windows.cpp
+@@ -13,6 +13,8 @@
+ #include "steamvr_abi.h"
+ #include <map>
+ #include <memory>
++#include <cstdio>
++void wvr_log_construction_marker(const char *message);
+ 
+ // Specific to OCOVR
+ #include "Drivers/Backend.h"
+@@ -28,6 +30,7 @@
+ {
+ 	switch (ul_reason_for_call) {
+ 	case DLL_PROCESS_ATTACH:
++		wvr_log_construction_marker("[wvr-cxx-init] OpenComposite process attach\n");
+ 		openovr_module_id = hModule;
+ #if defined(_DEBUG)
+ 		DbgSetModule(hModule);
+@@ -89,3 +92,20 @@
+ 
+ 	return (alternativeCoreFactory_t)GetProcAddress(chainedImplementation, "VRClientCoreFactory");
+ }
++
++#ifdef __MINGW32__
++// Trace the loader boundary before CRT construction. Forward every reason and
++// argument unchanged to the real startup routine; do not initialize globals
++// manually or bypass detach/thread notifications.
++extern "C" BOOL WINAPI DllMainCRTStartup(HINSTANCE, DWORD, LPVOID);
++extern "C" BOOL WINAPI WVRDllMainCRTStartup(HINSTANCE module, DWORD reason, LPVOID reserved) {
++    wvr_log_construction_marker(reason == DLL_PROCESS_ATTACH ?
++        "[wvr-cxx-init] CRT entry process attach\n" :
++        "[wvr-cxx-init] CRT entry other notification\n");
++    BOOL result = DllMainCRTStartup(module, reason, reserved);
++    wvr_log_construction_marker(result ?
++        "[wvr-cxx-init] CRT startup returned success\n" :
++        "[wvr-cxx-init] CRT startup returned failure\n");
++    return result;
++}
++#endif

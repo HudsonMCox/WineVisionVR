@@ -1,0 +1,144 @@
+name: VisionOSWindowsVRPrebuilt
+options:
+  minimumXcodeGenVersion: 2.38.0
+  deploymentTarget:
+    visionOS: "27.0"
+packages:
+  WindowsVRCore:
+    path: ../windows-vr
+  WindowsVRMetal:
+    path: ../windows-vr-metal
+targets:
+  VisionOSWindowsVR:
+    type: application
+    platform: visionOS
+    dependencies:
+      - package: WindowsVRCore
+      - package: WindowsVRMetal
+        embed: true
+      - target: WindowsVRNativeBridge
+      # Unmodified copy of the working JIT runtime; generated AIR is corrected
+      # by the separately built source writer in WindowsVRNativeBridge.
+      - framework: ../dist/windows-vr-preserved-runtime/WindowsRuntimePlugin.framework
+        embed: true
+        codeSign: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.avpplay.visionos-windows-vr
+        PRODUCT_NAME: WineVision VR
+        TARGETED_DEVICE_FAMILY: "7"
+        XROS_DEPLOYMENT_TARGET: "27.0"
+        SWIFT_VERSION: "6.0"
+        OTHER_LDFLAGS: ["$(inherited)", "-lz", "-llzma"]
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: Apple Development
+        # Increased Memory Limit, the same single memory entitlement Madeira ships (its
+        # "Memory+" badge). Extended Virtual Addressing is deliberately not requested:
+        # personal development teams cannot provision it, and Madeira runs without it.
+        CODE_SIGN_ENTITLEMENTS: Resources/VisionOSWindowsVR.entitlements
+        CODE_SIGNING_REQUIRED: YES
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/WindowsVR-Bridging-Header.h
+        INFOPLIST_KEY_NSWorldSensingUsageDescription: Head tracking places the game's stereo views in your surroundings.
+        INFOPLIST_KEY_NSAccessoryTrackingUsageDescription: Tracked controllers provide poses and controls to your VR game.
+    info:
+      path: Generated-Info.plist
+      properties:
+        LSApplicationQueriesSchemes: [stikdebug, stikjit]
+        UIFileSharingEnabled: true
+        # Writes the launcher log and the compositor bridge trace to Documents. Off in release builds.
+        WVRDiagnostics: true
+        LSSupportsOpeningDocumentsInPlace: true
+        GCSupportsControllerUserInteraction: true
+        GCSupportedGameControllers:
+          - ProfileName: SpatialGamepad
+    sources:
+      - path: Sources
+      # Madeira's StikDebug script from the pinned Madeira checkout (windows-vr-tools/fetch_sources.py).
+      - path: ../third-party/madeira/app/Madeira/madeira-jit.js
+        buildPhase: resources
+      - path: Resources/Runtime
+        type: folder
+        buildPhase: resources
+      # Wine's unix loader (load_ntdll) reads <bundle>/<pe-dir>/ntdll.dll and apisetschema.dll
+      # relative to the app, not WINEDLLPATH (<bundle>/Runtime). Expose just those two files.
+      - path: Resources/Runtime/aarch64-windows/ntdll.dll
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: aarch64-windows
+      - path: Resources/Runtime/aarch64-windows/apisetschema.dll
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: aarch64-windows
+      - path: Resources/Runtime/arm64ec-windows/ntdll.dll
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: arm64ec-windows
+      - path: Resources/Runtime/arm64ec-windows/apisetschema.dll
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: arm64ec-windows
+      # Experiment: also expose the NLS tables at <bundle>/nls, where Madeira's own layout puts them.
+      - path: Resources/Runtime/nls
+        type: folder
+        buildPhase: resources
+      - path: Resources/WindowsVR
+        type: folder
+        buildPhase: resources
+      # Copy helper files individually: a folder resource would replace the
+      # loader directory and delete ntdll/apisetschema on incremental builds.
+      - path: Resources/arm64ec-windows/dockhost.exe
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: arm64ec-windows
+      - path: Resources/arm64ec-windows/dock-notices.txt
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: arm64ec-windows
+      - path: Resources/arm64ec-windows/dock-build.json
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: arm64ec-windows
+      - path: ../third-party/steam-native
+        type: folder
+        buildPhase: resources
+    postBuildScripts:
+      - name: Verify Wine bootstrap bundle
+        script: 'bash "$SRCROOT/../windows-vr-tools/verify_wine_bundle.sh" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"'
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(SRCROOT)/../windows-vr-tools/verify_wine_bundle.sh
+          - $(SRCROOT)/../windows-vr-tools/verify_dxmt_bundle.py
+          - $(SRCROOT)/../windows-vr-tools/verify_openvr_bundle.py
+          - $(SRCROOT)/../windows-runtime-plugin/WindowsVRRuntimePlugin.mm
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)
+  WindowsVRNativeBridge:
+    type: framework
+    platform: visionOS
+    dependencies:
+      - framework: ../dist/windows-vr-air-writer-canonical/libWindowsVRAIRWriter.a
+        embed: false
+      - sdk: Metal.framework
+    sources:
+      - path: ../windows-vr-native/Sources
+      - path: ../windows-vr-native/include
+        headerVisibility: public
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.avpplay.windows-vr.native-bridge
+        GENERATE_INFOPLIST_FILE: YES
+        CLANG_ENABLE_OBJC_ARC: YES
+        CLANG_CXX_LANGUAGE_STANDARD: c++20
+        GCC_PREPROCESSOR_DEFINITIONS: ["$(inherited)", "WVR_SOURCE_AIR_WRITER=1"]
+        LIBRARY_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/../dist/windows-vr-air-writer-canonical"]
+        EXPORTED_SYMBOLS_FILE: $(SRCROOT)/../windows-vr-native/shader-compiler/NativeBridge.exports
+        HEADER_SEARCH_PATHS: $(SRCROOT)/../windows-vr-native/include
+        CODE_SIGN_STYLE: Automatic

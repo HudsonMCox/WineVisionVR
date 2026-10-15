@@ -1,0 +1,37 @@
+{
+  "userConfirmed": [
+    "Trigger inputs working",
+    "Head motion much better and smoother"
+  ],
+  "freeze": {
+    "lastGuestFrame": 1222,
+    "allAcquiredFramesCompleted": true,
+    "pendingGuestFrames": 0,
+    "observedSeconds": 130.28499999999997,
+    "renderThread": "Running near 100% CPU in D3D11 GetData/ARM64EC alias lookup",
+    "rootCauseResolved": false
+  },
+  "performance": {
+    "movingMedianFPS": 26.137270550678664,
+    "optimization": "Validated forward/reverse alias caches, with full lookup fallback and live range validation",
+    "syntheticLegacyNs": 80.48,
+    "syntheticCachedNs": 1.97,
+    "measuredGameFPSGain": null
+  },
+  "validation": {
+    "nativeAArch64AssemblyProbe": "passed",
+    "FEXARM64ECBuild": "passed",
+    "simulatorGPUStatisticsProbe": "passed",
+    "signedBuild": "passed",
+    "headsetGameLaunchedByAgent": false
+  },
+  "dependencyOverrideAuthorizedByUser": true,
+  "logs": [
+    "/private/tmp/avpplay-freeze-fps-launcher.log",
+    "/private/tmp/avpplay-freeze-fps-runtime.log",
+    "/private/tmp/avpplay-freeze-fps-openxr.log",
+    "/private/tmp/avpplay-alias-cache-test.log",
+    "/private/tmp/avpplay-gpu-stats-test.log",
+    "/private/tmp/avpplay-fps-cache-build.log"
+  ]
+}

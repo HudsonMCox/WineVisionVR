@@ -1,0 +1,53 @@
+{
+  "targetGPU": "applegpu_g14g",
+  "platform": "xros",
+  "deploymentVersion": "27.0",
+  "kind": "offline-compilation-only",
+  "limitations": [
+    "Synthetic vertex interfaces, not captured full game pipelines",
+    "No shader or game execution",
+    "Headset compatibility remains unverified"
+  ],
+  "fragments": [
+    {
+      "fragment": "ps_5eae021a_09294cb027c6533290aba4a0ddbac736ab3dd05e",
+      "capturedLibrarySHA256": "0287a04e1f7f639ef29e3b8d825ab1d71e24b03410df937273454173121d3660",
+      "compilerExitCode": 0
+    },
+    {
+      "fragment": "ps_437d7603_4b4b89ac1d4568875f28f5b50d2bc1041a43714a",
+      "capturedLibrarySHA256": "1321a2470e2fd3ecc1fb0e5b227b86450d3ad2b7b8de1f6d8bec56a3c1097568",
+      "compilerExitCode": 0
+    },
+    {
+      "fragment": "ps_a205f7ce_09294cb027c6533290aba4a0ddbac736ab3dd05e",
+      "capturedLibrarySHA256": "57bd2bfb6f6866bd51b5e47060bbc30959709919e63d1271abc1068c8de66401",
+      "compilerExitCode": 0
+    },
+    {
+      "fragment": "ps_89d46a79_09294cb027c6533290aba4a0ddbac736ab3dd05e",
+      "capturedLibrarySHA256": "6cff3d6ce55c892b5cc2c4c557dc1510021f7472bbf853f4bf7c4c9a239e2c9b",
+      "compilerExitCode": 0
+    },
+    {
+      "fragment": "ps_1b0117e4_4b4b89ac1d4568875f28f5b50d2bc1041a43714a",
+      "capturedLibrarySHA256": "969850ca9fe0de5de40aac4cb1fd4f35219ad6acb5624b7224156c2a8bd42819",
+      "compilerExitCode": 0
+    },
+    {
+      "fragment": "ps_6b803b5e_4b4b89ac1d4568875f28f5b50d2bc1041a43714a",
+      "capturedLibrarySHA256": "d462360e0e8f37428d5cbc4868634937a7a4229ed8125e35107ffbb6e3c71775",
+      "compilerExitCode": 0
+    },
+    {
+      "fragment": "ps_2b24588b_99e49795ad7649086e51fcf2726a05df42cc17d3",
+      "capturedLibrarySHA256": "dde543a64ba0fb2b3a3c989ea8b88943a08a4949107aed5ff330e32dc123e85d",
+      "compilerExitCode": 0
+    },
+    {
+      "fragment": "ps_a4962e34_09294cb027c6533290aba4a0ddbac736ab3dd05e",
+      "capturedLibrarySHA256": "de3a902122afb91d900191eae449ae22f4749aca6930b776463b54c4dcb6e6bb",
+      "compilerExitCode": 0
+    }
+  ]
+}
