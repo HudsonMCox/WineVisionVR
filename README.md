@@ -10,6 +10,12 @@ see [Inspiration and credits](#inspiration-and-credits).
 
 > **Research software.** It has been built and tested by one person on one headset. Expect rough edges.
 
+## Donations
+
+This project is a passion project and I will continue it regardless but any contribution is welcome:
+https://ko-fi.com/hudsonmcox
+
+
 ## Status
 
 As of 2026-10-14, on one headset (M2 Vision Pro, visionOS 27.2):
