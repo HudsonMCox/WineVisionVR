@@ -1,0 +1,71 @@
+{
+  "date": "2026-10-15",
+  "changes": {
+    "d3d11": {
+      "artifact": "d3d11.dll",
+      "baselineSha256": "f84e0d73f09a478391a7637d4e838e4b9dc7d6300962ca49618fe591edf4a095",
+      "sha256": "a1f6f2ce74a23d90c238f6841aae585c7a6566d187239d5e7a21810cfd69cc17",
+      "patch": "windows-vr-openxr/patches/0016-dxmt-event-query-flush-coalescing.patch",
+      "patchSha256": "8e8b518245b53203021d180527c9f964ce6220c3c247861017a861071beb17cc",
+      "nativeArchiveChanged": false,
+      "matchingImportExportContractVerified": true,
+      "sourceRevision": "e94c312f5c054263acf261cfa109edf13e757587",
+      "gpuEventSemantics": "Exact Metal shared-event value checked on every poll; one submission request per issue",
+      "validation": "docs/windows-vr-flush-logger-validation.json"
+    },
+    "opencomposite": {
+      "artifact": "bin/vrclient_x64.dll",
+      "baselineSha256": "8e06cdb528221badfbe80db856dc00cbd6970c5d671ea076680fb3fa7f8a5e21",
+      "sha256": "230e5504c4fdb6564bd15de6358dbf3abbf286cbd4a411673bdbe822c3f673bf",
+      "patch": "windows-vr-openvr/patches/0005-first-use-logger-lifetime.patch",
+      "patchSha256": "cd1a413ad2d9fbac800e826a2ec7f10b3fb3d5cdb6df57e311a62523e98484ad",
+      "exportsUnchanged": true,
+      "sharedCXXImports": false,
+      "headsetExecutionValidated": false
+    }
+  },
+  "checks": {
+    "productionGetDataBaseline": "250000 pending polls, 250000 exact GPU reads, 250000 Flush calls",
+    "productionGetDataPatched": "250000 pending polls, 250000 exact GPU reads, 1 Flush call",
+    "eventQueryLifecycle": "pass: reissue, DONOTFLUSH threshold, timestamp-disjoint, invalid queries, exact signal before chunk retirement",
+    "loggerBaseline": "original global ofstream crashes when another translation-unit constructor logs first",
+    "loggerPatched": "pass: both TU link orders and 8000 concurrent writes plus early global-constructor write",
+    "loggerThreadSanitizer": "pass",
+    "queryReadbackAndPublication": "pass",
+    "queryPublicationThreadSanitizer": "pass",
+    "vrEncoderBoundaries": "pass",
+    "arm64ecD3D11Build": "pass",
+    "x64OpenCompositeBuild": "pass",
+    "D3D11ImportsExports": "unchanged",
+    "OpenVRExports": "unchanged",
+    "OpenVRCXXDependencyClosure": "pass; no shared C++ runtime imports",
+    "productionPackageValidator": "pass; accepts actual package and rejects stale hash/missing DLL",
+    "profileShellSyntax": "pass",
+    "signedReleaseBuild": "pass",
+    "strictCodeSignature": "pass",
+    "packagedDLLHashes": "pass; both OpenComposite copies and D3D11 match verified build artifacts"
+  },
+  "nativeRuntimeChanged": false,
+  "resolutionChanged": false,
+  "eyeSize": [
+    1888,
+    1792
+  ],
+  "installedOnHeadset": true,
+  "gameLaunchedByAgent": false,
+  "postChangeGameFPSMeasured": false,
+  "limitations": [
+    "Host tests isolate production code paths; they do not execute a game or measure headset FPS.",
+    "BONEWORKS may expose additional failures after the repaired initialization step.",
+    "GPU shared-event bridge reads still occur on every pending query poll."
+  ],
+  "evidenceDirectory": ".build-performance/",
+  "installation": {
+    "status": "success",
+    "bundleID": "org.avpplay.visionos-windows-vr",
+    "configuration": "Release",
+    "target": "visionOS 27.0",
+    "deviceOS": "visionOS 27.2",
+    "gameLaunchedByAgent": false
+  }
+}

@@ -1,0 +1,65 @@
+--- a/src/d3d11/d3d11_query.hpp
++++ b/src/d3d11/d3d11_query.hpp
+@@ -120,6 +120,7 @@
+ struct MTLD3D11EventQuery : public ID3D11Query1 {
+   virtual void Issue(uint64_t current_seq_id) = 0;
+   virtual EventState CheckEventState(uint64_t coherent_seq_id) = 0;
++  virtual bool RequestFlush() = 0;
+ };
+ 
+ template <typename DataType>
+@@ -134,6 +135,7 @@
+     state = QueryState::Issued;
+     should_be_signaled_at = current_seq_id;
+     stall_counter = 0;
++    flush_requested = false;
+   }
+ 
+   EventState CheckEventState(uint64_t coherent_seq_id) override {
+@@ -154,7 +156,17 @@
+     return EventState::Stall;
+   };
+ 
++  bool RequestFlush() override {
++    // Once Flush submits this query's preceding commands and event, later
++    // context work cannot make that same event complete sooner. Reissue
++    // restores eligibility; GPU completion is still checked on every poll.
++    if (flush_requested) return false;
++    flush_requested = true;
++    return true;
++  }
++
+ private:
++  bool flush_requested = false;
+   QueryState state = QueryState::Undefined;
+   uint32_t stall_counter = 0;
+   uint64_t should_be_signaled_at = 0;
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -406,13 +406,15 @@
+       return E_INVALIDARG;
+ 
+     HRESULT hr = S_FALSE;
++    MTLD3D11EventQuery *eventQuery = nullptr;
+ 
+     D3D11_QUERY_DESC desc;
+     ((ID3D11Query *)pAsync)->GetDesc(&desc);
+     switch (desc.Query) {
+     case D3D11_QUERY_EVENT:
+     case D3D11_QUERY_TIMESTAMP_DISJOINT: {
+-      switch (static_cast<MTLD3D11EventQuery *>(pAsync)->CheckEventState(cmd_queue.SignaledEventSeqId())) {
++      eventQuery = static_cast<MTLD3D11EventQuery *>(pAsync);
++      switch (eventQuery->CheckEventState(cmd_queue.SignaledEventSeqId())) {
+       case EventState::Pending:
+         break;
+       case EventState::Stall:
+@@ -492,7 +494,8 @@
+     }
+     if (hr == S_FALSE && (GetDataFlags & D3D11_ASYNC_GETDATA_DONOTFLUSH) == 0) {
+       cmd_queue.CurrentFrameStatistics().event_stall++;
+-      Flush();
++      if (!eventQuery || eventQuery->RequestFlush())
++        Flush();
+     }
+     return hr;
+   }

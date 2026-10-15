@@ -93,6 +93,7 @@ function(add_opencomposite_variant variant platform)
             PATCH_COMMAND "${GIT_EXECUTABLE}" -C <SOURCE_DIR> apply "${OPENCOMPOSITE_GRAPHICS_PATCH}"
                 COMMAND "${GIT_EXECUTABLE}" -C <SOURCE_DIR> apply "${OPENCOMPOSITE_LLVM_MINGW_PATCH}"
                 COMMAND "${GIT_EXECUTABLE}" -C <SOURCE_DIR> apply "${CMAKE_CURRENT_SOURCE_DIR}/patches/0004-runtime-construction-diagnostics.patch"
+                COMMAND "${GIT_EXECUTABLE}" -C <SOURCE_DIR> apply "${CMAKE_CURRENT_SOURCE_DIR}/patches/0005-first-use-logger-lifetime.patch"
             CMAKE_ARGS
                 "-DCMAKE_INSTALL_PREFIX=${OPENCOMPOSITE_STAGE_ROOT}/WindowsVR/Guest/${variant}"
                 "-DERROR_ON_WARNING=OFF"

@@ -1,0 +1,78 @@
+--- a/OpenOVR/logging.cpp
++++ b/OpenOVR/logging.cpp
+@@ -9,6 +9,7 @@
+ #include <ctime>
+ #include <errno.h> // errno, ENOENT, EEXIST
+ #include <fstream>
++#include <mutex>
+ #include <iostream>
+ #include <sstream>
+ #include <stdarg.h>
+@@ -155,15 +156,25 @@
+         wvr_log_construction_marker("[wvr-cxx-init] logging TU entered before stream construction\n");
+     }
+ };
+-static StreamConstructorBefore stream_before;
+-static std::ofstream stream;
+ struct StreamConstructorAfter {
+     StreamConstructorAfter() {
+         stream_constructor_phase = 2;
+         wvr_log_construction_marker("[wvr-cxx-init] logging stream constructed\n");
+     }
+ };
+-static StreamConstructorAfter stream_after;
++struct LoggerState {
++    StreamConstructorBefore before;
++    std::ofstream stream;
++    StreamConstructorAfter after;
++    std::mutex mutex;
++};
++
++static LoggerState& logger_state() {
++    // Config and other translation-unit constructors can log before this TU
++    // initializes. Construct the stream on first use, exactly once.
++    static LoggerState state;
++    return state;
++}
+ static std::atomic<bool> stream_diagnostic_written{false};
+ 
+ #ifdef __GLIBCXX__
+@@ -193,6 +204,7 @@
+ 
+ static void init_stream()
+ {
++    auto& stream = logger_state().stream;
+     if (!stream_diagnostic_written.exchange(true)) {
+         void *vtable = nullptr;
+         memcpy(&vtable, &stream, sizeof(vtable));
+@@ -289,6 +301,9 @@
+ #ifdef ANDROID
+ 	__android_log_print(ANDROID_LOG_INFO, "OpenComposite", "%s:%d \t %s", func, line, msg);
+ #else
++    auto& logger = logger_state();
++    std::lock_guard<std::mutex> lock(logger.mutex);
++    auto& stream = logger.stream;
+ 	init_stream();
+ 	stream << "[" << format_time() << "] " << func << ":" << line << "\t- " << (msg ? msg : "NULL") << std::endl;
+ 
+@@ -298,7 +313,6 @@
+ 	printf("[OC] %s:%ld \t %s\n", func, line, msg);
+ #endif
+ 
+-	// Do we need to close the stream or something? What about multiple threads?
+ #endif
+ }
+ 
+@@ -342,7 +356,11 @@
+ #ifdef ANDROID
+ 	__android_log_print(ANDROID_LOG_ERROR, "OpenComposite", "ERROR: %s:%d \t %s", func, line, buff);
+ #else
+-	stream << std::flush;
++	{
++		auto& logger = logger_state();
++		std::lock_guard<std::mutex> lock(logger.mutex);
++		logger.stream << std::flush;
++	}
+ #endif
+ 
+ 	OOVR_MESSAGE(buff, title);
