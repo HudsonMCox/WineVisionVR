@@ -1,0 +1,45 @@
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 6fda5f0..5575398 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -985,7 +985,7 @@ public:
+           if (passes == 1 || (passes >= 1024 && (passes & (passes - 1)) == 0))
+             WARN("wvr-foveation d3d12 passes=", passes, " safe=", safePasses, " eligible=", eligiblePasses,
+                  " peer=", foveationPeer, " draws=", data->foveation_draw_calls,
+-                 " array=", render_pass_info.render_target_array_length,
++                 " array=", unsigned(render_pass_info.render_target_array_length),
+                  " colors=", unsigned(data->render_target_count));
+           if (eligible && foveationPeer && render_pass_info.render_target_width >= 256 &&
+               render_pass_info.render_target_height >= 256) {
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index d49f511..11b8b5a 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -1106,8 +1106,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+       if (passes==1 || (passes>=1024 && (passes&(passes-1))==0))
+         WARN("wvr-foveation passes=",passes," safe=",safePasses," eligible=",eligiblePasses,
+              " peer=",foveationPeer," draws=",data->foveation_draw_calls," pso=",bool(data->last_pso),
+-             " visibility=",data->use_visibility_result," samples=",render_pass_info.default_raster_sample_count,
+-             " array=",render_pass_info.render_target_array_length," colors=",unsigned(data->render_target_count));
++             " visibility=",data->use_visibility_result," samples=",unsigned(render_pass_info.default_raster_sample_count),
++             " array=",unsigned(render_pass_info.render_target_array_length)," colors=",unsigned(data->render_target_count));
+       if (eligible && foveationPeer && render_pass_info.render_target_width >= 256 && render_pass_info.render_target_height >= 256) {
+         foveation.colorCount=data->render_target_count;
+         for (unsigned i=1;i<data->render_target_count;++i) {
+diff --git a/src/util/log/log.cpp b/src/util/log/log.cpp
+index 96ced95..624fb06 100644
+--- a/src/util/log/log.cpp
++++ b/src/util/log/log.cpp
+@@ -74,6 +74,12 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
+     std::string line;
+ 
+     while (std::getline(stream, line, '\n')) {
++      // Wine consumes C strings and buffers until a newline. An embedded NUL
++      // would truncate the newline and can eventually raise BUFFER_OVERFLOW
++      // inside __wine_dbg_output. Keep binary fields printable at this boundary.
++      for (size_t offset = 0; (offset = line.find('\0', offset)) != std::string::npos; offset += 2)
++        line.replace(offset, 1, "\\0");
++
+       std::stringstream outstream;
+       outstream << prefix << line << std::endl;
+ 

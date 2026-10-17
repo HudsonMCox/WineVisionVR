@@ -1,0 +1,32 @@
+--- a/build/win32u-unix/message_ios.c
++++ b/build/win32u-unix/message_ios.c
+@@ -2858,7 +2858,12 @@
+                     /* fall through */
+                 case MA_ACTIVATE:
+                 case 0:
+-                    if (!set_foreground_window( hwndTop, TRUE, FALSE )) eat_msg = TRUE;
++                    /* An already-active root can reject a redundant foreground
++                     * request in the embedded driver. Match the non-client
++                     * activation path: do not swallow this client button-down
++                     * when activation has already reached the requested root. */
++                    if (!set_foreground_window( hwndTop, TRUE, FALSE ) &&
++                        get_active_window() != hwndTop) eat_msg = TRUE;
+                     break;
+                 default:
+                     WARN( "unknown WM_MOUSEACTIVATE code %d\n", ret );
+--- a/wine/dlls/win32u/message.c
++++ b/wine/dlls/win32u/message.c
+@@ -2822,7 +2822,12 @@
+                     /* fall through */
+                 case MA_ACTIVATE:
+                 case 0:
+-                    if (!set_foreground_window( hwndTop, TRUE, FALSE )) eat_msg = TRUE;
++                    /* An already-active root can reject a redundant foreground
++                     * request in the embedded driver. Match the non-client
++                     * activation path: do not swallow this client button-down
++                     * when activation has already reached the requested root. */
++                    if (!set_foreground_window( hwndTop, TRUE, FALSE ) &&
++                        get_active_window() != hwndTop) eat_msg = TRUE;
+                     break;
+                 default:
+                     WARN( "unknown WM_MOUSEACTIVATE code %d\n", ret );

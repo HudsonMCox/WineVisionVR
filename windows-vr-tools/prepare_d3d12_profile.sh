@@ -97,6 +97,7 @@ patches=[
  "windows-vr-openxr/patches/0039-dxmt-d3d12-submit-jitter.patch",
  "windows-vr-openxr/patches/0040-dxmt-d3d12-single-pass-stereo.patch",
  "windows-vr-openxr/patches/0041-dxmt-d3d11-getdata-blocking-wait.patch",
+ "windows-vr-openxr/patches/0042-dxmt-wine-log-nul-safety.patch",
 ]
 subprocess.run(["git","init","--quiet"],cwd=dest,check=True)
 for rel in patches:

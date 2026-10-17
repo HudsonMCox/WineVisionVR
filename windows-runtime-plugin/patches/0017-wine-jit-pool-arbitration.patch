@@ -1,0 +1,182 @@
+diff --git a/build/ntdll-unix/virtual_ios.c b/build/ntdll-unix/virtual_ios.c
+--- a/build/ntdll-unix/virtual_ios.c
++++ b/build/ntdll-unix/virtual_ios.c
+@@ -2304,6 +2304,35 @@
+  * imm26 0x90A311 == truncation of -0xDBD73BC). Pass anchor_off = the
+  * image's pool offset and max_dist to force the range within branch
+  * reach; (size_t)-1 anchor = unconstrained (old behavior). */
++/* Head and fresh-tail reservations share ios_pool_lock. A caller may have
++ * computed its head limit before blocking on that lock, so re-clamp the limit
++ * at the commit point. A failed reservation never moves either cursor. */
++static size_t ios_pool_head_limit_locked( size_t requested_limit )
++{
++    size_t total = ios_jit_pool_size_global, tail = ios_jit_tail_reserved;
++    size_t live_limit = tail <= total ? total - tail : 0;
++    return requested_limit < live_limit ? requested_limit : live_limit;
++}
++
++static int ios_pool_reserve_tail_locked( size_t size, size_t *offset )
++{
++    size_t total = ios_jit_pool_size_global;
++    size_t head = jit_pool_offset, tail = ios_jit_tail_reserved;
++    /* Ten percent of the existing arena (64 MiB for the 640 MiB visionOS
++     * pool) stays available for DLLs loaded after FEX creates its code buffer.
++     * This replaces the old 48 MiB advisory cap, whose 16 MiB floor could
++     * consume that reserve even when calculated room was zero. */
++    size_t head_reserve = total / 10;
++    if (!size || head > total || tail > total - head) return 0;
++    if (head_reserve > total - head - tail ||
++        size > total - head - tail - head_reserve) return 0;
++    /* Preserve the existing maximum three-quarter tail ownership policy. */
++    if (tail > (total / 4) * 3 || size > (total / 4) * 3 - tail) return 0;
++    *offset = total - tail - size;
++    ios_jit_tail_reserved = tail + size;
++    return 1;
++}
++
+ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
+                                        size_t anchor_off, size_t max_dist )
+ {
+@@ -2498,7 +2527,8 @@
+ 
+     if (off == (size_t)-1)
+     {
+-        if (jit_pool_offset + alloc_size <= pool_limit
++        pool_limit = ios_pool_head_limit_locked( pool_limit );
++        if (jit_pool_offset <= pool_limit && alloc_size <= pool_limit - jit_pool_offset
+             && IOS_POOL_IN_REACH(jit_pool_offset))
+         {
+             off = jit_pool_offset;
+@@ -23333,78 +23363,11 @@
+         ios_jit_pool_size_global)
+     {
+         size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;
+-        /* ml459 (#75): cap a single EC code buffer at 16MB. FEX asks for 32MB
+-         * once its buffers get hot, but an old generation stays pinned by any
+-         * thread still referencing it (see [pool-tail] PIN) — and a 32MB
+-         * generation pinned while 10% full wastes 29MB of a pool the head is
+-         * fighting us for (ml458: tail 214MB, head 682MB, died 1MB short).
+-         * Refusing the oversized ask is SAFE and already-exercised: FEX's
+-         * CodeBuffer ctor halves down the ladder on failure, and this run's own
+-         * log shows "exec alloc degraded 0x2000000 -> 0x400000" followed by
+-         * normal execution. Smaller generations waste less per pin; the
+-         * [pool-tail] census says whether pinning or churn dominates. */
+-        /* iOS-Madeira ml480 (#84): the flat 16MB refusal above made EVERY hot
+-         * thread rotate its code buffer constantly. ml479's run: 79 tail
+-         * events, 267k real compiles, and a compile-miss rate PINNED at ~19-20%
+-         * for the whole run (a warmed-up workload should approach 0). Each
+-         * rotation discards that thread's compiled code, so the SteamUI frame
+-         * thread spends its frames recompiling — Steam itself reported "frame
+-         * stalled for: 32818 ms", which is why its accept() loop only drains
+-         * the listen backlog every 2-3 minutes and CEF's ~12s websocket
+-         * handshake ALWAYS times out (the login window can never come up).
+-         *
+-         * Budget-aware cap instead of a flat one: grant 32MB while the tail is
+-         * under the watermark (measured peak tail_resv was 112MB of the 256MB
+-         * tail; head peaked 682MB of its 896MB budget), and fall back to the
+-         * proven 16MB refusal once the tail is loaded. Hot threads that rotate
+-         * early get big buffers; late/idle threads still get real ones, so the
+-         * ml436 exhaustion (10 refusals, 123 degraded threads) can't return. */
+-        {
+-            /* ml1052: the cap was 32 MB (16 MB once the tail passed 160 MB). FEX
+-             * keeps ONE shared code buffer per process and discards every
+-             * translation when it fills, so a program whose hot code does not
+-             * fit retranslates forever: one run measured 12.5M block lookups,
+-             * 5.5M real compiles (56 % hit rate), 390 buffer rotations, and a
+-             * quarter of all running CPU samples inside the compiler. The cap is
+-             * now what the pool can actually afford: up to 128 MB (the branch
+-             * range FEX itself limits a buffer to) while HEAD_RESERVE stays free
+-             * between the image head and the tail. */
+-            enum { TAIL_SMALL = 0x1000000, TAIL_MAX = 0x8000000, HEAD_RESERVE = 48u * 1024 * 1024 };
+-            size_t head_now = jit_pool_offset, tail_now = ios_jit_tail_reserved;
+-            size_t room = ios_jit_pool_size_global > head_now + tail_now + HEAD_RESERVE
+-                        ? ios_jit_pool_size_global - head_now - tail_now - HEAD_RESERVE : 0;
+-            size_t cap = TAIL_SMALL;
+-            while (cap < TAIL_MAX && cap * 2 <= room) cap *= 2;
+-            /* A retired generation of this size already sitting on the carve
+-             * free-list costs the pool nothing new: never refuse that. */
+-            if (alloc_size > cap)
+-            {
+-                unsigned fi;
+-                pthread_mutex_lock( &ios_tail_carve_lock );
+-                for (fi = 0; fi < ios_tail_carve_n; fi++)
+-                    if (ios_tail_carves[fi].free && ios_tail_carves[fi].size >= alloc_size) { cap = alloc_size; break; }
+-                pthread_mutex_unlock( &ios_tail_carve_lock );
+-            }
+-
+-            if (alloc_size > cap) {
+-                static int cap_log_n;
+-                if (cap_log_n < 16) {
+-                    cap_log_n++;
+-                    dprintf(2, "[jit-pool] tail CAP: refusing 0x%lx (cap 0x%lx, tail_resv=0x%lx) so FEX halves down rev=ml480\n",
+-                            (unsigned long)alloc_size, (unsigned long)cap,
+-                            (unsigned long)ios_jit_tail_reserved);
+-                }
+-                return STATUS_NO_MEMORY;
+-            }
+-            if (alloc_size > TAIL_SMALL) {
+-                static int big_log_n;
+-                if (big_log_n < 16) {
+-                    big_log_n++;
+-                    dprintf(2, "[jit-pool] tail BIG: granting 0x%lx (tail_resv=0x%lx) rev=ml480\n",
+-                            (unsigned long)alloc_size, (unsigned long)ios_jit_tail_reserved);
+-                }
+-            }
+-        }
++        /* Keep FEX's branch-reach bound, but decide affordability only at the
++         * reservation commit below. Reusing a retired carve or a grace-expired
++         * head range consumes no fresh tail and must not be rejected by a stale
++         * advisory cap. FEX halves a genuinely refused request as before. */
++        if (!alloc_size || alloc_size > 128u * 1024 * 1024) return STATUS_NO_MEMORY;
+         /* ml438 (#74): serve from the free-list first — see ios_tail_carves. */
+         {
+             unsigned i, best = ~0u;
+@@ -23437,12 +23400,13 @@
+          * mprotect_exec's PE-image copies which take from the start.
+          * ios_jit_tail_reserved is the shared file-scope counter so the
+          * head allocators can refuse to grow into tail-carved buffers. */
+-        size_t reserve_offset = __sync_fetch_and_add(&ios_jit_tail_reserved, alloc_size);
+-        size_t pool_tail_off = ios_jit_pool_size_global - reserve_offset - alloc_size;
+-        /* ml1052: was "tail may never exceed half the pool", a rule from a
+-         * workload whose HEAD was 700 MB. The real constraint is the collision. */
+-        if (reserve_offset + alloc_size > (ios_jit_pool_size_global / 4) * 3 ||
+-            pool_tail_off < jit_pool_offset)
++        size_t reserve_offset, pool_tail_off = 0;
++        int reserved;
++        pthread_mutex_lock( &ios_pool_lock );
++        reserve_offset = ios_jit_tail_reserved;
++        reserved = ios_pool_reserve_tail_locked( alloc_size, &pool_tail_off );
++        pthread_mutex_unlock( &ios_pool_lock );
++        if (!reserved)
+         {
+             /* ml1039: before refusing, take a reclaimed head range if one fits. */
+             {
+@@ -23453,7 +23417,6 @@
+                     volatile uint32_t *f_rw = (volatile uint32_t *)((char *)ios_jit_rw_base_global + foff);
+                     size_t w, nw = alloc_size / sizeof(uint32_t);
+ 
+-                    __sync_fetch_and_sub(&ios_jit_tail_reserved, alloc_size);   /* not a tail carve */
+                     for (w = 0; w < nw; w++) f_rw[w] = 0xd503201fu;             /* NOP-prefill, as for fresh carves */
+                     pthread_mutex_lock( &ios_tail_carve_lock );
+                     if (ios_tail_carve_n < IOS_TAIL_CARVE_MAX)
+@@ -23481,9 +23444,8 @@
+              * guest-band base). Fail the allocation HONESTLY instead: FEX's
+              * CodeBuffer ctor (rev=ml364) sees NULL, halves the request down
+              * to 1MB (small carves can still fit pool gaps), and if nothing
+-             * fits forces the diagnosable 0xdead fault. Also roll back the
+-             * tail reservation — the old path leaked it on every refusal. */
+-            __sync_fetch_and_sub(&ios_jit_tail_reserved, alloc_size);
++             * fits forces the diagnosable 0xdead fault. The failed reservation
++             * never changed the cursor, so no concurrent rollback is needed. */
+             ERR("NtAllocateVirtualMemoryEx iOS: JIT-pool tail exhausted for FEX EC_CODE %zu bytes\n",
+                 (size_t)*size_ptr);
+             /* ml459 (#75): dump the carve table on the FIRST refusal — the
+@@ -23513,7 +23475,7 @@
+                             (unsigned long)freed, (unsigned long)(freed >> 20));
+                 }
+             }
+-            dprintf(2, "[jit-pool] TAIL REFUSED (FEX EC_CODE): want=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx — REFUSING honestly rev=ml421 (was: fall to normal alloc = guest-band non-exec buffer = ClearCache wild write)\n",
++            dprintf(2, "[jit-pool] TAIL REFUSED (FEX EC_CODE): want=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx — REFUSING within 10-percent head reserve rev=wvr0012 (was: fall to normal alloc = guest-band non-exec buffer = ClearCache wild write)\n",
+                     (unsigned long)alloc_size, (unsigned long)reserve_offset,
+                     (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global);
+             return STATUS_NO_MEMORY;

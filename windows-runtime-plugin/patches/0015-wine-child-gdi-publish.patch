@@ -22,16 +22,19 @@ diff --git a/wine/dlls/win32u/win32u_private.h b/wine/dlls/win32u/win32u_private
 index da02424..69f8ebb 100644
 --- a/wine/dlls/win32u/win32u_private.h
 +++ b/wine/dlls/win32u/win32u_private.h
-@@ -387,7 +387,11 @@ extern __thread void *win32u_gdi_published_peb;
+@@ -387,7 +387,13 @@ extern __thread void *win32u_gdi_published_peb;
  extern void win32u_gdi_publish_shared(void);
  static inline void win32u_gdi_check_publish(void)
  {
 -    if (win32u_wow_session && NtCurrentTeb()->WowTebOffset &&
+-        win32u_gdi_published_peb != NtCurrentTeb()->Peb)
++    TEB *teb = NtCurrentTeb();
 +    /* 64-bit pseudo-processes need it too: gdi_init() only publishes into the
 +     * PEB of the session's first process, so every later one (a child started
 +     * through a launcher stub) had a NULL GdiSharedHandleTable. The WoW64
-+     * section gate still applies to 32-bit callers. */
-+    if ((win32u_wow_session || !NtCurrentTeb()->WowTebOffset) &&
-         win32u_gdi_published_peb != NtCurrentTeb()->Peb)
++     * section gate still applies to 32-bit callers. A PEB whose table is still
++     * NULL is republished even if this thread already recorded it. */
++    if ((win32u_wow_session || !teb->WowTebOffset) &&
++        (win32u_gdi_published_peb != teb->Peb || !teb->Peb->GdiSharedHandleTable))
          win32u_gdi_publish_shared();
  }
