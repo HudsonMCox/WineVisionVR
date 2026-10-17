@@ -1,0 +1,174 @@
+diff --git a/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h b/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+index 1a2e7c1..4162ece 100644
+--- a/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
++++ b/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+@@ -144,7 +144,10 @@ constexpr auto REG_GUEST_ADDR_TMP = ARMEmitter::XReg::x24;
+ // Scoped to `FEX_IOS_HOST && !ARCHITECTURE_arm64ec`: the ARM64EC module keeps its sequence byte for
+ // byte, and every non-iOS build keeps the shadow stack. What remains is the lone `adr` at a linked
+ // CALL, the known-call marker Arm64JITCore::ExitFunctionLink reads to relink the callsite as `bl`.
+-#if defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)
++// Windows/ARM64EC (iOS) now takes the same path: the RET-side consumer is compiled out there too, so the
++// per-call bounds guard, State.callret_sp reload/writeback and 16-byte push were pure overhead on every
++// guest CALL/RET and on every x64->EC exit.
++#if defined(FEX_IOS_HOST)
+ #define FEX_CALLRET_STACK_UNUSED 1
+ #endif
+ 
+diff --git a/FEX/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEX/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 032a62b..dda6297 100644
+--- a/FEX/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEX/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -242,7 +242,9 @@ void Dispatcher::EmitDispatcher() {
+   lsrv(ARMEmitter::Size::i64Bit, TMP1, TMP1, TMP2);
+   (void)tbz(TMP1, 0, &l_NotECCode);
+ 
++#ifndef FEX_CALLRET_STACK_UNUSED
+   str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
++#endif
+ 
+   add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, StaticRegisters[X86State::REG_RSP], 0);
+   mov(EC_CALL_CHECKER_PC_REG, RipReg);
+@@ -701,7 +703,7 @@ void Dispatcher::EmitDispatcher() {
+ 
+     // load static regs
+     FillStaticRegs();
+-#ifdef ARCHITECTURE_arm64ec
++#if defined(ARCHITECTURE_arm64ec) && !defined(FEX_CALLRET_STACK_UNUSED)
+     // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2). The JITCallback
+     // sentinel push uses REG_CALLRET_SP after FillStaticRegs, which on iOS
+     // ARM64EC reloads x17 from State.callret_sp. If State has drifted OOB
+diff --git a/FEX/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEX/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+index f231071..6321d62 100644
+--- a/FEX/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEX/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -81,7 +81,9 @@ DEF_OP(ExitFunction) {
+   if (IsInlineConstant(Op->NewRIP, &NewRIP) || IsInlineEntrypointOffset(Op->NewRIP, &NewRIP)) {
+ #ifdef ARCHITECTURE_arm64ec
+     if (NewRIP < EC_CODE_BITMAP_MAX_ADDRESS && RtlIsEcCode(NewRIP)) {
++#ifndef FEX_CALLRET_STACK_UNUSED
+       str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
++#endif
+       add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, StaticRegisters[X86State::REG_RSP], 0);
+       InsertGuestRIPMove(EC_CALL_CHECKER_PC_REG, NewRIP);
+       ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.ExitFunctionEC));
+@@ -161,7 +163,7 @@ DEF_OP(ExitFunction) {
+       ARMEmitter::ForwardLabel l_BranchHost;
+       ARMEmitter::ForwardLabel l_CallReturn;
+       if (Op->Hint == IR::BranchHint::Call) {
+-#ifdef ARCHITECTURE_arm64ec
++#if defined(ARCHITECTURE_arm64ec) && !defined(FEX_CALLRET_STACK_UNUSED)
+         // iOS-Madeira 2026-05-13: REG_CALLRET_SP (x17) gets clobbered when a
+         // previous BLR returns from native ARM64EC code (DXMT vtable methods,
+         // ARM64EC entry thunks). Reload from State.callret_sp before pushing
+@@ -220,7 +222,7 @@ DEF_OP(ExitFunction) {
+           stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
+         }
+ #endif
+-#ifdef ARCHITECTURE_arm64ec
++#if defined(ARCHITECTURE_arm64ec) && !defined(FEX_CALLRET_STACK_UNUSED)
+         /* Write back post-push x17 so dispatcher LoopTop's reload picks
+          * up the new top. Without this, in-register PUSH changes get
+          * lost on next dispatcher iteration and the entry leaks. */
+@@ -334,7 +336,7 @@ DEF_OP(ExitFunction) {
+     (void)Bind(&SkipFullLookup);
+     if (Op->Hint == IR::BranchHint::Call) {
+       ARMEmitter::ForwardLabel l_CallReturn;
+-#ifdef ARCHITECTURE_arm64ec
++#if defined(ARCHITECTURE_arm64ec) && !defined(FEX_CALLRET_STACK_UNUSED)
+       // iOS-Madeira 2026-05-13: see note above — reload REG_CALLRET_SP (x17)
+       // from State.callret_sp before pushing the call-return frame, since
+       // native ARM64EC returns leave x17 pointing at an arbitrary RX page.
+@@ -370,7 +372,7 @@ DEF_OP(ExitFunction) {
+         stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
+       }
+ #endif
+-#ifdef ARCHITECTURE_arm64ec
++#if defined(ARCHITECTURE_arm64ec) && !defined(FEX_CALLRET_STACK_UNUSED)
+       /* Write back post-push x17 so dispatcher LoopTop reload sees it. */
+       str(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+ #endif
+diff --git a/FEX/Source/Windows/ARM64EC/Module.S b/FEX/Source/Windows/ARM64EC/Module.S
+index 73a362f..7f317ff 100644
+--- a/FEX/Source/Windows/ARM64EC/Module.S
++++ b/FEX/Source/Windows/ARM64EC/Module.S
+@@ -21,14 +21,18 @@
+ .arch_extension lse   // ml1131: stadd/ldadd for the transition probe counters
+ // ml1131: add 1 to the sp-sharded counter at IosXpFex + \off. Clobbers \a, \b.
+ .macro IOS_XP_COUNT off, a, b
++  // Plain load/add/store: the shard is selected by sp bits 16..19, so it is
++  // effectively thread-private and the (rare) cross-thread collision only
++  // loses a diagnostic count. An LSE atomic here cost a locked RMW per crossing.
+   adrp \a, IosXpFex
+   add \a, \a, #:lo12:IosXpFex
+   mov \b, sp
+   ubfx \b, \b, #16, #4
+   add \a, \a, \b, lsl #6
+   add \a, \a, #\off
+-  mov \b, #1
+-  stadd \b, [\a]
++  ldr \b, [\a]
++  add \b, \b, #1
++  str \b, [\a]
+ .endm
+ .macro IOS_LOAD_TEB reg
+   mrs \reg, TPIDRRO_EL0
+@@ -249,13 +253,16 @@ enter_jit:
+   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
+ #endif
+   mov w16, #1
+-  strb w16, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+ #ifdef FEX_IOS_HOST
+   // ml460 (#75) Dekker handshake vs the pool-tail sweeper: InSimulation=1 is
+-  // published above; the full barrier orders it before the gate read, so
+-  // either the sweeper sees us in-simulation (and skips this thread) or we
+-  // see the gate (and wait out the sweep before touching L1/callret state).
+-  dmb ish
++  // published with a store-release and the gate is read with load-acquire
++  // (ldar below). Release-store then acquire-load is ordered store->load by the
++  // architecture (RCsc), which is all the handshake needs, so the full
++  // `dmb ish` that used to sit between them (paid on EVERY EC->x64 return) is
++  // unnecessary: either the sweeper sees us in-simulation (and skips this
++  // thread) or we see the gate (and wait out the sweep before touching
++  // L1/callret state).
++  stlrb w16, [x17]      // ChpeV2CpuAreaInfo->InSimulation
+ 8:
+   adrp x16, IosCodeBufferSweepGate
+   add x16, x16, #:lo12:IosCodeBufferSweepGate
+@@ -264,6 +271,8 @@ enter_jit:
+   yield
+   b 8b
+ 9:
++#else
++  strb w16, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+ #endif
+   ldr x16, [x17, #0x40] // ChpeV2CpuAreaInfo->EmulatorData[2] - DispatcherLoopTopEnterEC
+   br x16 // DispatcherLoopTopEnterEC(RIP:x9, CPUArea:x17)
+@@ -280,8 +289,7 @@ BeginSimulation:
+   // Publish InSimulation BEFORE SyncThreadContext (the sweeper touches
+   // State.callret_sp) and wait out any active sweep.
+   mov w16, #1
+-  strb w16, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+-  dmb ish
++  stlrb w16, [x17]      // ChpeV2CpuAreaInfo->InSimulation; release-store + ldar below orders store->load (see enter_jit)
+ 6:
+   adrp x16, IosCodeBufferSweepGate
+   add x16, x16, #:lo12:IosCodeBufferSweepGate
+@@ -341,12 +349,15 @@ ExitFunctionEC:
+   ubfx x23, x23, #16, #4
+   add x17, x16, x23, lsl #6
+   add x17, x17, #64
+-  mov x4, #1
+-  ldadd x4, x23, [x17]
++  ldr x23, [x17]
++  add x4, x23, #1
++  str x4, [x17]          // plain RMW: shard is thread-private in practice (see IOS_XP_COUNT)
+   tst x23, #63
+   b.ne 2f
+   add x17, x16, #3136
+-  ldadd x4, x23, [x17]
++  ldr x23, [x17]
++  add x4, x23, #1
++  str x4, [x17]
+   and x23, x23, #4095
+   add x17, x16, #3200
+   str x9, [x17, x23, lsl #3]

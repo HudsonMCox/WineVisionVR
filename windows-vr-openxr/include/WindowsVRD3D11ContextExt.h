@@ -41,6 +41,17 @@ struct WVRDXMTSubmitFrameV2 {
   uint32_t rightY;
   uint32_t rightWidth;
   uint32_t rightHeight;
+  // Appended trailing fields (projection jitter). The record is passed by pointer, so consumers
+  // built against the prefix still read the original offsets unchanged.
+  uint32_t jitterFlags;  // WVRDXMTJitterValid when the jitter fields are meaningful.
+  float jitterPixelX;    // Projection center offset in pixels of the recommended eye image.
+  float jitterPixelY;
+  float jitterNdcX;      // Same offset in NDC for eye 0 (2 * pixel / width).
+  float jitterNdcY;
+};
+
+enum WVRDXMTJitterFlagsV1 {
+  WVRDXMTJitterValid = 1u << 0
 };
 
 enum WVRDXMTControllerRoleV1 {
@@ -124,3 +135,20 @@ struct WVRDXMTDepthFrameV1 {
 struct __declspec(uuid("794f57f1-7369-4f63-a12d-604391027a18")) IMTLD3D11ContextExt4 : public IUnknown {
   virtual HRESULT STDMETHODCALLTYPE SubmitWindowsVRDepthFrame(const WVRDXMTDepthFrameV1 *frame) = 0;
 };
+
+// Optional eye size publication, separately queried; published Ext2-4 vtables stay frozen.
+// The runtime calls this when a session binds its D3D11 context so that the DXMT side can create eye textures
+// that are eligible for stereo single-pass rendering. Until it is called, no eye texture candidates are made.
+inline constexpr GUID kWVRD3D11ContextExt5IID = {0xa6ccb1eb,0x6989,0x4cb4,{0xa7,0x2e,0x1a,0x5f,0x61,0x58,0xd2,0xf2}};
+struct __declspec(uuid("a6ccb1eb-6989-4cb4-a72e-1a5f6158d2f2")) IMTLD3D11ContextExt5 : public IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE SetWindowsVREyeSize(UINT width, UINT height) = 0;
+};
+
+// MinGW's i386 ABI implements __uuidof through template specializations.
+// Clang's uuid attribute alone is ignored on that target.
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(IMTLD3D11ContextExt2, 0xbc8694b6, 0xa18f, 0x48d8, 0xbc, 0xe1, 0x90, 0xda, 0x0b, 0x6b, 0x7f, 0x42)
+__CRT_UUID_DECL(IMTLD3D11ContextExt4, 0x794f57f1, 0x7369, 0x4f63, 0xa1, 0x2d, 0x60, 0x43, 0x91, 0x02, 0x7a, 0x18)
+__CRT_UUID_DECL(IMTLD3D11ContextExt3, 0xd9e15e9c, 0x7c99, 0x4b09, 0x8d, 0xd8, 0x62, 0x8d, 0x3c, 0xf0, 0x04, 0xa7)
+__CRT_UUID_DECL(IMTLD3D11ContextExt5, 0xa6ccb1eb, 0x6989, 0x4cb4, 0xa7, 0x2e, 0x1a, 0x5f, 0x61, 0x58, 0xd2, 0xf2)
+#endif

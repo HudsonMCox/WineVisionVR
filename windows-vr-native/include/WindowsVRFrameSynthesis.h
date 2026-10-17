@@ -6,8 +6,10 @@ extern "C" {
 #endif
 // Native-host API only: no changes to the guest or Unix carrier ABI.
 // 1 = edge-adaptive spatial reconstruction; 2 adds bounded object
-// extrapolation. These are custom Metal algorithms, not NVIDIA DLSS or a
-// MetalFX interpolator.
+// extrapolation. 3 = spatial reconstruction plus a foveal temporal resolve; it
+// needs explicit game depth and projection jitter (the jitter-carrying V3
+// submission) and otherwise behaves as 1. These are custom Metal algorithms,
+// not NVIDIA DLSS or a MetalFX interpolator.
 void *wvr_synthesis_create_v1(void *device, uint32_t mode);
 void wvr_synthesis_destroy_v1(void *context);
 void wvr_synthesis_reset_v1(void *context);
@@ -47,6 +49,16 @@ void *wvr_synthesis_copy_motion_v1(void *context, uint32_t eye);
 void *wvr_synthesis_copy_depth_v1(void *context, uint32_t eye);
 int32_t wvr_synthesis_copy_stats_v1(void *context, char *buffer,
                                     uint32_t capacity);
+// 1 when extrapolation is trustworthy for the next display tick: the backend is
+// ready, mode >= 2, and both eyes' last sampled optical-flow coverage is high
+// enough. 0 means the caller should present plain reprojection instead.
+int32_t wvr_synthesis_forecast_reliable_v1(void *context);
+// Display-pose depth of the latest synthesized output, per eye: drawable-convention
+// depth (clip.z/clip.w with the display projection), 0 where no source pixel maps.
+// Owned, retained texture; release with the bridge.
+void *wvr_synthesis_copy_display_depth_v1(void *context, uint32_t eye);
+// Drops the synthesized-output history used for disocclusion fill.
+void wvr_synthesis_reset_history_v1(void *context);
 #ifdef __cplusplus
 }
 #endif

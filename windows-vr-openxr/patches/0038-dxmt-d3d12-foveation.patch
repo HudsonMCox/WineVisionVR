@@ -1,0 +1,254 @@
+diff --git a/src/d3d12/d3d12_command_encoder.hpp b/src/d3d12/d3d12_command_encoder.hpp
+index 1caf3bc..4986676 100644
+--- a/src/d3d12/d3d12_command_encoder.hpp
++++ b/src/d3d12/d3d12_command_encoder.hpp
+@@ -103,6 +103,8 @@ struct RenderEncoderData : EncoderData {
+   bool use_visibility_result = 0;
+   bool use_tessellation = 0;
+   bool use_geometry = 0;
++  bool foveation_safe = true;
++  uint32_t foveation_draw_calls = 0;
+ };
+ 
+ struct BlitEncoderData : EncoderData {
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index feeb006..f6beb44 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -435,6 +435,8 @@ public:
+       return DrawCallStatus::Invalid;
+ 
+     if (dirty_state_.test(DirtyState::GraphicsPipelineState)) {
++      // a pass stays foveation eligible only while every pipeline bound inside it is safe
++      static_cast<RenderEncoderData *>(allocator_->encoder_current)->foveation_safe &= pso_graphics_->foveation_safe;
+       auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
+       cmd_setpso.type = WMTRenderCommandSetPSO;
+       cmd_setpso.pso = pso_graphics_->pso;
+@@ -569,6 +571,7 @@ public:
+     if (status == DrawCallStatus::Invalid)
+       return;
+ 
++    ++static_cast<RenderEncoderData *>(allocator_->encoder_current)->foveation_draw_calls;
+     auto &cmd_draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw>();
+     cmd_draw.type = WMTRenderCommandDraw;
+     cmd_draw.primitive_type = primitive_type;
+@@ -590,6 +593,7 @@ public:
+     DrawCallStatus status = PreDraw();
+     if (status == DrawCallStatus::Invalid)
+       return;
++    ++static_cast<RenderEncoderData *>(allocator_->encoder_current)->foveation_draw_calls;
+     auto &cmd_draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indexed>();
+     cmd_draw.type = WMTRenderCommandDrawIndexed;
+     cmd_draw.primitive_type = primitive_type;
+@@ -1590,6 +1594,8 @@ public:
+     if (status != DrawCallStatus::Ordinary) {
+       IMPLEMENT_ME // TODO: (potential) emulated pipeline
+     }
++    // indirect draws run pipelines chosen inside the argument buffer, which the pass safety tracking cannot see
++    static_cast<RenderEncoderData *>(allocator_->encoder_current)->foveation_safe = false;
+ 
+     auto cmd = allocator_->EncodeIndirectRenderCommand(sig, pso_graphics_.ptr(), MaxCommandCount);
+     cmd->max_count_buffer = CountBufferAddress;
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 25ea393..0a8d268 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -30,6 +30,7 @@
+ #include <unordered_map>
+ #include "WindowsVRD3D12CommandQueueExt.h"
+ #include "WindowsVRWMTBridge.h"
++#include "WindowsVRGuestFoveation.h"
+ #include "d3d10_1.h"
+ #include "d3d11_4.h"
+ 
+@@ -524,9 +525,130 @@ public:
+             render_pass_info.render_target_width = data->render_target_width;
+             render_pass_info.render_target_height = data->render_target_height;
+           }
+-          auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
++          auto &color = render_pass_info.colors[0];
++          WVRGuestFoveationPassV1 foveation{};
++          foveation.abiVersion = WVR_GUEST_FOVEATION_ABI;
++          foveation.structSize = sizeof(foveation);
++          foveation.status = -1;
++          foveation.operation = 1;
++          // Depth-only passes (no colour target) are eligible with a stored depth attachment.
++          const bool depthOnlyPass = !color.texture && !data->render_target_count && render_pass_info.depth.texture;
++          bool eligible = data->foveation_safe && data->foveation_draw_calls && !data->use_visibility_result &&
++              !data->use_geometry && !data->use_tessellation && data->render_target_count <= 8 &&
++              render_pass_info.default_raster_sample_count == 1 &&
++              (render_pass_info.render_target_array_length == 1 ||
++               (render_pass_info.render_target_array_length == 2 && color.texture &&
++                data->render_target_count == 1 && !render_pass_info.stencil.texture)) &&
++              (color.texture
++                   ? data->render_target_count >= 1 && color.store_action == WMTStoreActionStore &&
++                         !color.resolve_texture && !color.level && !color.depth_plane
++                   : depthOnlyPass && render_pass_info.depth.store_action == WMTStoreActionStore) &&
++              !render_pass_info.depth.level && !render_pass_info.depth.depth_plane &&
++              !render_pass_info.stencil.level && !render_pass_info.stencil.depth_plane;
++          for (unsigned i = 1; i < data->render_target_count; ++i) {
++            const auto &attachment = render_pass_info.colors[i];
++            eligible &= !attachment.resolve_texture && !attachment.level && !attachment.depth_plane;
++          }
++          // A failed early probe must not disable the bridge for the process lifetime.
++          // Retry boundedly until the host companion becomes ready.
++          static thread_local bool foveationPeer = false;
++          static thread_local uint64_t uniformFoveationBuffer = 0;
++          static thread_local uint32_t capabilityRetry = 0;
++          if (!foveationPeer && capabilityRetry++ % 256 == 0) {
++            WVRGuestFoveationPassV1 caps{};
++            caps.abiVersion = WVR_GUEST_FOVEATION_ABI;
++            caps.structSize = sizeof(caps);
++            caps.status = -1;
++            WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&caps));
++            foveationPeer = caps.status == 0;
++            uniformFoveationBuffer = foveationPeer ? caps.encoder : 0;
++          }
++          static thread_local uint64_t passes = 0, safePasses = 0, eligiblePasses = 0;
++          ++passes;
++          safePasses += data->foveation_safe;
++          eligiblePasses += eligible;
++          if (passes == 1 || (passes >= 1024 && (passes & (passes - 1)) == 0))
++            WARN("wvr-foveation d3d12 passes=", passes, " safe=", safePasses, " eligible=", eligiblePasses,
++                 " peer=", foveationPeer, " draws=", data->foveation_draw_calls,
++                 " array=", render_pass_info.render_target_array_length,
++                 " colors=", unsigned(data->render_target_count));
++          if (eligible && foveationPeer && render_pass_info.render_target_width >= 256 &&
++              render_pass_info.render_target_height >= 256) {
++            foveation.colorCount = data->render_target_count;
++            for (unsigned i = 1; i < data->render_target_count; ++i) {
++              const auto &attachment = render_pass_info.colors[i];
++              auto &out = foveation.additionalColors[i - 1];
++              out.texture = attachment.texture;
++              out.slice = attachment.slice;
++              out.load = attachment.load_action;
++              out.clearColor[0] = attachment.clear_color.r;
++              out.clearColor[1] = attachment.clear_color.g;
++              out.clearColor[2] = attachment.clear_color.b;
++              out.clearColor[3] = attachment.clear_color.a;
++            }
++            foveation.flags = WVR_GUEST_FOVEATION_SAFE_SHADER;
++            foveation.commandBuffer = cmdbuf.handle;
++            foveation.colorTexture = color.texture;
++            foveation.depthTexture = render_pass_info.depth.texture;
++            foveation.stencilTexture = render_pass_info.stencil.texture;
++            foveation.stencilSlice = render_pass_info.stencil.slice;
++            foveation.stencilLoad = render_pass_info.stencil.load_action;
++            foveation.stencilClear = render_pass_info.stencil.clear_stencil;
++            foveation.depthStencilReadOnlyMask = data->dsv_readonly_flags;
++            foveation.drawCalls = data->foveation_draw_calls;
++            foveation.arrayLength = render_pass_info.render_target_array_length;
++            foveation.colorSlice = color.slice;
++            foveation.depthSlice = render_pass_info.depth.slice;
++            foveation.width = render_pass_info.render_target_width;
++            foveation.height = render_pass_info.render_target_height;
++            foveation.colorLoad = color.load_action;
++            foveation.depthLoad = render_pass_info.depth.load_action;
++            foveation.clearColor[0] = color.clear_color.r;
++            foveation.clearColor[1] = color.clear_color.g;
++            foveation.clearColor[2] = color.clear_color.b;
++            foveation.clearColor[3] = color.clear_color.a;
++            foveation.clearDepth = render_pass_info.depth.clear_depth;
++            WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&foveation));
++          }
++          WMT::RenderCommandEncoder encoder{};
++          if (foveation.status == 0 && foveation.encoder)
++            encoder.handle = foveation.encoder;
++          else
++            encoder = cmdbuf.renderCommandEncoder(render_pass_info);
++          // Legacy companions need operation 3. New companions expose their process-lifetime identity buffer
++          // during capability negotiation. Small or unsafe uniform passes still need it for transformed SV_Position.
++          const bool uniformPass = foveationPeer && foveation.status != 0;
++          if (uniformPass && !uniformFoveationBuffer) {
++            WVRGuestFoveationPassV1 uniform{};
++            uniform.abiVersion = WVR_GUEST_FOVEATION_ABI;
++            uniform.structSize = sizeof(uniform);
++            uniform.operation = 3;
++            uniform.encoder = encoder.handle;
++            WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&uniform));
++          }
+           encoder.waitForFence(fence_, WMTRenderStageVertex);
++          if (foveation.status == 0 && foveation.encoder) {
++            foveation.operation = 4;
++            WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&foveation));
++            encoder.handle = foveation.encoder;
++          }
++          if (uniformPass && uniformFoveationBuffer) {
++            wmtcmd_render_setbuffer identity{};
++            identity.type = WMTRenderCommandSetFragmentBuffer;
++            identity.buffer = uniformFoveationBuffer;
++            identity.offset = 0;
++            identity.index = 28;
++            identity.next.set(nullptr);
++            encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&identity));
++          }
+           encoder.encodeCommands(&data->cmd_head);
++          if (foveation.status == 0 && foveation.encoder) {
++            encoder.endEncoding();
++            foveation.operation = 2;
++            foveation.status = -1;
++            WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&foveation));
++            encoder.handle = foveation.encoder;
++          }
+           encoder.updateFence(fence_, WMTRenderStageFragment);
+           encoder.endEncoding();
+           break;
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index bbe91ed..756a92b 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -146,6 +146,8 @@ public:
+   float scole_scale;
+   float depth_bias_clamp;
+   uint32_t forced_sample_count;
++  // pixel/vertex stages that the system foveation rate map may shade, see ComputeFoveationSafe
++  bool foveation_safe = false;
+ 
+   virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
+ 
+diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
+index 12664d5..b6c951a 100644
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -464,6 +464,32 @@ public:
+     forced_sample_count = pDesc->RasterizerState.ForcedSampleCount;
+   }
+ 
++  // Mirrors the D3D11 foveation rule: the pixel shader may only read SV_Position as a system value, neither
++  // stage may write UAVs, and hull, domain, geometry and stream output stages are never foveated.
++  bool
++  ComputeFoveationSafe(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
++    if (!pDesc->VS.pShaderBytecode || !pDesc->PS.pShaderBytecode)
++      return false;
++    if (pDesc->HS.pShaderBytecode || pDesc->DS.pShaderBytecode || pDesc->GS.pShaderBytecode ||
++        pDesc->StreamOutput.NumEntries)
++      return false;
++    if (ref_vs.UAVSlotMask || ref_ps.UAVSlotMask || ref_ps.PixelShader.HasCoverageOutput)
++      return false;
++    microsoft::CSignatureParser input;
++    if (FAILED(microsoft::DXBCGetInputSignature(pDesc->PS.pShaderBytecode, &input)))
++      return false;
++    const microsoft::D3D11_SIGNATURE_PARAMETER *parameters = nullptr;
++    const auto count = input.GetParameters(&parameters);
++    for (unsigned i = 0; i < count; ++i) {
++      // The companion AIR writer remaps SV_Position with the system map.
++      // Other built-ins remain uniform until their semantics are supported.
++      if (parameters[i].SystemValue != microsoft::D3D10_SB_NAME_UNDEFINED &&
++          parameters[i].SystemValue != microsoft::D3D10_SB_NAME_POSITION)
++        return false;
++    }
++    return true;
++  }
++
+   virtual HRESULT
+   Initialize(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
+     if (pDesc->StreamOutput.NumEntries) {
+@@ -614,6 +640,8 @@ public:
+       }
+     }
+ 
++    foveation_safe = ComputeFoveationSafe(pDesc);
++
+     // DSSO
+     InitializeDSSO(pDesc);
+ 

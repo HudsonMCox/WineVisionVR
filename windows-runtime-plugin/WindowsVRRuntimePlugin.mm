@@ -34,6 +34,7 @@
 // DXMT archive. A resource marker cannot turn a baseline archive into D3D12.
 extern "C" size_t wvr_dxmt_d3d12_unix_call_count_v1(void) __attribute__((weak_import));
 extern "C" uint32_t wvr_dxmt_d3d12_transport_abi_v1(void) __attribute__((weak_import));
+extern "C" void winios_post_key(int virtualKey, int down);
 
 extern "C" __attribute__((visibility("default")))
 const uint32_t windows_vr_runtime_abi_version = WINDOWS_VR_RUNTIME_ABI_VERSION;
@@ -55,17 +56,25 @@ struct LaunchRequest {
     std::string gameID;
     std::string backend;
     std::string graphics;
+    std::string presentation = "immersiveVR";
+    std::string guestArchitecture;
     std::string gameDirectory;
     std::string executablePath;
     std::vector<std::string> arguments;
     std::vector<std::pair<std::string, std::string>> environment;
 };
 
+bool PresentationIsReady(const LaunchRequest &request, const WVRCompositorReadinessV1 &readiness) {
+    return readiness.metalDeviceBound &&
+        (request.presentation == "desktop" || readiness.stereoTargetsPublished);
+}
+
 std::mutex g_mutex;
 std::atomic<RuntimeState> g_state{RuntimeState::idle};
 std::atomic<bool> g_launchConsumed{false};
 std::atomic<bool> g_stopRequested{false};
 std::string g_lastError;
+bool g_desktopSession = false; // accessed under g_mutex
 // The Wine bridge uses the process environment. Restore host values on every
 // startup failure and natural exit rather than deleting inherited settings.
 std::map<std::string, std::optional<std::string>> g_originalEnvironment;
@@ -260,6 +269,26 @@ bool IsAllowedEnvironmentKey(const std::string &key) {
            !starts("MADEIRA_");
 }
 
+// OpenComposite writes applist.json and apps-config.json beside its client DLL.
+// The signed bundle cannot host those writes; each launch gets a private copy.
+bool CopyGuestOpenComposite(NSString *source, NSString *destination, std::string &error) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *fsError = nil;
+    if (![fm copyItemAtPath:source toPath:destination error:&fsError]) {
+        error = fsError.localizedDescription.UTF8String ?: "Could not copy the guest OpenComposite runtime.";
+        return false;
+    }
+    // Packaging may leave resource folders read-only. Keep the DLL bytes intact
+    // while making the private settings directories writable by their owner.
+    for (NSString *directory in @[destination, [destination stringByAppendingPathComponent:@"bin"]]) {
+        if (![fm setAttributes:@{NSFilePosixPermissions: @0700} ofItemAtPath:directory error:&fsError]) {
+            error = fsError.localizedDescription.UTF8String ?: "Could not prepare writable OpenComposite settings.";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool SHA256File(const char *path, std::string &hex) {
     FILE *file = std::fopen(path, "rb");
     if (!file) return false;
@@ -357,21 +386,46 @@ bool ValidateGuestPackage(std::string &architecture, std::string &error) {
     return true;
 }
 
+bool ValidateX86GuestPackage(std::string &error) {
+    NSURL *resources = [NSBundle mainBundle].resourceURL;
+    NSString *root = [resources URLByAppendingPathComponent:@"WindowsVR/Guest/x86"].path;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *relative in @[@"OpenComposite/bin/vrclient.dll", @"wvr_openxr.dll"]) {
+        NSString *path = [root stringByAppendingPathComponent:relative];
+        NSDictionary *info = [fm attributesOfItemAtPath:path error:nil];
+        uint16_t machine = 0;
+        if (![info[NSFileType] isEqualToString:NSFileTypeRegular] ||
+            !IsContainedPath(path.fileSystemRepresentation, root.fileSystemRepresentation) ||
+            !ReadPEMachine(path.fileSystemRepresentation, machine) || machine != 0x014c) {
+            error = "Required x86 VR runtime is absent, unsafe or has the wrong architecture: " + std::string(relative.UTF8String);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool InstallGuestOpenXRRuntime(uint16_t machine, bool gameARM64EC, NSString *driveC, std::string &runtimeABI,
                                LaunchScope &scope, std::string &error) {
-    // Wine ARM64EC supports native hybrid DLLs in an x64 guest process,
-    // as already used by the D3D11/DXGI stack. The game still uses FEX.
-    if (!(machine == 0x8664 || machine == 0xA641)) {
-        error = "No OpenVR/OpenXR package is available for this game architecture."; return false;
-    }
-    if (!ValidateGuestPackage(runtimeABI, error)) return false;
-    if (gameARM64EC && runtimeABI != "arm64ec") {
-        error = "An ARM64EC game requires the ARM64EC runtime package."; return false;
+    // Explicit 32-bit Steam children keep their isolated legacy VR package.
+    // A translated x64 game can use the native ARM64EC pair when packaged.
+    if (machine == 0x014c && !gameARM64EC) {
+        runtimeABI = "x86";
+        if (!ValidateX86GuestPackage(error)) return false;
+    } else {
+        if (!(machine == 0x8664 || machine == 0xA641)) {
+            error = "No OpenVR/OpenXR package is available for this game architecture.";
+            return false;
+        }
+        if (!ValidateGuestPackage(runtimeABI, error)) return false;
+        if (gameARM64EC && runtimeABI != "arm64ec") {
+            error = "An ARM64EC game requires the ARM64EC runtime package.";
+            return false;
+        }
     }
     NSString *guestRoot = [[[NSBundle mainBundle] resourceURL] URLByAppendingPathComponent:
         [NSString stringWithFormat:@"WindowsVR/Guest/%s", runtimeABI.c_str()]].path;
     NSString *openComposite = [guestRoot stringByAppendingPathComponent:@"OpenComposite"];
-    NSString *clientDLL = [openComposite stringByAppendingPathComponent:@"bin/vrclient_x64.dll"];
+    NSString *clientDLL = [openComposite stringByAppendingPathComponent:runtimeABI == "x86" ? @"bin/vrclient.dll" : @"bin/vrclient_x64.dll"];
     NSString *runtimeDLL = [guestRoot stringByAppendingPathComponent:@"wvr_openxr.dll"];
     NSFileManager *fm = [NSFileManager defaultManager];
     NSDictionary *clientInfo = [fm attributesOfItemAtPath:clientDLL error:nil];
@@ -407,8 +461,11 @@ bool InstallGuestOpenXRRuntime(uint16_t machine, bool gameARM64EC, NSString *dri
         error = "The private guest OpenXR runtime destination already exists; refusing to replace it.";
         return false;
     }
-    if (![fm createSymbolicLinkAtPath:guestOpenComposite withDestinationPath:openComposite error:&fsError] ||
-        ![fm createSymbolicLinkAtPath:guestRuntimeDLL withDestinationPath:runtimeDLL error:&fsError]) {
+    if (!CopyGuestOpenComposite(openComposite, guestOpenComposite, error)) {
+        [fm removeItemAtPath:guestRuntime error:nil];
+        return false;
+    }
+    if (![fm createSymbolicLinkAtPath:guestRuntimeDLL withDestinationPath:runtimeDLL error:&fsError]) {
         [fm removeItemAtPath:guestRuntime error:nil];
         error = fsError.localizedDescription.UTF8String ?: "Could not map the app-bundled guest OpenXR runtime into the Wine prefix.";
         return false;
@@ -462,6 +519,20 @@ bool ParseRequest(const char *json, LaunchRequest &request, std::string &error) 
         return false;
     }
     NSDictionary *dict = object;
+    if (dict[@"presentation"] && !ReadString(dict, @"presentation", request.presentation)) {
+        error = "Presentation must be immersiveVR or desktop.";
+        return false;
+    }
+    if (request.presentation != "immersiveVR" && request.presentation != "desktop") {
+        error = "Unsupported presentation mode.";
+        return false;
+    }
+    if (!ReadString(dict, @"guestArchitecture", request.guestArchitecture, false) ||
+        (!request.guestArchitecture.empty() && request.guestArchitecture != "x86" &&
+         request.guestArchitecture != "x64" && request.guestArchitecture != "arm64ec")) {
+        error = "Unsupported guest runtime architecture.";
+        return false;
+    }
     NSNumber *schema = dict[@"schemaVersion"];
     if (![schema isKindOfClass:[NSNumber class]] || CFGetTypeID((__bridge CFTypeRef)schema) == CFBooleanGetTypeID() || schema.doubleValue != 1.0 ||
         !ReadString(dict, @"backend", request.backend) ||
@@ -527,7 +598,7 @@ bool ParseRequest(const char *json, LaunchRequest &request, std::string &error) 
 
 bool IsModernDXMTNativeProfile() {
     return wvr_dxmt_d3d12_unix_call_count_v1 && wvr_dxmt_d3d12_transport_abi_v1 &&
-           wvr_dxmt_d3d12_unix_call_count_v1() == 148 && wvr_dxmt_d3d12_transport_abi_v1() == 1;
+           wvr_dxmt_d3d12_unix_call_count_v1() == 149 && wvr_dxmt_d3d12_transport_abi_v1() == 1;
 }
 
 bool ValidateD3D12Package() {
@@ -593,6 +664,46 @@ bool HasD3D12Package() {
     return available;
 }
 
+uint16_t RuntimeGuestMachine(const LaunchRequest &request, uint16_t executableMachine) {
+    if (request.guestArchitecture == "x86") return 0x014c;
+    if (request.guestArchitecture == "x64") return 0x8664;
+    if (request.guestArchitecture == "arm64ec") return 0xA641;
+    return executableMachine;
+}
+
+
+bool SupportsPersistentFEXCache(const LaunchRequest &request, uint16_t executableMachine) {
+    return request.backend == "windowsWineFEX" && RuntimeGuestMachine(request, executableMachine) != 0x014c;
+}
+
+bool HasX86WineResources(std::string &error) {
+    NSURL *resources = [NSBundle mainBundle].resourceURL;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *name in @[@"ntdll.dll", @"kernel32.dll", @"kernelbase.dll", @"user32.dll", @"d3d11.dll", @"dxgi.dll", @"winemetal.dll"]) {
+        NSString *path = [[resources URLByAppendingPathComponent:@"Runtime/i386-windows"] URLByAppendingPathComponent:name].path;
+        NSDictionary *info = [fm attributesOfItemAtPath:path error:nil];
+        uint16_t machine = 0;
+        if (![info[NSFileType] isEqualToString:NSFileTypeRegular] || ![info[NSFileSize] unsignedLongLongValue] ||
+            !IsContainedPath(path.fileSystemRepresentation ?: "", resources.path.fileSystemRepresentation ?: "") ||
+            !ReadPEMachine(path.fileSystemRepresentation ?: "", machine) || machine != 0x014c) {
+            error = "This game needs the experimental 32-bit Windows runtime; its matching DLL package is missing or invalid.";
+            return false;
+        }
+    }
+    for (NSString *name in @[@"wow64.dll", @"wow64win.dll", @"xtajit.dll"]) {
+        NSString *path = [[resources URLByAppendingPathComponent:@"Runtime/aarch64-windows"] URLByAppendingPathComponent:name].path;
+        NSDictionary *info = [fm attributesOfItemAtPath:path error:nil];
+        uint16_t machine = 0;
+        if (![info[NSFileType] isEqualToString:NSFileTypeRegular] || ![info[NSFileSize] unsignedLongLongValue] ||
+            !IsContainedPath(path.fileSystemRepresentation ?: "", resources.path.fileSystemRepresentation ?: "") ||
+            !ReadPEMachine(path.fileSystemRepresentation ?: "", machine) || machine != 0xAA64) {
+            error = "The native WoW64 CPU/runtime backend is missing or invalid.";
+            return false;
+        }
+    }
+    return true;
+}
+
 int32_t PreflightRequest(LaunchRequest &request, std::string &error) {
     if ((wvr_dxmt_d3d12_unix_call_count_v1 || wvr_dxmt_d3d12_transport_abi_v1) && !IsModernDXMTNativeProfile()) {
         error = "The linked modern DXMT native archive has an incompatible dispatch table or transport ABI.";
@@ -631,9 +742,22 @@ int32_t PreflightRequest(LaunchRequest &request, std::string &error) {
         return EINVAL;
     }
     uint16_t machine = 0;
-    if (!IsX64PE(request.executablePath) || !ReadPEMachine(request.executablePath, machine)) {
-        error = "The first Windows VR runtime requires a readable x64 (AMD64) PE executable.";
+    if (!ReadPEMachine(request.executablePath, machine) ||
+        (machine != 0x014c && !IsX64PE(request.executablePath))) {
+        error = "The Windows runtime requires a readable x64 or experimental x86 PE executable.";
         return ENOTSUP;
+    }
+    const uint16_t runtimeMachine = RuntimeGuestMachine(request, machine);
+    if (machine == 0x014c && runtimeMachine != 0x014c) {
+        error = "A 32-bit executable requires the matching 32-bit guest runtime; a 64-bit override cannot bypass that requirement.";
+        return ENOTSUP;
+    }
+    if (runtimeMachine == 0x014c) {
+        if (request.graphics != "direct3D11" || IsModernDXMTNativeProfile()) {
+            error = "The experimental 32-bit runtime requires its matching legacy D3D11 graphics profile.";
+            return ENOTSUP;
+        }
+        if (!HasX86WineResources(error)) return ENOENT;
     }
     NSURL *resources = [NSBundle mainBundle].resourceURL;
     for (NSString *path in @[@"Runtime/prefix-template.tar.gz",
@@ -658,8 +782,21 @@ int32_t PreflightRequest(LaunchRequest &request, std::string &error) {
             return ENOENT;
         }
     }
-    std::string guestArchitecture;
-    if (!ValidateGuestPackage(guestArchitecture, error) || !ValidateFEXCachePackage(error)) return ENOENT;
+    if (request.presentation == "immersiveVR") {
+        if (runtimeMachine == 0x014c) {
+            if (!ValidateX86GuestPackage(error)) return ENOENT;
+        } else {
+            std::string guestArchitecture;
+            if (!ValidateGuestPackage(guestArchitecture, error)) return ENOENT;
+            if (runtimeMachine == 0xA641 && guestArchitecture != "arm64ec") {
+                error = "An ARM64EC game requires the ARM64EC runtime package.";
+                return ENOENT;
+            }
+        }
+    }
+    // The format-3 compiler package is for the 64-bit translator. Requiring it
+    // for an experimental i386 child would regress the legacy runtime.
+    if (SupportsPersistentFEXCache(request, machine) && !ValidateFEXCachePackage(error)) return ENOENT;
     return 0;
 }
 
@@ -698,6 +835,7 @@ int32_t RunRequest(LaunchRequest request) {
         return -1;
     }
     const bool nativeARM64 = request.backend == "nativeARM64";
+    const bool cacheSupported = SupportsPersistentFEXCache(request, machine);
     if (request.backend != "nativeARM64" && request.backend != "windowsWineFEX") {
         SetError("Requested backend is not supported by the Madeira adapter.");
         return -1;
@@ -757,13 +895,18 @@ int32_t RunRequest(LaunchRequest request) {
     compositorReadiness.abiVersion = WVR_COMPOSITOR_ABI_VERSION;
     compositorReadiness.structSize = sizeof(compositorReadiness);
     if (wvr_compositor_copy_readiness_v1(&compositorReadiness) != WVRCompositorStatusOK ||
-        !compositorReadiness.metalDeviceBound || !compositorReadiness.stereoTargetsPublished) {
-        SetError("The immersive compositor must publish its Metal device and stereo targets before Wine starts.");
+        !PresentationIsReady(request, compositorReadiness)) {
+        SetError(request.presentation == "desktop"
+            ? "The desktop surface must bind its Metal device before Wine starts."
+            : "The immersive compositor must publish its Metal device and stereo targets before Wine starts.");
         return -1;
     }
     std::string runtimeABI;
     std::string runtimeError;
-    if (!InstallGuestOpenXRRuntime(machine, gameARM64EC, driveC, runtimeABI, scope, runtimeError)) {
+    if (request.presentation == "immersiveVR" &&
+        !InstallGuestOpenXRRuntime(RuntimeGuestMachine(request, machine),
+                                   request.guestArchitecture.empty() ? gameARM64EC : request.guestArchitecture == "arm64ec",
+                                   driveC, runtimeABI, scope, runtimeError)) {
         SetError(runtimeError);
         return -1;
     }
@@ -849,59 +992,64 @@ int32_t RunRequest(LaunchRequest request) {
         std::snprintf(address, sizeof(address), "0x%llx", static_cast<unsigned long long>(jitRW - jitRX));
         SetLaunchEnvironment("MADEIRA_JIT_WRITE_OFFSET", address);
 
-        if (!getenv("FEX_MULTIBLOCK")) SetLaunchEnvironment("FEX_MULTIBLOCK", "1");
-        if (!getenv("FEX_MAXINST")) SetLaunchEnvironment("FEX_MAXINST", "512");
-        if (!getenv("FEX_ENABLECODECACHINGWIP")) SetLaunchEnvironment("FEX_ENABLECODECACHINGWIP", "1");
-        // Windows caches are finalized eagerly before publishing executable pointers.
-        SetLaunchEnvironment("FEX_ENABLELAZYCODECACHINGWIP", "0");
-        if (!getenv("FEX_ENABLECODECACHEVALIDATION")) SetLaunchEnvironment("FEX_ENABLECODECACHEVALIDATION", "0");
-        if (!getenv("FEX_SILENTLOG")) SetLaunchEnvironment("FEX_SILENTLOG", "1");
-        std::string cachePackageError;
-        if (!ValidateFEXCachePackage(cachePackageError)) { CleanupLaunch(mountPathUTF8, true); SetError(cachePackageError); return -1; }
-        NSString *cacheTools = [[NSBundle mainBundle].resourceURL.path stringByAppendingPathComponent:@"WindowsVR/CacheTools"];
-        NSString *translator = [[NSBundle mainBundle].resourceURL.path stringByAppendingPathComponent:@"Runtime/arm64ec-windows/xtajit64.dll"];
-        // A binary/host namespace plus resolved per-executable FEX configuration
-        // IDs prevents reuse across toolchain, hardware and codegen changes.
-        NSMutableData *identity = [NSMutableData data];
-        for (NSString *path in @[translator, [cacheTools stringByAppendingPathComponent:@"FEXOfflineCompiler64.exe"]]) {
-            NSData *bytes = [NSData dataWithContentsOfFile:path];
-            if (!bytes.length) { CleanupLaunch(mountPathUTF8, true); SetError("The FEX cache runtime/compiler package is missing."); return -1; }
-            [identity appendData:bytes];
-        }
-        [identity appendData:[NSProcessInfo.processInfo.operatingSystemVersionString dataUsingEncoding:NSUTF8StringEncoding]];
-        char model[256] = {}; size_t modelSize = sizeof(model);
-        if (sysctlbyname("hw.model", model, &modelSize, nullptr, 0) == 0) [identity appendBytes:model length:strnlen(model, sizeof(model))];
-        uint8_t digest[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(identity.bytes, (CC_LONG)identity.length, digest);
-        NSMutableString *cacheKey = [NSMutableString string];
-        for (uint8_t byte : digest) [cacheKey appendFormat:@"%02x", byte];
-        NSString *cachesDir = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
-        NSString *fexPersistentCache = [[cachesDir stringByAppendingPathComponent:@"FEXCache"] stringByAppendingPathComponent:cacheKey];
-        NSError *cacheError = nil;
-        if (![fileManager createDirectoryAtPath:fexPersistentCache withIntermediateDirectories:YES attributes:nil error:&cacheError]) {
-            CleanupLaunch(mountPathUTF8, true); SetError(cacheError.localizedDescription.UTF8String); return -1;
-        }
-        // Refresh only our symlink: container UUIDs may change after reinstall.
-        NSString *fexGuestCache = [driveC stringByAppendingPathComponent:@"FEXCache"];
-        NSString *previousTarget = [fileManager destinationOfSymbolicLinkAtPath:fexGuestCache error:nil];
-        if (!previousTarget && [fileManager fileExistsAtPath:fexGuestCache]) {
-            NSString *legacy = [[cachesDir stringByAppendingPathComponent:@"FEXCache"] stringByAppendingPathComponent:[@"legacy-" stringByAppendingString:NSUUID.UUID.UUIDString]];
-            if (![fileManager moveItemAtPath:fexGuestCache toPath:legacy error:&cacheError]) {
-                CleanupLaunch(mountPathUTF8, true); SetError("Cannot migrate the previous FEX cache directory."); return -1;
+        if (cacheSupported) {
+            if (!getenv("FEX_MULTIBLOCK")) SetLaunchEnvironment("FEX_MULTIBLOCK", "1");
+            if (!getenv("FEX_MAXINST")) SetLaunchEnvironment("FEX_MAXINST", "512");
+            if (!getenv("FEX_ENABLECODECACHINGWIP")) SetLaunchEnvironment("FEX_ENABLECODECACHINGWIP", "1");
+            // Windows caches are finalized eagerly before publishing executable pointers.
+            SetLaunchEnvironment("FEX_ENABLELAZYCODECACHINGWIP", "0");
+            if (!getenv("FEX_ENABLECODECACHEVALIDATION")) SetLaunchEnvironment("FEX_ENABLECODECACHEVALIDATION", "0");
+            if (!getenv("FEX_SILENTLOG")) SetLaunchEnvironment("FEX_SILENTLOG", "1");
+            std::string cachePackageError;
+            if (!ValidateFEXCachePackage(cachePackageError)) { CleanupLaunch(mountPathUTF8, true); SetError(cachePackageError); return -1; }
+            NSString *cacheTools = [[NSBundle mainBundle].resourceURL.path stringByAppendingPathComponent:@"WindowsVR/CacheTools"];
+            NSString *translator = [[NSBundle mainBundle].resourceURL.path stringByAppendingPathComponent:@"Runtime/arm64ec-windows/xtajit64.dll"];
+            // A binary/host namespace plus resolved per-executable FEX configuration
+            // IDs prevents reuse across toolchain, hardware and codegen changes.
+            NSMutableData *identity = [NSMutableData data];
+            for (NSString *path in @[translator, [cacheTools stringByAppendingPathComponent:@"FEXOfflineCompiler64.exe"]]) {
+                NSData *bytes = [NSData dataWithContentsOfFile:path];
+                if (!bytes.length) { CleanupLaunch(mountPathUTF8, true); SetError("The FEX cache runtime/compiler package is missing."); return -1; }
+                [identity appendData:bytes];
             }
-        }
-        if (previousTarget && ![previousTarget isEqualToString:fexPersistentCache]) [fileManager removeItemAtPath:fexGuestCache error:nil];
-        if (![[fileManager destinationOfSymbolicLinkAtPath:fexGuestCache error:nil] isEqualToString:fexPersistentCache] &&
-            ![fileManager createSymbolicLinkAtPath:fexGuestCache withDestinationPath:fexPersistentCache error:&cacheError]) {
-            CleanupLaunch(mountPathUTF8, true); SetError("Cannot create the persistent FEX cache mapping; an existing C:\\FEXCache directory may need migration."); return -1;
-        }
-        SetLaunchEnvironment("FEX_APP_CACHE_LOCATION", "C:\\FEXCache\\");
-        if (strcmp(getenv("FEX_ENABLECODECACHINGWIP"), "0") != 0) {
-            NSString *toolMount = [driveC stringByAppendingPathComponent:@"wvr-cache-tools"];
-            NSString *oldToolMount = [fileManager destinationOfSymbolicLinkAtPath:toolMount error:nil];
-            if (oldToolMount) [fileManager removeItemAtPath:toolMount error:nil];
-            if (![fileManager createSymbolicLinkAtPath:toolMount withDestinationPath:cacheTools error:&cacheError]) {
-                CleanupLaunch(mountPathUTF8, true); SetError("Cannot map the FEX cache helper package."); return -1;
+            [identity appendData:[NSProcessInfo.processInfo.operatingSystemVersionString dataUsingEncoding:NSUTF8StringEncoding]];
+            char model[256] = {}; size_t modelSize = sizeof(model);
+            if (sysctlbyname("hw.model", model, &modelSize, nullptr, 0) == 0) [identity appendBytes:model length:strnlen(model, sizeof(model))];
+            uint8_t digest[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(identity.bytes, (CC_LONG)identity.length, digest);
+            NSMutableString *cacheKey = [NSMutableString string];
+            for (uint8_t byte : digest) [cacheKey appendFormat:@"%02x", byte];
+            NSString *cachesDir = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+            NSString *fexPersistentCache = [[cachesDir stringByAppendingPathComponent:@"FEXCache"] stringByAppendingPathComponent:cacheKey];
+            NSError *cacheError = nil;
+            if (![fileManager createDirectoryAtPath:fexPersistentCache withIntermediateDirectories:YES attributes:nil error:&cacheError]) {
+                CleanupLaunch(mountPathUTF8, true); SetError(cacheError.localizedDescription.UTF8String); return -1;
             }
+            // Refresh only our symlink: container UUIDs may change after reinstall.
+            NSString *fexGuestCache = [driveC stringByAppendingPathComponent:@"FEXCache"];
+            NSString *previousTarget = [fileManager destinationOfSymbolicLinkAtPath:fexGuestCache error:nil];
+            if (!previousTarget && [fileManager fileExistsAtPath:fexGuestCache]) {
+                NSString *legacy = [[cachesDir stringByAppendingPathComponent:@"FEXCache"] stringByAppendingPathComponent:[@"legacy-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+                if (![fileManager moveItemAtPath:fexGuestCache toPath:legacy error:&cacheError]) {
+                    CleanupLaunch(mountPathUTF8, true); SetError("Cannot migrate the previous FEX cache directory."); return -1;
+                }
+            }
+            if (previousTarget && ![previousTarget isEqualToString:fexPersistentCache]) [fileManager removeItemAtPath:fexGuestCache error:nil];
+            if (![[fileManager destinationOfSymbolicLinkAtPath:fexGuestCache error:nil] isEqualToString:fexPersistentCache] &&
+                ![fileManager createSymbolicLinkAtPath:fexGuestCache withDestinationPath:fexPersistentCache error:&cacheError]) {
+                CleanupLaunch(mountPathUTF8, true); SetError("Cannot create the persistent FEX cache mapping; an existing C:\\FEXCache directory may need migration."); return -1;
+            }
+            SetLaunchEnvironment("FEX_APP_CACHE_LOCATION", "C:\\FEXCache\\");
+            if (strcmp(getenv("FEX_ENABLECODECACHINGWIP"), "0") != 0) {
+                NSString *toolMount = [driveC stringByAppendingPathComponent:@"wvr-cache-tools"];
+                NSString *oldToolMount = [fileManager destinationOfSymbolicLinkAtPath:toolMount error:nil];
+                if (oldToolMount) [fileManager removeItemAtPath:toolMount error:nil];
+                if (![fileManager createSymbolicLinkAtPath:toolMount withDestinationPath:cacheTools error:&cacheError]) {
+                    CleanupLaunch(mountPathUTF8, true); SetError("Cannot map the FEX cache helper package."); return -1;
+                }
+            }
+        } else {
+            SetLaunchEnvironment("FEX_ENABLECODECACHINGWIP", "0");
+            SetLaunchEnvironment("FEX_APP_CACHE_LOCATION", nullptr);
         }
     } else {
         SetLaunchEnvironment("WINE_IOS_JIT_RX", nullptr);
@@ -917,12 +1065,19 @@ int32_t RunRequest(LaunchRequest request) {
         SetLaunchEnvironment("FEX_APP_CACHE_LOCATION", nullptr);
     }
     SetLaunchEnvironment("MADEIRA_USE_ARM64EC", nativeARM64 ? "0" : "1");
+    SetLaunchEnvironment("MADEIRA_DESKTOP", request.presentation == "desktop" ? "1" : "0");
+    if (request.presentation == "desktop") {
+        SetLaunchEnvironment("VR_OVERRIDE", nullptr);
+        SetLaunchEnvironment("XR_RUNTIME_JSON", nullptr);
+    }
+    // Desktop and VR both bind the exact device through the bridge; only VR
+    // additionally requires stereo targets and a tracked head pose.
     SetLaunchEnvironment("WVR_REQUIRE_COMPOSITOR_DEVICE", "1");
     SetLaunchEnvironment("WVR_GRAPHICS_API", request.graphics.c_str());
     SetLaunchEnvironment("WINEDLLOVERRIDES", "d3d11,d3d12,dxgi,winemetal=b");
 
     std::vector<std::string> launchArguments = request.arguments;
-    if (!nativeARM64 && strcmp(getenv("FEX_ENABLECODECACHINGWIP"), "0") != 0) {
+    if (cacheSupported && strcmp(getenv("FEX_ENABLECODECACHINGWIP"), "0") != 0) {
         launchArguments.insert(launchArguments.begin(), winExecutable);
         launchArguments.insert(launchArguments.begin(), "C:\\wvr-cache-tools\\FEXOfflineCompiler64.exe");
         winExecutable = "C:\\wvr-cache-tools\\WindowsVRCacheLauncher.exe";
@@ -1035,6 +1190,7 @@ windows_vr_launch_v1(const char *request_json) {
         return EALREADY;
     }
     g_lastError.clear();
+    g_desktopSession = request.presentation == "desktop";
     g_stopRequested.store(false, std::memory_order_release);
     wvr_compositor_reset_session_exit_v1();
     g_state.store(RuntimeState::preparing, std::memory_order_release);
@@ -1070,9 +1226,20 @@ windows_vr_stop_v1(void) {
     if (wine_process_is_running() || state == RuntimeState::running || state == RuntimeState::launchingWine ||
         state == RuntimeState::startingWineServer || state == RuntimeState::preparing || state == RuntimeState::stopping) {
         g_stopRequested.store(true, std::memory_order_release);
-        wvr_compositor_request_session_exit_v1();
+        if (g_desktopSession && wine_process_is_running()) {
+            // Ordinary desktop applications receive a cooperative Alt-F4. They
+            // may display a save prompt, so the host keeps the screen/input live.
+            winios_post_key(0x12, 1);
+            winios_post_key(0x73, 1);
+            winios_post_key(0x73, 0);
+            winios_post_key(0x12, 0);
+        } else if (!g_desktopSession) {
+            wvr_compositor_request_session_exit_v1();
+        }
         if (wine_process_is_running()) g_state.store(RuntimeState::stopping, std::memory_order_release);
-        g_lastError = "Cooperative exit requested. Waiting for the OpenXR guest and Wine process to exit; no thread was forcibly terminated.";
+        g_lastError = g_desktopSession
+            ? "Desktop close requested. Complete any save prompt in Windows; the session stays active until Wine exits."
+            : "Cooperative exit requested. Waiting for the OpenXR guest and Wine process to exit; no thread was forcibly terminated.";
         return EINPROGRESS;
     }
     return 0;
@@ -1094,6 +1261,11 @@ windows_vr_graphics_capabilities_v1(void) {
             return IsModernDXMTNativeProfile() && HasD3D12Package() ? (WINDOWS_VR_GRAPHICS_D3D11 | WINDOWS_VR_GRAPHICS_D3D12) : 0u;
         return WINDOWS_VR_GRAPHICS_D3D11;
     }
+}
+
+extern "C" __attribute__((visibility("default"))) uint32_t
+windows_vr_presentation_capabilities_v1(void) {
+    return 3u; // immersive VR and the app-hosted Windows desktop
 }
 
 extern "C" __attribute__((visibility("default"))) uint64_t

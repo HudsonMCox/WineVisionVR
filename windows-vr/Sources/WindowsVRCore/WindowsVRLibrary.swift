@@ -42,6 +42,7 @@ public struct WindowsVRLaunchProfile: Codable, Sendable, Equatable, Identifiable
     public var launchArguments: [String]
     public var environment: [String: String]
     public var renderScale: Float
+    public var presentation: WindowsPresentationMode
 
     public init(
         id: String = UUID().uuidString,
@@ -50,7 +51,8 @@ public struct WindowsVRLaunchProfile: Codable, Sendable, Equatable, Identifiable
         graphics: WindowsGraphicsAPI,
         launchArguments: [String],
         environment: [String: String] = [:],
-        renderScale: Float = 1
+        renderScale: Float = 1,
+        presentation: WindowsPresentationMode = .immersiveVR
     ) throws {
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanName.isEmpty, cleanName.count <= 80 else {
@@ -68,11 +70,12 @@ public struct WindowsVRLaunchProfile: Codable, Sendable, Equatable, Identifiable
         self.launchArguments = launchArguments
         self.environment = environment
         self.renderScale = renderScale
+        self.presentation = presentation
         try validate()
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, backend, graphics, launchArguments, environment, renderScale
+        case id, name, backend, graphics, launchArguments, environment, renderScale, presentation
     }
 
     public init(from decoder: Decoder) throws {
@@ -84,7 +87,8 @@ public struct WindowsVRLaunchProfile: Codable, Sendable, Equatable, Identifiable
             graphics: values.decode(WindowsGraphicsAPI.self, forKey: .graphics),
             launchArguments: values.decode([String].self, forKey: .launchArguments),
             environment: values.decodeIfPresent([String: String].self, forKey: .environment) ?? [:],
-            renderScale: values.decodeIfPresent(Float.self, forKey: .renderScale) ?? 1
+            renderScale: values.decodeIfPresent(Float.self, forKey: .renderScale) ?? 1,
+            presentation: values.decodeIfPresent(WindowsPresentationMode.self, forKey: .presentation) ?? .immersiveVR
         )
     }
 
@@ -110,6 +114,8 @@ public struct WindowsVRLaunchProfile: Codable, Sendable, Equatable, Identifiable
             graphics: graphics,
             launchArguments: launchArguments,
             environment: environment,
+            presentation: presentation,
+            guestArchitecture: manifest.guestArchitecture,
             schemaVersion: manifest.schemaVersion
         )
     }

@@ -1,0 +1,13 @@
+# Modern source-built DXMT requires its matching source AIR writer.
+# assemble_runtime.sh builds this archive and exports AVPPLAY_AIR_OUTPUT.
+include:
+  - project.yml
+targets:
+  WindowsVRNativeBridge:
+    dependencies:
+      - framework: ${AVPPLAY_AIR_OUTPUT}/libWindowsVRAIRWriter.a
+        embed: false
+    settings:
+      base:
+        GCC_PREPROCESSOR_DEFINITIONS: ["$(inherited)", "WVR_SOURCE_AIR_WRITER=1"]
+        LIBRARY_SEARCH_PATHS: ["$(inherited)", "${AVPPLAY_AIR_OUTPUT}"]

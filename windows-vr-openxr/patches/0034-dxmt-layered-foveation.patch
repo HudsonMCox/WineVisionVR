@@ -1,0 +1,23 @@
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 279dc32..2a4cba5 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -1075,7 +1075,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+           !data->use_geometry && !data->use_tessellation && !data->use_emulated_so &&
+           data->render_target_count <= 8 &&
+           render_pass_info.default_raster_sample_count == 1 &&
+-          render_pass_info.render_target_array_length == 1 &&
++          (render_pass_info.render_target_array_length == 1 ||
++              (render_pass_info.render_target_array_length == 2 && color.texture &&
++               data->render_target_count == 1 && !render_pass_info.stencil.texture)) &&
+           (color.texture
+               ? data->render_target_count >= 1 && color.store_action == WMTStoreActionStore &&
+                   !color.resolve_texture && !color.level && !color.depth_plane
+@@ -1125,6 +1127,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+         foveation.stencilClear=render_pass_info.stencil.clear_stencil;
+         foveation.depthStencilReadOnlyMask=data->dsv_readonly_flags;
+         foveation.drawCalls=data->foveation_draw_calls;
++        foveation.arrayLength=render_pass_info.render_target_array_length;
+         foveation.colorSlice = color.slice; foveation.depthSlice = render_pass_info.depth.slice;
+         foveation.width = render_pass_info.render_target_width;
+         foveation.height = render_pass_info.render_target_height;

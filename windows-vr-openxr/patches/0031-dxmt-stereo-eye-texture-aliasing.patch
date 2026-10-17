@@ -1,0 +1,457 @@
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index 9f939e6..ebdce75 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -657,6 +657,10 @@ public:
+       auto *extension=static_cast<IMTLD3D11ContextExt4 *>(&ext_);
+       extension->AddRef();*ppvObject=extension;return S_OK;
+     }
++    if (riid == kWVRD3D11ContextExt5IID) {
++      auto *extension=static_cast<IMTLD3D11ContextExt5 *>(&ext_);
++      extension->AddRef();*ppvObject=extension;return S_OK;
++    }
+     if (riid == kWVRD3D11ContextExt3IID) {
+       auto *extension = static_cast<IMTLD3D11ContextExt3 *>(&ext_);
+       extension->AddRef(); *ppvObject = extension; return S_OK;
+@@ -5287,7 +5291,7 @@ public:
+ };
+ 
+ template <typename ContextInternalState>
+-class MTLD3D11ContextExt : public IMTLD3D11ContextExt1, public IMTLD3D11ContextExt2, public IMTLD3D11ContextExt3, public IMTLD3D11ContextExt4 {
++class MTLD3D11ContextExt : public IMTLD3D11ContextExt1, public IMTLD3D11ContextExt2, public IMTLD3D11ContextExt3, public IMTLD3D11ContextExt4, public IMTLD3D11ContextExt5 {
+   class CachedTemporalScaler {
+   public:
+     WMTPixelFormat color_pixel_format;
+@@ -5312,6 +5316,10 @@ public:
+       auto *extension=static_cast<IMTLD3D11ContextExt4 *>(this);
+       AddRef();*ppvObject=extension;return S_OK;
+     }
++    if (riid == kWVRD3D11ContextExt5IID) {
++      auto *extension=static_cast<IMTLD3D11ContextExt5 *>(this);
++      AddRef();*ppvObject=extension;return S_OK;
++    }
+     if (riid == kWVRD3D11ContextExt3IID) {
+       auto *p = static_cast<IMTLD3D11ContextExt3 *>(this); AddRef(); *ppvObject = p; return S_OK;
+     }
+@@ -5610,6 +5618,11 @@ public:
+     if(!frame || !frame->depth[0] || !frame->depth[1])return E_INVALIDARG;
+     return SubmitWindowsVRFrameCommon(&frame->color,frame);
+   }
++  HRESULT STDMETHODCALLTYPE SetWindowsVREyeSize(UINT width, UINT height) final {
++    if (!width || !height) return E_INVALIDARG;
++    ctx_->device->SetWindowsVREyeSize(width, height);
++    return S_OK;
++  }
+   HRESULT SubmitWindowsVRFrameCommon(const WVRDXMTSubmitFrameV2 *frame,const WVRDXMTDepthFrameV1 *depthFrame) {
+     if (!frame || !frame->left || !frame->right || !frame->targetGeneration) return E_INVALIDARG;
+     WVRDXMTTargetInfoV1 targets = cached_targets_;
+@@ -5689,7 +5702,10 @@ public:
+         reconstruction.eyes[0].depthTexture=nativeDepthLeft.handle;
+         reconstruction.eyes[1].depthTexture=nativeDepthRight.handle;
+       }
+-      enc.recordStereoEyeTargets(leftTexture->current()->texture(), rightTexture->current()->texture(), frameCopy);
++      enc.recordStereoEyeTargets(leftTexture->current()->texture(), rightTexture->current()->texture(),
++                                 leftTexture->current()->eyeParent, leftTexture->current()->eyeParentSlice,
++                                 rightTexture->current()->eyeParent, rightTexture->current()->eyeParentSlice,
++                                 frameCopy);
+       enc.queueWindowsVRSubmission(leftTexture->current()->texture(), rightTexture->current()->texture(),
+                                      frameCopy, result, reconstruction, nativeDepthLeft, nativeDepthRight);
+     }, true);
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 8ff362b..29603ae 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -23,6 +23,9 @@
+ #include "d3d11_resource.hpp"
+ #include "dxgi_object.hpp"
+ #include <memory>
++#include <atomic>
++#include <mutex>
++#include "dxmt_texture.hpp"
+ #include "d3d11_4.h"
+ #include "util_win32_compat.h"
+ 
+@@ -1030,6 +1033,43 @@ public:
+     return S_OK;
+   };
+ 
++  void SetWindowsVREyeSize(UINT width, UINT height) override {
++    // one 64-bit store so width and height are always seen together
++    eye_size_.store((uint64_t(width) << 32) | uint64_t(height));
++  }
++
++  bool ClaimEyeTextureBacking(const WMTTextureInfo &info, bool eligible,
++                              std::shared_ptr<EyeTextureBacking> *backing, uint32_t *slice) override {
++    std::lock_guard<std::mutex> lock(eye_mutex_);
++    const uint64_t size = eye_size_.load();
++    if (!eligible || !size || info.width != uint32_t(size >> 32) || info.height != uint32_t(size)) {
++      eye_pending_.reset();
++      return false;
++    }
++    if (eye_pending_) {
++      const auto &p = eye_pending_->info;
++      if (p.pixel_format == info.pixel_format && p.width == info.width && p.height == info.height &&
++          p.depth == info.depth && p.type == info.type && p.mipmap_level_count == info.mipmap_level_count &&
++          p.sample_count == info.sample_count && p.usage == info.usage) {
++        // the partner: second slice of the same backing, the pending slot is consumed
++        *backing = eye_pending_;
++        *slice = 1;
++        eye_pending_.reset();
++        return true;
++      }
++    }
++    // first of a pair: starts a new pending backing, a non-matching pending one is dropped
++    eye_pending_ = std::make_shared<EyeTextureBacking>();
++    eye_pending_->info = info;
++    *backing = eye_pending_;
++    *slice = 0;
++    return true;
++  }
++
++  std::atomic<uint64_t> eye_size_{0}; // (width << 32) | height, 0 when unset
++  std::mutex eye_mutex_;
++  std::shared_ptr<EyeTextureBacking> eye_pending_;
++
+   HRESULT
+   CreateComputePipeline(MTL_COMPUTE_PIPELINE_DESC *pDesc,
+                         MTLCompiledComputePipeline **ppPipeline) override {
+diff --git a/src/d3d11/d3d11_device.hpp b/src/d3d11/d3d11_device.hpp
+index a89de9f..8a4d16b 100644
+--- a/src/d3d11/d3d11_device.hpp
++++ b/src/d3d11/d3d11_device.hpp
+@@ -7,8 +7,11 @@
+ #include "dxgi_interfaces.h"
+ #include "dxmt_device.hpp"
+ #include "dxmt_format.hpp"
++#include <memory>
+ 
+ struct MTL_GRAPHICS_PIPELINE_DESC;
++struct WMTTextureInfo;
++struct EyeTextureBacking;
+ struct MTL_COMPUTE_PIPELINE_DESC;
+ 
+ DEFINE_COM_INTERFACE("3a3f085a-d0fe-4324-b0ae-fe04de18571c",
+@@ -44,6 +47,15 @@ public:
+   virtual HRESULT CreateStereoGraphicsPipeline(MTL_GRAPHICS_PIPELINE_DESC * pDesc,
+                                                MTLCompiledGraphicsPipeline * *ppPipeline) = 0;
+ 
++  /* WindowsVR eye size from IMTLD3D11ContextExt5; eye texture candidates stay off until it is set */
++  virtual void SetWindowsVREyeSize(UINT width, UINT height) = 0;
++
++  /* stereo eye candidates: every texture creation passes through here (eligible or not) so that a pending
++     partner is only kept for the immediately following identical creation. Returns the shared backing and
++     the slice of the texture when it is a candidate. */
++  virtual bool ClaimEyeTextureBacking(const WMTTextureInfo &info, bool eligible,
++                                      std::shared_ptr<EyeTextureBacking> *backing, uint32_t *slice) = 0;
++
+   virtual HRESULT CreateComputePipeline(MTL_COMPUTE_PIPELINE_DESC * pDesc,
+                                         MTLCompiledComputePipeline *
+                                             *ppPipeline) = 0;
+diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
+index bd78ee4..620f641 100644
+--- a/src/d3d11/d3d11_texture_device.cpp
++++ b/src/d3d11/d3d11_texture_device.cpp
+@@ -375,6 +375,18 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+       ((finalDesc.BindFlags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS)) == 0) &&
+       finalDesc.Usage == D3D11_USAGE_DEFAULT && finalDesc.CPUAccessFlags == 0 && finalDesc.MiscFlags == 0;
+ 
++  // stereo eye candidate: a default 2D target that may become one slice of a shared 2-slice parent
++  // every creation goes through the claim so that a pending partner only survives the next identical creation
++  const bool eyeEligible =
++      info.type == WMTTextureType2D && info.array_length == 1 && info.mipmap_level_count == 1 &&
++      info.sample_count == 1 && (finalDesc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)) != 0 &&
++      finalDesc.Usage == D3D11_USAGE_DEFAULT && finalDesc.CPUAccessFlags == 0 && finalDesc.MiscFlags == 0;
++  std::shared_ptr<EyeTextureBacking> eyeBacking;
++  uint32_t eyeSlice = 0;
++  const bool eyeClaimed = pDevice->ClaimEyeTextureBacking(info, eyeEligible, &eyeBacking, &eyeSlice);
++  if (eyeClaimed)
++    texture->setEyeBacking(eyeBacking, eyeSlice);
++
+   MTL_DXGI_FORMAT_DESC format_desc;
+   MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, format_desc);
+ 
+@@ -471,7 +483,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+     flags.set(TextureAllocationFlag::ShaderReadonly);
+   if (finalDesc.Usage == D3D11_USAGE_IMMUTABLE)
+     flags.set(TextureAllocationFlag::GpuReadonly);
+-  if (single_subresource && (finalDesc.BindFlags & D3D11_BIND_DEPTH_STENCIL)) {
++  if (single_subresource && (finalDesc.BindFlags & D3D11_BIND_DEPTH_STENCIL) && !eyeClaimed) {
+     Rc<RenamableTexturePool> renamable = new RenamableTexturePool(texture.ptr(), 32, flags);
+     initialize(renamable->getNext(0));
+     *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 84b5313..4509d93 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -1011,6 +1011,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+             continue;
+           auto &color_info = render_pass_info.colors[i];
+           color_info.texture = color_data.attachment.texture();
++          if (data->eye_parent_color)
++            color_info.texture = data->eye_parent_color;
+           color_info.load_action = color_data.load_action;
+           color_info.store_action = color_data.store_action;
+           if (color_data.store_action == WMTStoreActionStore && !color_data.resolve_attachment &&
+@@ -1030,6 +1032,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+           auto &depth_info = render_pass_info.depth;
+           auto &depth_data = data->depth;
+           depth_info.texture = depth_data.attachment.texture();
++          if (data->eye_parent_depth)
++            depth_info.texture = data->eye_parent_depth;
+           depth_info.load_action = depth_data.load_action;
+           depth_info.store_action = depth_data.store_action;
+           depth_info.level = depth_data.level;
+@@ -1759,10 +1763,19 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+   // the two eyes are either consecutive layers of the same eye target texture (layered), or the two
+   // disjoint halves of one slice of it (atlas); both cases need one eye target texture
+   const StereoEyeTargets &eye = r0->eye_targets;
+-  if (!eye.valid || eye.left == nullptr || eye.right == nullptr || !(eye.left == eye.right))
++  if (!eye.valid || eye.left == nullptr || eye.right == nullptr)
+     return false;
+-  const bool atlas = eye.rightSlice == eye.leftSlice;
+-  if (!atlas && eye.rightSlice != eye.leftSlice + 1)
++  // separate (case c): two single-slice eye textures that are slices 0 and 1 of one parent array, rendered
++  // as a layered pass over that parent; depth follows the same rule with its own parent
++  const bool separate = !(eye.left == eye.right);
++  WMT::Reference<WMT::Texture> depthParent;
++  if (separate) {
++    if (eye.leftParent == nullptr || !(eye.leftParent == eye.rightParent) || eye.leftParentSlice != 0 ||
++        eye.rightParentSlice != 1 || eye.leftSlice != 0 || eye.rightSlice != 0 || r0->render_target_count != 1)
++      return false;
++  }
++  const bool atlas = !separate && eye.rightSlice == eye.leftSlice;
++  if (!separate && !atlas && eye.rightSlice != eye.leftSlice + 1)
+     return false;
+   // atlas: eye1 is eye0 moved by a constant offset, the rects have equal size and do not overlap
+   int64_t dx = 0, dy = 0;
+@@ -1812,7 +1825,7 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+         return false;
+       continue;
+     }
+-    if (!(a0.attachment.texture() == eye.left) || !(a1.attachment.texture() == eye.left))
++    if (!(a0.attachment.texture() == eye.left) || !(a1.attachment.texture() == (separate ? eye.right : eye.left)))
+       return false;
+     if (a0.level || a1.level || a0.depth_plane || a1.depth_plane)
+       return false;
+@@ -1840,8 +1853,16 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+   if (static_cast<bool>(r0->depth.attachment) != static_cast<bool>(r1->depth.attachment))
+     return false;
+   if (r0->depth.attachment) {
+-    if (!(r0->depth.attachment.texture() == r1->depth.attachment.texture()))
++    if (separate) {
++      auto d0 = r0->depth.attachment->allocation;
++      auto d1 = r1->depth.attachment->allocation;
++      if (!d0 || !d1 || !d0->eyeParent || !(d0->eyeParent == d1->eyeParent) || d0->eyeParentSlice != 0 ||
++          d1->eyeParentSlice != 1 || r0->depth.slice != 0 || r1->depth.slice != 0)
++        return false;
++      depthParent = d0->eyeParent;
++    } else if (!(r0->depth.attachment.texture() == r1->depth.attachment.texture())) {
+       return false;
++    }
+     if (r0->depth.level || r1->depth.level || r0->depth.depth_plane || r1->depth.depth_plane)
+       return false;
+     if (atlas) {
+@@ -1855,7 +1876,7 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+       if (r0->depth.store_action != r1->depth.store_action)
+         return false;
+     } else {
+-      if (r0->depth.slice + 1 != r1->depth.slice)
++      if (separate ? (r0->depth.slice != 0 || r1->depth.slice != 0) : (r0->depth.slice + 1 != r1->depth.slice))
+         return false;
+       if (r0->depth.load_action != r1->depth.load_action || r0->depth.store_action != r1->depth.store_action)
+         return false;
+@@ -1937,9 +1958,8 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+     const size_t size = stereoPairCommandSize(a->type);
+     if (!size)
+       return false;
+-    // layered pairs keep one viewport per pass; atlas pairs rewrite the plural forms only
+-    if (atlas ? (a->type == WMTRenderCommandSetViewport || a->type == WMTRenderCommandSetScissorRect)
+-              : (a->type == WMTRenderCommandSetViewports || a->type == WMTRenderCommandSetScissorRects))
++    // atlas pairs rewrite the plural forms and cannot carry the single forms; layered pairs keep them as they are
++    if (atlas && (a->type == WMTRenderCommandSetViewport || a->type == WMTRenderCommandSetScissorRect))
+       return false;
+     wmtcmd_base *out = nullptr;
+     if (a->type == WMTRenderCommandSetPSO) {
+@@ -1965,6 +1985,26 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+       appendEyeOffset(SM50_BINDING_INDEX_CONSTANT_BUFFER_EYE1, eyeConstantsOffset);
+       out = cloneCommand(a, size);
+       sawDraw = true;
++    } else if (!atlas && a->type == WMTRenderCommandSetViewports) {
++      // layered: both eyes render through the same single viewport, so the entries must match and pass through
++      auto pa = (wmtcmd_render_setviewports *)a;
++      auto pb = (wmtcmd_render_setviewports *)b;
++      if (pa->viewport_count != 1 || pb->viewport_count != 1 || !pa->viewports.get() || !pb->viewports.get())
++        return false;
++      if (std::memcmp(pa->viewports.get(), pb->viewports.get(), sizeof(WMTViewport)) != 0)
++        return false;
++      out = cloneCommand(a, size);
++      sawViewport = true;
++    } else if (!atlas && a->type == WMTRenderCommandSetScissorRects) {
++      // layered: both eyes share the single scissor rect, so the entries must match and pass through
++      auto pa = (wmtcmd_render_setscissorrects *)a;
++      auto pb = (wmtcmd_render_setscissorrects *)b;
++      if (pa->rect_count != 1 || pb->rect_count != 1 || !pa->scissor_rects.get() || !pb->scissor_rects.get())
++        return false;
++      if (std::memcmp(pa->scissor_rects.get(), pb->scissor_rects.get(), sizeof(WMTScissorRect)) != 0)
++        return false;
++      out = cloneCommand(a, size);
++      sawScissor = true;
+     } else if (a->type == WMTRenderCommandSetViewports) {
+       // atlas: eye0 viewport stays in the eye0 rect, eye1 viewport is the same viewport moved by the eye offset
+       auto pa = (wmtcmd_render_setviewports *)a;
+@@ -2069,6 +2109,8 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+   if (!atlas)
+     r0->render_target_array_length = 2;
+   r0->stereo_pass = true;
++  r0->eye_parent_color = separate ? eye.leftParent : WMT::Reference<WMT::Texture>();
++  r0->eye_parent_depth = depthParent;
+   r0->foveation_draw_calls += r1->foveation_draw_calls;
+   r0->fence_update.merge(r1->fence_update);
+   r0->fence_wait.merge(r1->fence_wait);
+diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
+index 664c172..2edc942 100644
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -212,6 +212,11 @@ struct StereoEyeTargets {
+   /* eye rects inside their slices, used to pair eyes that share one slice (atlas) */
+   uint32_t leftX = 0, leftY = 0, leftWidth = 0, leftHeight = 0;
+   uint32_t rightX = 0, rightY = 0, rightWidth = 0, rightHeight = 0;
++  /* parent 2-slice arrays when the eyes are slice views (stereo eye candidates), null otherwise */
++  WMT::Reference<WMT::Texture> leftParent;
++  WMT::Reference<WMT::Texture> rightParent;
++  uint32_t leftParentSlice = 0;
++  uint32_t rightParentSlice = 0;
+   bool valid = false;
+ };
+ 
+@@ -251,6 +256,9 @@ struct RenderEncoderData : EncoderData {
+   StereoEyeTargets eye_targets;
+   /* set when this pass was rewritten to render both eyes with vertex amplification */
+   bool stereo_pass = false;
++  /* when set, the merged pass renders into these parent arrays instead of the attachment views (case c) */
++  WMT::Reference<WMT::Texture> eye_parent_color;
++  WMT::Reference<WMT::Texture> eye_parent_depth;
+ };
+ 
+ struct ComputeEncoderData : EncoderData {
+@@ -732,9 +740,15 @@ public:
+   }
+ 
+ 
+-  void recordStereoEyeTargets(WMT::Texture left, WMT::Texture right, const WMTWindowsVRRequestV2 &frame) {
++  void recordStereoEyeTargets(WMT::Texture left, WMT::Texture right, WMT::Texture leftParent, uint32_t leftParentSlice,
++                              WMT::Texture rightParent, uint32_t rightParentSlice,
++                              const WMTWindowsVRRequestV2 &frame) {
+     eye_targets_.left = left;
+     eye_targets_.right = right;
++    eye_targets_.leftParent = leftParent;
++    eye_targets_.rightParent = rightParent;
++    eye_targets_.leftParentSlice = leftParentSlice;
++    eye_targets_.rightParentSlice = rightParentSlice;
+     eye_targets_.leftSlice = frame.leftSlice;
+     eye_targets_.rightSlice = frame.rightSlice;
+     eye_targets_.leftX = frame.leftX;
+diff --git a/src/dxmt/dxmt_texture.cpp b/src/dxmt/dxmt_texture.cpp
+index 0e5b4bd..6b514d9 100644
+--- a/src/dxmt/dxmt_texture.cpp
++++ b/src/dxmt/dxmt_texture.cpp
+@@ -188,6 +188,30 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
+     options |= WMTResourceStorageModeManaged;
+   }
+   info.options = options;
++  if (eye_backing_ && !bytes_per_image_) {
++    // eye candidate: a single-slice view of the shared 2-slice parent; the first allocation creates the parent
++    WMTTextureInfo parent_info = info;
++    parent_info.type = WMTTextureType2DArray;
++    parent_info.array_length = 2;
++    WMT::Reference<WMT::Texture> parent;
++    {
++      std::lock_guard<std::mutex> lock(eye_backing_->mutex);
++      if (!eye_backing_->parent)
++        eye_backing_->parent = device_.newTexture(parent_info);
++      parent = eye_backing_->parent;
++    }
++    uint64_t view_resource_id = 0;
++    auto view = parent.newTextureView(
++        info.pixel_format, WMTTextureType2D, 0, 1, eye_slice_, 1,
++        {WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha},
++        view_resource_id
++    );
++    info.gpu_resource_id = view_resource_id;
++    auto allocation = new TextureAllocation(this, std::move(view), info, flags);
++    allocation->eyeParent = parent;
++    allocation->eyeParentSlice = eye_slice_;
++    return allocation;
++  }
+   if (bytes_per_image_) {
+     WMTBufferInfo buffer_info;
+     buffer_info.length = bytes_per_image_;
+@@ -323,6 +347,9 @@ TextureViewKey Texture::checkViewUseFormat(TextureViewKey key, WMTPixelFormat fo
+ 
+ Rc<TextureAllocation>
+ Texture::rename(Rc<TextureAllocation> &&newAllocation) {
++  // eye candidates are default usage and never mapped, so they are never renamed; keep the current view
++  if (current_ && current_->eyeParent)
++    return {};
+   Rc<TextureAllocation> old = std::move(current_);
+   current_ = std::move(newAllocation);
+   return old;
+diff --git a/src/dxmt/dxmt_texture.hpp b/src/dxmt/dxmt_texture.hpp
+index cf3c55e..363d682 100644
+--- a/src/dxmt/dxmt_texture.hpp
++++ b/src/dxmt/dxmt_texture.hpp
+@@ -25,6 +25,8 @@
+ #include "thread.hpp"
+ #include "util_flags.hpp"
+ #include "util_svector.hpp"
++#include <memory>
++#include <mutex>
+ 
+ namespace dxmt {
+ 
+@@ -146,6 +148,9 @@ public:
+   }
+ 
+   Texture *descriptor;
++  // set when this allocation is a single-slice view of a shared 2-slice parent (stereo eye candidates)
++  WMT::Reference<WMT::Texture> eyeParent;
++  uint32_t eyeParentSlice = 0;
+   void *mappedMemory;
+   uint64_t gpuResourceID;
+   mach_port_t machPort;
+@@ -173,6 +178,13 @@ private:
+   small_vector<TextureViewRef, 4> cached_view_;
+ };
+ 
++/* 2-slice array shared by a pair of stereo eye textures, see MTLD3D11Device::ClaimEyeTextureBacking */
++struct EyeTextureBacking {
++  std::mutex mutex;
++  WMTTextureInfo info{}; // desc of one eye texture, array length 1
++  WMT::Reference<WMT::Texture> parent; // created by the first allocation of either eye texture
++};
++
+ class Texture {
+ 
+ public:
+@@ -294,6 +306,12 @@ public:
+   // render target or depth stencil that no shader or copy reads, see CreateDeviceTexture
+   bool transient_attachment = false;
+ 
++  // stereo eye candidate: allocations become views of `slice` of the shared backing, see allocate()
++  void setEyeBacking(std::shared_ptr<EyeTextureBacking> backing, uint32_t slice) {
++    eye_backing_ = std::move(backing);
++    eye_slice_ = slice;
++  }
++
+ private:
+   void prepareAllocationViews(TextureAllocation* allocation);
+ 
+@@ -308,6 +326,8 @@ private:
+   small_vector<TextureViewDescriptor, 4> viewDescriptors_;
+   dxmt::shared_mutex mutex_;
+   WMT::Device device_;
++  std::shared_ptr<EyeTextureBacking> eye_backing_;
++  uint32_t eye_slice_ = 0;
+ };
+ 
+ class RenamableTexturePool {

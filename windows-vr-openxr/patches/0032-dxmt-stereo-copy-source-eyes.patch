@@ -1,0 +1,387 @@
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index ebdce75..6d748d6 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -627,6 +627,15 @@ class MTLD3D11ContextExt;
+ 
+ enum class DrawCallStatus { Invalid, Ordinary, Tessellation, Geometry };
+ 
++/* the copy that last wrote a destination texture: its source texture, slices and rect */
++struct WindowsVRCopySource {
++  Rc<Texture> dst;
++  Rc<Texture> src;
++  uint32_t dstSlice = 0;
++  uint32_t srcSlice = 0;
++  uint32_t srcX = 0, srcY = 0, srcWidth = 0, srcHeight = 0;
++};
++
+ template <typename ContextInternalState> class MTLD3D11DeviceContextImplBase : public MTLD3D11DeviceContextBase {
+   template<typename ContextInternalState_>
+   friend class MTLD3D11ContextExt;
+@@ -1100,6 +1109,7 @@ public:
+       ((ID3D11Texture2D1 *)pSrcResource)->GetDesc1(&desc);
+       for (auto sub : EnumerateSubresources(desc)) {
+         CopyTexture(TextureCopyCommand(Dst, sub.SubresourceId, 0, 0, 0, Src, sub.SubresourceId, nullptr));
++        recordCopySource(Dst, sub.SubresourceId, Src, sub.SubresourceId, nullptr);
+       }
+       break;
+     }
+@@ -1155,6 +1165,7 @@ public:
+       if (Src.Dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+         return;
+       CopyTexture(TextureCopyCommand(Dst, DstSubresource, DstX, DstY, DstZ, Src, SrcSubresource, pSrcBox));
++      recordCopySource(Dst, DstSubresource, Src, SrcSubresource, pSrcBox);
+       break;
+     }
+   }
+@@ -5238,6 +5249,83 @@ public:
+ 
+ protected:
+   bool stereo_armed_ = false;
++  /* copies into 2D textures, one entry per destination; a VR submission takes the entries of its eye images */
++  std::array<WindowsVRCopySource, 8> copy_sources_{};
++  uint32_t copy_source_next_ = 0;
++
++  void recordCopySource(BlitObject &Dst, UINT DstSubresource, BlitObject &Src, UINT SrcSubresource,
++                        const D3D11_BOX *pSrcBox) {
++    // every copy that writes a destination replaces its entry, so an entry always names the last writer
++    auto dstCommon = GetResourceCommon(Dst.pResource);
++    Rc<Texture> dst = dstCommon ? dstCommon->texture() : Rc<Texture>();
++    if (!dst.ptr())
++      return;
++    WindowsVRCopySource record{};
++    auto srcCommon = GetResourceCommon(Src.pResource);
++    bool valid = Dst.Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D &&
++                 Src.Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D && srcCommon && srcCommon->texture().ptr();
++    if (valid) {
++      const auto &dstDesc = Dst.Texture2DDesc;
++      const auto &srcDesc = Src.Texture2DDesc;
++      // mip 0 only, single sample; the eye rect is taken from the source box or the whole source slice
++      valid = dstDesc.MipLevels && srcDesc.MipLevels && srcDesc.SampleDesc.Count == 1 &&
++              DstSubresource < dstDesc.MipLevels * dstDesc.ArraySize &&
++              SrcSubresource < srcDesc.MipLevels * srcDesc.ArraySize &&
++              DstSubresource % dstDesc.MipLevels == 0 && SrcSubresource % srcDesc.MipLevels == 0;
++      if (valid) {
++        record.srcX = 0;
++        record.srcY = 0;
++        record.srcWidth = srcDesc.Width;
++        record.srcHeight = srcDesc.Height;
++        if (pSrcBox) {
++          valid = pSrcBox->left < pSrcBox->right && pSrcBox->top < pSrcBox->bottom &&
++                  pSrcBox->right <= srcDesc.Width && pSrcBox->bottom <= srcDesc.Height;
++          record.srcX = pSrcBox->left;
++          record.srcY = pSrcBox->top;
++          record.srcWidth = pSrcBox->right - pSrcBox->left;
++          record.srcHeight = pSrcBox->bottom - pSrcBox->top;
++        }
++      }
++      if (valid) {
++        record.dst = dst;
++        record.src = srcCommon->texture();
++        record.dstSlice = DstSubresource / dstDesc.MipLevels;
++        record.srcSlice = SrcSubresource / srcDesc.MipLevels;
++      }
++    }
++    if (!valid)
++      record = {};
++    for (auto &entry : copy_sources_) {
++      if (entry.dst.ptr() == dst.ptr()) {
++        entry = record;
++        return;
++      }
++    }
++    if (!valid)
++      return;
++    copy_sources_[copy_source_next_] = record;
++    copy_source_next_ = (copy_source_next_ + 1) % copy_sources_.size();
++  }
++
++  /* the copies that last wrote the submitted eye images, since the previous submission; clears the table */
++  bool takeWindowsVRCopySources(const Rc<Texture> &left, UINT leftSlice, const Rc<Texture> &right, UINT rightSlice,
++                                WindowsVRCopySource *outLeft, WindowsVRCopySource *outRight) {
++    std::lock_guard<mutex_t> lock(mutex);
++    auto find = [this](const Rc<Texture> &dst, UINT slice, WindowsVRCopySource *out) {
++      for (auto &entry : copy_sources_) {
++        if (entry.dst.ptr() && entry.dst.ptr() == dst.ptr() && entry.dstSlice == slice) {
++          *out = entry;
++          return true;
++        }
++      }
++      return false;
++    };
++    const bool found = find(left, leftSlice, outLeft) && find(right, rightSlice, outRight);
++    copy_sources_ = {};
++    copy_source_next_ = 0;
++    return found;
++  }
++
+   MTLD3D11Device *device;
+   CommandBufferState cmdbuf_state = CommandBufferState::Idle;
+   CommandBufferState previous_render_pipeline_state = CommandBufferState::Idle;
+@@ -5692,9 +5780,13 @@ public:
+       if(depthFrame)for(unsigned eye=0;eye<2;++eye)
+         windows_vr_leases_[depthFrame->depth[eye]]={RetainWindowsVRResource(depthFrame->depth[eye]),{},0,result};
+     }
++    // the game's own eye targets are the sources of the copies into the submitted images, taken now
++    WindowsVRCopySource leftCopy{}, rightCopy{};
++    const bool copiedEyes = ctx_->takeWindowsVRCopySources(leftTexture, frame->leftArraySlice, rightTexture,
++                                                           frame->rightArraySlice, &leftCopy, &rightCopy);
+     ctx_->markStereoArmed();
+     ctx_->EmitWindowsVROperation([leftTexture = std::move(leftTexture), rightTexture = std::move(rightTexture),
+-                  frameCopy = layout, result, reconstruction,
++                  frameCopy = layout, result, reconstruction, leftCopy, rightCopy, copiedEyes,
+                   depthLeft=std::move(depthTextures[0]), depthRight=std::move(depthTextures[1])](ArgumentEncodingContext &enc) mutable {
+       WMT::Texture nativeDepthLeft{},nativeDepthRight{};
+       if(depthLeft && depthRight) {
+@@ -5706,6 +5798,29 @@ public:
+                                  leftTexture->current()->eyeParent, leftTexture->current()->eyeParentSlice,
+                                  rightTexture->current()->eyeParent, rightTexture->current()->eyeParentSlice,
+                                  frameCopy);
++      StereoEyeTargets copyEyes{};
++      auto leftSource = copiedEyes ? leftCopy.src->current() : nullptr;
++      auto rightSource = copiedEyes ? rightCopy.src->current() : nullptr;
++      if (leftSource && rightSource) {
++        copyEyes.left = leftSource->texture();
++        copyEyes.right = rightSource->texture();
++        copyEyes.leftParent = leftSource->eyeParent;
++        copyEyes.rightParent = rightSource->eyeParent;
++        copyEyes.leftParentSlice = leftSource->eyeParentSlice;
++        copyEyes.rightParentSlice = rightSource->eyeParentSlice;
++        copyEyes.leftSlice = leftCopy.srcSlice;
++        copyEyes.rightSlice = rightCopy.srcSlice;
++        copyEyes.leftX = leftCopy.srcX;
++        copyEyes.leftY = leftCopy.srcY;
++        copyEyes.leftWidth = leftCopy.srcWidth;
++        copyEyes.leftHeight = leftCopy.srcHeight;
++        copyEyes.rightX = rightCopy.srcX;
++        copyEyes.rightY = rightCopy.srcY;
++        copyEyes.rightWidth = rightCopy.srcWidth;
++        copyEyes.rightHeight = rightCopy.srcHeight;
++        copyEyes.valid = true;
++      }
++      enc.recordStereoCopyEyeTargets(copyEyes);
+       enc.queueWindowsVRSubmission(leftTexture->current()->texture(), rightTexture->current()->texture(),
+                                      frameCopy, result, reconstruction, nativeDepthLeft, nativeDepthRight);
+     }, true);
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 29603ae..c53190b 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -124,12 +124,14 @@ public:
+       case D3D11_USAGE_IMMUTABLE:
+         return CreateDeviceTexture1D(this, pDesc, pInitialData, ppTexture1D);
+       case D3D11_USAGE_DYNAMIC: {
++        ResetEyeTextureCandidate();
+         HRESULT hr = CreateDynamicLinearTexture1D(this, pDesc, pInitialData, ppTexture1D);
+         if (SUCCEEDED(hr))
+           return hr;
+         return CreateDynamicTexture1D(this, pDesc, pInitialData, ppTexture1D);
+       }
+       case D3D11_USAGE_STAGING:
++        ResetEyeTextureCandidate();
+         if (pDesc->BindFlags != 0) {
+           return E_INVALIDARG;
+         }
+@@ -458,6 +460,7 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE
+   OpenSharedResource(HANDLE hResource, REFIID ReturnedInterface, void **ppResource) override {
++    ResetEyeTextureCandidate();
+     return ImportSharedTexture(this, hResource, ReturnedInterface, ppResource);
+   }
+ 
+@@ -776,12 +779,14 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE
+   OpenSharedResource1(HANDLE hResource, REFIID ReturnedInterface, void **ppResource) override {
++    ResetEyeTextureCandidate();
+     return ImportSharedTextureFromNtHandle(this, hResource, ReturnedInterface, ppResource);
+   }
+ 
+   HRESULT STDMETHODCALLTYPE
+   OpenSharedResourceByName(LPCWSTR lpName, DWORD dwDesiredAccess, REFIID ReturnedInterface, void **ppResource)
+       override {
++    ResetEyeTextureCandidate();
+     return ImportSharedTextureByName(this, lpName, dwDesiredAccess, ReturnedInterface, ppResource);
+   }
+ 
+@@ -852,12 +857,14 @@ public:
+       case D3D11_USAGE_IMMUTABLE:
+         return CreateDeviceTexture2D(this, pDesc, pInitialData, ppTexture2D);
+       case D3D11_USAGE_DYNAMIC: {
++        ResetEyeTextureCandidate();
+         HRESULT hr = CreateDynamicLinearTexture2D(this, pDesc, pInitialData, ppTexture2D);
+         if (SUCCEEDED(hr))
+           return hr;
+         return CreateDynamicTexture2D(this, pDesc, pInitialData, ppTexture2D);
+       }
+       case D3D11_USAGE_STAGING:
++        ResetEyeTextureCandidate();
+         if (pDesc->BindFlags != 0) {
+           return E_INVALIDARG;
+         }
+@@ -888,8 +895,10 @@ public:
+       case D3D11_USAGE_IMMUTABLE:
+         return CreateDeviceTexture3D(this, pDesc, pInitialData, ppTexture3D);
+       case D3D11_USAGE_DYNAMIC:
++        ResetEyeTextureCandidate();
+         return CreateDynamicTexture3D(this, pDesc, pInitialData, ppTexture3D);
+       case D3D11_USAGE_STAGING:
++        ResetEyeTextureCandidate();
+         if (pDesc->BindFlags != 0) {
+           return E_INVALIDARG;
+         }
+@@ -1038,23 +1047,36 @@ public:
+     eye_size_.store((uint64_t(width) << 32) | uint64_t(height));
+   }
+ 
++  static bool sameEyeTextureDesc(const WMTTextureInfo &p, const WMTTextureInfo &info) {
++    return p.pixel_format == info.pixel_format && p.width == info.width && p.height == info.height &&
++           p.depth == info.depth && p.type == info.type && p.mipmap_level_count == info.mipmap_level_count &&
++           p.sample_count == info.sample_count && p.usage == info.usage;
++  }
++
+   bool ClaimEyeTextureBacking(const WMTTextureInfo &info, bool eligible,
+                               std::shared_ptr<EyeTextureBacking> *backing, uint32_t *slice) override {
+     std::lock_guard<std::mutex> lock(eye_mutex_);
++    const uint64_t claim = ++eye_claims_;
+     const uint64_t size = eye_size_.load();
+     if (!eligible || !size || info.width != uint32_t(size >> 32) || info.height != uint32_t(size)) {
+       eye_pending_.reset();
+       return false;
+     }
++    // a swapchain group is created as identical images in a row: the image right after a completed pair
++    // would pair with the next pair's first image, so it stays out of the candidates
++    if (eye_pair_valid_ && claim == eye_pair_claim_ + 1 && sameEyeTextureDesc(eye_pair_info_, info)) {
++      eye_pending_.reset();
++      return false;
++    }
+     if (eye_pending_) {
+-      const auto &p = eye_pending_->info;
+-      if (p.pixel_format == info.pixel_format && p.width == info.width && p.height == info.height &&
+-          p.depth == info.depth && p.type == info.type && p.mipmap_level_count == info.mipmap_level_count &&
+-          p.sample_count == info.sample_count && p.usage == info.usage) {
++      if (sameEyeTextureDesc(eye_pending_->info, info)) {
+         // the partner: second slice of the same backing, the pending slot is consumed
+         *backing = eye_pending_;
+         *slice = 1;
+         eye_pending_.reset();
++        eye_pair_valid_ = true;
++        eye_pair_claim_ = claim;
++        eye_pair_info_ = info;
+         return true;
+       }
+     }
+@@ -1066,9 +1088,19 @@ public:
+     return true;
+   }
+ 
++  void ResetEyeTextureCandidate() override {
++    std::lock_guard<std::mutex> lock(eye_mutex_);
++    ++eye_claims_;
++    eye_pending_.reset();
++  }
++
+   std::atomic<uint64_t> eye_size_{0}; // (width << 32) | height, 0 when unset
+   std::mutex eye_mutex_;
+   std::shared_ptr<EyeTextureBacking> eye_pending_;
++  uint64_t eye_claims_ = 0; // every texture creation counts once, see ClaimEyeTextureBacking
++  bool eye_pair_valid_ = false;
++  uint64_t eye_pair_claim_ = 0; // creation index of the last completed pair
++  WMTTextureInfo eye_pair_info_{};
+ 
+   HRESULT
+   CreateComputePipeline(MTL_COMPUTE_PIPELINE_DESC *pDesc,
+diff --git a/src/d3d11/d3d11_device.hpp b/src/d3d11/d3d11_device.hpp
+index 8a4d16b..1149ebb 100644
+--- a/src/d3d11/d3d11_device.hpp
++++ b/src/d3d11/d3d11_device.hpp
+@@ -56,6 +56,9 @@ public:
+   virtual bool ClaimEyeTextureBacking(const WMTTextureInfo &info, bool eligible,
+                                       std::shared_ptr<EyeTextureBacking> *backing, uint32_t *slice) = 0;
+ 
++  /* texture creations that do not take the claim (dynamic, staging, shared opens) drop a pending partner */
++  virtual void ResetEyeTextureCandidate() = 0;
++
+   virtual HRESULT CreateComputePipeline(MTL_COMPUTE_PIPELINE_DESC * pDesc,
+                                         MTLCompiledComputePipeline *
+                                             *ppPipeline) = 0;
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 4509d93..279dc32 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -692,6 +692,7 @@ ArgumentEncodingContext::startRenderPass(
+   encoder_info->dsv_readonly_flags = dsv_readonly_flags;
+   encoder_info->render_target_count = render_target_count;
+   encoder_info->eye_targets = eye_targets_;
++  encoder_info->eye_copy_targets = eye_copy_targets_;
+   auto [gpu_buffer_contents, gpu_buffer_, offset] = queue_.AllocateArgumentBuffer(seq_id_, encoder_argbuf_size);
+   encoder_info->allocated_argbuf = gpu_buffer_;
+   encoder_info->allocated_argbuf_offset = offset;
+@@ -1678,7 +1679,8 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
+ 
+       return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
+     }
+-    if (tryPairStereoPasses(r0, r1))
++    // swapchain eye targets first, then the sources of the copies into them
++    if (tryPairStereoPasses(r0, r1, r0->eye_targets) || tryPairStereoPasses(r0, r1, r0->eye_copy_targets))
+       return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
+   }
+ 
+@@ -1752,7 +1754,7 @@ Rewrites r0 (the former pass) to render both eyes with vertex amplification and
+ Only pairs passes that are provably the same work for both eyes, see the checks below. On failure nothing is changed.
+ */
+ bool
+-ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncoderData *r1) {
++ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncoderData *r1, const StereoEyeTargets &eye) {
+   // r1 must be the next live encoder after r0
+   EncoderData *next = r0->next;
+   while (next && next->type == EncoderType::Null)
+@@ -1762,7 +1764,6 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+ 
+   // the two eyes are either consecutive layers of the same eye target texture (layered), or the two
+   // disjoint halves of one slice of it (atlas); both cases need one eye target texture
+-  const StereoEyeTargets &eye = r0->eye_targets;
+   if (!eye.valid || eye.left == nullptr || eye.right == nullptr)
+     return false;
+   // separate (case c): two single-slice eye textures that are slices 0 and 1 of one parent array, rendered
+diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
+index 2edc942..2638168 100644
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -254,6 +254,8 @@ struct RenderEncoderData : EncoderData {
+   uint32_t last_stencil_ref = 0;
+   /* eye targets known when this pass started; used to pair left/right passes */
+   StereoEyeTargets eye_targets;
++  /* the sources of the copies into the submitted eye images, tried when eye_targets does not pair */
++  StereoEyeTargets eye_copy_targets;
+   /* set when this pass was rewritten to render both eyes with vertex amplification */
+   bool stereo_pass = false;
+   /* when set, the merged pass renders into these parent arrays instead of the attachment views (case c) */
+@@ -762,6 +764,9 @@ public:
+     eye_targets_.valid = true;
+   }
+ 
++  /* eye targets taken from the copy sources of the submission; an invalid set pairs nothing */
++  void recordStereoCopyEyeTargets(const StereoEyeTargets &eyes) { eye_copy_targets_ = eyes; }
++
+   uint64_t
+   nextEncoderId() {
+     return encoder_id_++;
+@@ -922,6 +927,7 @@ private:
+   struct PendingWindowsVRSubmission { WMT::Reference<WMT::Texture> left, right, depthLeft, depthRight; WMTWindowsVRRequestV2 frame{}; WVRReconstructionSubmitV1 geometry{}; std::shared_ptr<WindowsVRSubmissionResult> result; };
+   std::optional<PendingWindowsVRSubmission> windows_vr_submission_;
+   StereoEyeTargets eye_targets_;
++  StereoEyeTargets eye_copy_targets_;
+   WMT::Device device_;
+ 
+ public:
+@@ -937,7 +943,7 @@ private:
+   DXMT_ENCODER_LIST_OP checkEncoderRelation(EncoderData* former, EncoderData* latter);
+   bool hasDataDependency(EncoderData* from, EncoderData* to);
+   bool isEncoderSignatureMatched(RenderEncoderData* former, RenderEncoderData* latter);
+-  bool tryPairStereoPasses(RenderEncoderData* former, RenderEncoderData* latter);
++  bool tryPairStereoPasses(RenderEncoderData* former, RenderEncoderData* latter, const StereoEyeTargets &eye);
+   RenderEncoderColorAttachmentData *isClearColorSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);
+   RenderEncoderDepthAttachmentData *isClearDepthSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);
+   RenderEncoderStencilAttachmentData *isClearStencilSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);

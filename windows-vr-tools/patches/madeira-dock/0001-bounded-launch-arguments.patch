@@ -1,0 +1,82 @@
+--- a/src/launch.c
++++ b/src/launch.c
+@@ -28,6 +28,18 @@
+ static bool method_is(HMODULE module, void *object, unsigned slot, uintptr_t rva)
+ {
+     return dock_method_is((uintptr_t)module, object, slot, rva);
++}
++
++/* Optional application arguments are bounded and never written to reports. */
++static bool read_launch_args(char *text, DWORD capacity)
++{
++    if (!text || !capacity) return false;
++    text[0] = 0;
++    SetLastError(ERROR_SUCCESS);
++    DWORD length = GetEnvironmentVariableA("MADEIRA_STEAM_HOST_EXTRA_ARGS", text, capacity);
++    if (length) return length < capacity;
++    DWORD error = GetLastError();
++    return error == ERROR_SUCCESS || error == ERROR_ENVVAR_NOT_FOUND;
+ }
+ 
+ struct saved_value { HKEY key; const wchar_t *name; DWORD previous, written; bool existed, changed; };
+@@ -187,6 +199,12 @@
+         return 45;
+     }
+     o->event("launch-option-index", (int32_t)launch_option);
++    char launch_args[2048] = {0};
++    if (!read_launch_args(launch_args, sizeof(launch_args))) {
++        o->event("launch-extra-args-invalid", 1);
++        return 45;
++    }
++
+     static char actual_utf8[32768];
+     static wchar_t actual[32768], expected[32768], normalized[32768];
+     DWORD length = GetEnvironmentVariableW(L"MADEIRA_STEAM_HOST_EXPECTED_INSTALL", expected, 32768);
+@@ -240,7 +258,7 @@
+     o->event("launch-client-discovery-published", 1);
+     SetConsoleCtrlHandler(on_control, TRUE);
+     uint64_t gameid = appid;
+-    uint64_t call = ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, launch_option, 0, "");
++    uint64_t call = ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, launch_option, 0, launch_args);
+     o->event("launch-request-submitted", call != 0);
+     if (!call) { result = 43; goto done; }
+     uint64_t begin = o->now_ms(), stopped_at = 0;
+@@ -368,7 +386,7 @@
+         }
+         if (retry_at && !seen_running && o->now_ms() >= retry_at) {
+             retry_at = 0;
+-            call = ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, launch_option, 0, "");
++            call = ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, launch_option, 0, launch_args);
+             ++retries;
+             if (retries <= 3 || retries % 60 == 0) o->event("launch-update-retry", (int32_t)retries);
+             if (!call) { result = 43; goto done; }
+--- a/README.md
++++ b/README.md
+@@ -64,7 +64,10 @@
+     and the signed-in account id in Steam's `ActiveProcess` registry values. Games find the
+     client through these. The previous values are restored on exit.
+ 11. **Asks Valve's client to start the game**: `IClientAppManager::LaunchApp` with the original
+-    launch entry key selected by Madeira, including nonzero and sparse keys. Valve's client
++    launch entry key selected by Madeira, including nonzero and sparse keys.
++    Optional `MADEIRA_STEAM_HOST_EXTRA_ARGS` supplies at most 2047 bytes of
++    application arguments on the initial request and every retry; argument
++    contents are never written to reports. Valve's client
+     applies its own launch checks and returns its own result; a
+     refusal (for example "no licence", "another session is playing", "update required") is
+     reported as Valve gave it, and the game is not started.
+--- a/docs/HANDOFF.md
++++ b/docs/HANDOFF.md
+@@ -1,4 +1,13 @@
+ # Madeira Dock — implementation handoff, ml2000 (2026-09-25)
++
++## Bounded application arguments (2026-10-17)
++
++The optional `MADEIRA_STEAM_HOST_EXTRA_ARGS` environment variable reaches the
++existing final LaunchApp parameter on initial requests and retries. Missing or
++empty values preserve the prior empty string. Values over 2047 bytes or failed
++environment reads stop with result 45 before launch. Reports never include
++argument contents. The source-built host and runtime audio-client additions
++require physical verification; no game compatibility is asserted by this change.
+ 
+ ## Original launch entry keys (2026-10-05)
+ 

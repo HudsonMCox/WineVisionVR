@@ -1,0 +1,140 @@
+diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
+index 620f641..671a956 100644
+--- a/src/d3d11/d3d11_texture_device.cpp
++++ b/src/d3d11/d3d11_texture_device.cpp
+@@ -26,6 +26,7 @@
+ #include "dxmt_texture.hpp"
+ #include "d3d11_resource.hpp"
+ #include "util_win32_compat.h"
++#include "util_env.hpp"
+ 
+ namespace dxmt {
+ 
+@@ -354,6 +355,38 @@ struct SharedResourceData {
+   D3DKMT_HANDLE mutex_handle;
+ };
+ 
++// DXMT_LOSSY_RENDER_TARGETS=1 opts plain color render targets into Metal lossy texture compression, read once
++static bool LossyRenderTargetsEnabled() {
++  static const bool enabled = env::getEnvVar("DXMT_LOSSY_RENDER_TARGETS") == "1";
++  return enabled;
++}
++
++// Only single-sampled, single-slice Texture2D render targets without UAV, depth, CPU access or misc flags.
++// The format list has no TYPELESS or sRGB entries, and a texture that needs a pixel format view is refused,
++// so DXMT never creates a typed view of a different format for a texture that gets compressed.
++static bool IsLossyRenderTargetCandidate(const D3D11_TEXTURE2D_DESC1 &desc, const WMTTextureInfo &info) {
++  if (!(desc.BindFlags & D3D11_BIND_RENDER_TARGET))
++    return false;
++  if (desc.BindFlags & (D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_DEPTH_STENCIL))
++    return false;
++  if (desc.Usage != D3D11_USAGE_DEFAULT || desc.CPUAccessFlags != 0 || desc.MiscFlags != 0)
++    return false;
++  if (info.type != WMTTextureType2D || info.sample_count != 1 || info.array_length != 1)
++    return false;
++  if (info.usage & WMTTextureUsagePixelFormatView)
++    return false;
++  switch (desc.Format) {
++  case DXGI_FORMAT_R8G8B8A8_UNORM:
++  case DXGI_FORMAT_B8G8R8A8_UNORM:
++  case DXGI_FORMAT_R16G16B16A16_FLOAT:
++  case DXGI_FORMAT_R11G11B10_FLOAT:
++  case DXGI_FORMAT_R10G10B10A2_UNORM:
++    return true;
++  default:
++    return false;
++  }
++}
++
+ template <typename tag>
+ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+                                     const typename tag::DESC1 *pDesc,
+@@ -366,15 +399,6 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+   }
+   bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&
+                             !(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE);
+-  auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
+-  // Nothing can sample or copy from it, so a pass that is fully overwritten by the next one may skip its store.
+-  // Memoryless storage is not used, as contents must survive pass boundaries when a later pass reads them.
+-  texture->transient_attachment =
+-      ((finalDesc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)) != 0) &&
+-      (info.sample_count > 1 || (finalDesc.BindFlags & D3D11_BIND_DEPTH_STENCIL)) &&
+-      ((finalDesc.BindFlags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS)) == 0) &&
+-      finalDesc.Usage == D3D11_USAGE_DEFAULT && finalDesc.CPUAccessFlags == 0 && finalDesc.MiscFlags == 0;
+-
+   // stereo eye candidate: a default 2D target that may become one slice of a shared 2-slice parent
+   // every creation goes through the claim so that a pending partner only survives the next identical creation
+   const bool eyeEligible =
+@@ -384,6 +408,22 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+   std::shared_ptr<EyeTextureBacking> eyeBacking;
+   uint32_t eyeSlice = 0;
+   const bool eyeClaimed = pDevice->ClaimEyeTextureBacking(info, eyeEligible, &eyeBacking, &eyeSlice);
++
++  // opt-in lossy compression for plain color render targets, decided before the texture is created
++  if constexpr (std::is_same_v<typename tag::DESC1, D3D11_TEXTURE2D_DESC1>) {
++    if (!eyeClaimed && LossyRenderTargetsEnabled() && IsLossyRenderTargetCandidate(finalDesc, info))
++      info.compression = 1;
++  }
++
++  auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
++  // Nothing can sample or copy from it, so a pass that is fully overwritten by the next one may skip its store.
++  // Memoryless storage is not used, as contents must survive pass boundaries when a later pass reads them.
++  texture->transient_attachment =
++      ((finalDesc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)) != 0) &&
++      (info.sample_count > 1 || (finalDesc.BindFlags & D3D11_BIND_DEPTH_STENCIL)) &&
++      ((finalDesc.BindFlags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS)) == 0) &&
++      finalDesc.Usage == D3D11_USAGE_DEFAULT && finalDesc.CPUAccessFlags == 0 && finalDesc.MiscFlags == 0;
++
+   if (eyeClaimed)
+     texture->setEyeBacking(eyeBacking, eyeSlice);
+ 
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index b424493..2132406 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -315,9 +315,22 @@ extract_texture_descriptor(id<MTLTexture> desc, struct WMTTextureInfo *info) {
+   info->sample_count = desc.sampleCount;
+   info->usage = desc.usage;
+   info->options = (enum WMTResourceOptions)desc.resourceOptions;
+-  info->reserved = 0;
++  info->compression = 0;
+ };
+ 
++// Lossy compression needs Apple8 and private storage; a request that does not qualify is ignored
++static void
++apply_lossy_compression(id<MTLDevice> device, MTLTextureDescriptor *desc, struct WMTTextureInfo *info) {
++  if (@available(macOS 12.5, iOS 15, visionOS 1.0, *)) {
++    if (info->usage & (WMTTextureUsageShaderWrite | WMTTextureUsagePixelFormatView))
++      return;
++    if (![device supportsFamily:(MTLGPUFamily)WMTGPUFamilyApple8])
++      return;
++    desc.compressionType = MTLTextureCompressionTypeLossy;
++    desc.resourceOptions = (desc.resourceOptions & ~MTLResourceStorageModeMask) | MTLResourceStorageModePrivate;
++  }
++}
++
+ static NTSTATUS
+ _MTLDevice_newTexture(void *obj) {
+   struct unixcall_mtldevice_newtexture *params = obj;
+@@ -325,6 +338,8 @@ _MTLDevice_newTexture(void *obj) {
+   struct WMTTextureInfo *info = params->info.ptr;
+   MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+   fill_texture_descriptor(desc, info);
++  if (info->compression)
++    apply_lossy_compression(device, desc, info);
+ 
+   id<MTLTexture> ret = [device newTextureWithDescriptor:desc];
+   params->ret = (obj_handle_t)ret;
+diff --git a/src/winemetal/winemetal.h b/src/winemetal/winemetal.h
+index 0ee1ecd..ec6dc9b 100644
+--- a/src/winemetal/winemetal.h
++++ b/src/winemetal/winemetal.h
+@@ -526,7 +526,7 @@ struct WMTTextureInfo {
+   uint32_t sample_count       : 8;
+   enum WMTTextureUsage usage  : 8;
+   enum WMTResourceOptions options;
+-  uint32_t reserved;
++  uint32_t compression; // in: 1 requests lossy compression, honored by MTLDevice_newTexture only
+   mach_port_t mach_port; // in/out
+   uint64_t gpu_resource_id; // out
+ };

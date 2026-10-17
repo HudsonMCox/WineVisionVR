@@ -23,7 +23,11 @@ struct WindowsVRCompositorScene: Scene {
         ImmersiveSpace(id: Self.identifier) {
             CompositorLayer(configuration: WindowsVRCompositorConfiguration()) { layerRenderer in
                 let transfer = WindowsVRLayerRendererTransfer(renderer: layerRenderer)
+                let taskIdentity = UUID().uuidString
+                LaunchLogFile.append("lifecycle", "CompositorLayer created task=\(taskIdentity)")
                 let task = Task.detached(executorPreference: WindowsVRRenderTaskExecutor.shared) {
+                    LaunchLogFile.append("lifecycle", "Render task entered id=\(taskIdentity)")
+                    defer { LaunchLogFile.append("lifecycle", "Render task returned id=\(taskIdentity) cancelled=\(Task.isCancelled)") }
                     if #available(visionOS 27.0, *) {
                         let renderer = WindowsVRCompositorRenderer(layerRenderer: transfer.renderer)
                         await renderer.run()
@@ -32,6 +36,7 @@ struct WindowsVRCompositorScene: Scene {
                 WindowsVRCompositorTaskStore.shared.install(task)
             }
             .onDisappear {
+                model.recordLifecycleEvent("CompositorLayer onDisappear; cancelling renderer")
                 WindowsVRCompositorTaskStore.shared.stop()
                 Task { await model.immersiveSpaceDidClose() }
             }
@@ -53,6 +58,7 @@ private final class WindowsVRCompositorTaskStore: @unchecked Sendable {
             task = newTask
             return previous
         }
+        LaunchLogFile.append("lifecycle", "Render task installed replacingExisting=\(previous != nil)")
         previous?.cancel()
     }
 
@@ -62,6 +68,7 @@ private final class WindowsVRCompositorTaskStore: @unchecked Sendable {
             task = nil
             return running
         }
+        LaunchLogFile.append("lifecycle", "Render task store stop hasTask=\(running != nil)")
         running?.cancel()
         wvr_compositor_pause_v1()
     }
@@ -98,8 +105,12 @@ private struct WindowsVRCompositorConfiguration: CompositorLayerConfiguration {
             configuration.layout = .layered
         }
         configuration.isFoveationEnabled = foveation
-        // Render-quality overrides are only supported with foveation. Leave the
-        // system's non-foveated quality untouched for uniform guest eye textures.
+        // Render-quality overrides are only supported with foveation (setting them
+        // with foveation off aborts Compositor Services). Without foveation, leave
+        // the system's quality untouched for uniform guest eye textures.
+        if foveation && capabilities.supportsFoveation {
+            configuration.maxRenderQuality = 1.0
+        }
         // Match the guest runtime's advertised D3D11 sRGB swapchain format.
         // The compositor default may be RGBA16Float, which this first path
         // must not accidentally advertise as an unsupported 8-bit format.
@@ -148,7 +159,16 @@ private final class WindowsVRCompositorRenderer {
     // Owned snapshots outlive a guest swapchain lease. They are updated and read
     // on the same Metal command queue, never by retaining a reusable guest image.
     private var lastEyeSnapshots: [any MTLTexture] = []
+    // Zero-copy mode keeps the guest lease itself as the current frame instead of a copy.
+    private var heldGuestFrame: GuestLeaseReference?
+    private var heldGuestSources: [EyeSource] = []
+    // Guest leases come from the OpenXR runtime's swapchains, which always have kImageCount (3)
+    // images; static-image swapchains (1) are written once and never waited again, so holding
+    // their lease cannot stall the game either.
+    private let guestSwapchainImageCount: Int? = 3
+    private var zeroCopyGuestFrames: Bool { (guestSwapchainImageCount ?? 0) >= 3 }
     private var presentationPlans: [SpatialEyePlan] = []
+    private var renderQualityApplied = false
     private var snapshotGeneration: UInt64 = 0
     private var snapshotTracking: WVRFrameTrackingV1?
     private var snapshotRenderPose: WindowsVRRenderPose?
@@ -157,6 +177,18 @@ private final class WindowsVRCompositorRenderer {
     private var lastDrawableLayout = ""
     private var lastFrameDiagnosticTime: TimeInterval = 0
     private var lastGPUStatisticsTime: TimeInterval = 0
+    // Adaptive frame generation (synthesis mode 4). Render-task state only.
+    private let adaptiveGenerationEnabled = UserDefaults.standard.integer(forKey: "WVRFrameSynthesisMode") == 4
+    private var adaptiveFrameIntervals: [CFTimeInterval] = []
+    private var adaptiveLastRealFrameTime: CFTimeInterval?
+    private var adaptiveEngaged = false
+    private var adaptiveBelowSince: CFTimeInterval?
+    private var adaptiveAboveSince: CFTimeInterval?
+    private var adaptivePacingLocked = false
+    private var adaptiveEmptyTicks = 0
+    private var adaptiveEngagements: UInt64 = 0
+    private var adaptiveGeneratedFrames: UInt64 = 0
+    private var adaptiveReprojectedFrames: UInt64 = 0
     private var transferStatus = WindowsVRFrameTransferStatus()
     private var performanceStartedAt = CACurrentMediaTime()
     private var presentationCount: UInt64 = 0
@@ -221,6 +253,105 @@ private final class WindowsVRCompositorRenderer {
         float2 uv = pixel / float2(source.get_width(), source.get_height());
         return float4(source.sample(linearClamp, uv, region.slice).rgb, 1.0);
     }
+    struct WVRSpatialDepthUniform {
+        float4x4 sourceInverseProjection;
+        float4x4 destFromSourceEye;
+        float4x4 destProjection;
+        uint2 depthOrigin;
+        uint2 depthSize;
+        float2 range;
+        float fallbackDepth;
+        uint padding;
+    };
+    struct WVRSpatialDepthOut {
+        float4 color [[color(0)]];
+        float depth [[depth(any)]];
+    };
+    // Reprojects the game's depth for the sampled source pixel into the drawable's
+    // reverse-Z depth. Mirrors the game_depth conversion: NDC z is the game depth
+    // normalised by range (minDepth, maxDepth), then the source inverse projection
+    // gives the source-eye point. That point moves into the destination eye and is
+    // projected with the drawable projection. Invalid samples take the fallback.
+    float wvr_presented_depth(depth2d<float, access::read> gameDepth, float2 sourceUV,
+                                     constant WVRSpatialDepthUniform& d) {
+        if (d.range.y == d.range.x) return d.fallbackDepth;
+        uint2 texel = min(uint2(sourceUV * float2(d.depthSize)), d.depthSize - 1) + d.depthOrigin;
+        float raw = gameDepth.read(texel);
+        if (!isfinite(raw) || raw < min(d.range.x, d.range.y) || raw > max(d.range.x, d.range.y)) return d.fallbackDepth;
+        float2 ndc = sourceUV * float2(2.0, -2.0) + float2(-1.0, 1.0);
+        float4 v = d.sourceInverseProjection * float4(ndc, (raw - d.range.x) / (d.range.y - d.range.x), 1.0);
+        if (v.w == 0.0) return d.fallbackDepth;
+        float3 sourcePoint = v.xyz / v.w;
+        float z = -sourcePoint.z;
+        if (!(isfinite(z) && z > 0.02 && z < 1000.0)) return d.fallbackDepth;
+        float4 clip = d.destProjection * (d.destFromSourceEye * float4(sourcePoint, 1.0));
+        if (!(clip.w > 0.0)) return d.fallbackDepth;
+        float depth = clip.z / clip.w;
+        return (isfinite(depth) && depth > 0.0 && depth <= 1.0) ? depth : d.fallbackDepth;
+    }
+    // Synthesized output already sits at the display pose; its depth texture holds drawable depth (0 = invalid).
+    fragment WVRSpatialDepthOut wvr_spatial_synth_depth_fragment(
+        WVRSpatialVertexOut in [[stage_in]],
+        texture2d<float> source [[texture(0)]],
+        texture2d<float, access::read> synthDepth [[texture(1)]],
+        sampler linearClamp [[sampler(0)]],
+        constant WVRSpatialSource& region [[buffer(0)]],
+        constant float& fallbackDepth [[buffer(1)]]) {
+        WVRSpatialDepthOut out;
+        float2 sourceUV = in.sourceClip.xy / in.sourceClip.z * float2(0.5, -0.5) + 0.5;
+        if (in.sourceClip.z <= 0.0 || any(sourceUV < 0.0) || any(sourceUV > 1.0)) {
+            out.color = float4(0.0, 0.0, 0.0, 1.0);
+            out.depth = fallbackDepth;
+            return out;
+        }
+        float2 pixel = clamp(region.origin + sourceUV * region.extent, region.origin + 0.5, region.origin + region.extent - 0.5);
+        float2 uv = pixel / float2(source.get_width(), source.get_height());
+        out.color = float4(source.sample(linearClamp, uv).rgb, 1.0);
+        uint2 texel = min(uint2(pixel), uint2(synthDepth.get_width(), synthDepth.get_height()) - 1);
+        float d = synthDepth.read(texel).r;
+        out.depth = (isfinite(d) && d > 0.0 && d <= 1.0) ? d : fallbackDepth;
+        return out;
+    }
+    fragment WVRSpatialDepthOut wvr_spatial_depth_fragment(
+        WVRSpatialVertexOut in [[stage_in]],
+        texture2d<float> source [[texture(0)]],
+        depth2d<float, access::read> gameDepth [[texture(1)]],
+        sampler linearClamp [[sampler(0)]],
+        constant WVRSpatialSource& region [[buffer(0)]],
+        constant WVRSpatialDepthUniform& depthUniform [[buffer(1)]]) {
+        WVRSpatialDepthOut out;
+        float2 sourceUV = in.sourceClip.xy / in.sourceClip.z * float2(0.5, -0.5) + 0.5;
+        if (in.sourceClip.z <= 0.0 || any(sourceUV < 0.0) || any(sourceUV > 1.0)) {
+            out.color = float4(0.0, 0.0, 0.0, 1.0);
+            out.depth = depthUniform.fallbackDepth;
+            return out;
+        }
+        float2 pixel = clamp(region.origin + sourceUV * region.extent, region.origin + 0.5, region.origin + region.extent - 0.5);
+        float2 uv = pixel / float2(source.get_width(), source.get_height());
+        out.color = float4(source.sample(linearClamp, uv).rgb, 1.0);
+        out.depth = wvr_presented_depth(gameDepth, sourceUV, depthUniform);
+        return out;
+    }
+    fragment WVRSpatialDepthOut wvr_spatial_array_depth_fragment(
+        WVRSpatialVertexOut in [[stage_in]],
+        texture2d_array<float> source [[texture(0)]],
+        depth2d<float, access::read> gameDepth [[texture(1)]],
+        sampler linearClamp [[sampler(0)]],
+        constant WVRSpatialSource& region [[buffer(0)]],
+        constant WVRSpatialDepthUniform& depthUniform [[buffer(1)]]) {
+        WVRSpatialDepthOut out;
+        float2 sourceUV = in.sourceClip.xy / in.sourceClip.z * float2(0.5, -0.5) + 0.5;
+        if (in.sourceClip.z <= 0.0 || any(sourceUV < 0.0) || any(sourceUV > 1.0)) {
+            out.color = float4(0.0, 0.0, 0.0, 1.0);
+            out.depth = depthUniform.fallbackDepth;
+            return out;
+        }
+        float2 pixel = clamp(region.origin + sourceUV * region.extent, region.origin + 0.5, region.origin + region.extent - 0.5);
+        float2 uv = pixel / float2(source.get_width(), source.get_height());
+        out.color = float4(source.sample(linearClamp, uv, region.slice).rgb, 1.0);
+        out.depth = wvr_presented_depth(gameDepth, sourceUV, depthUniform);
+        return out;
+    }
     """
 
     init(layerRenderer: LayerRenderer) {
@@ -242,8 +373,9 @@ private final class WindowsVRCompositorRenderer {
         depthDescriptor.isDepthWriteEnabled = true
         self.presentationDepthState = layerRenderer.device.makeDepthStencilState(descriptor: depthDescriptor)
         let synthesisMode = UserDefaults.standard.integer(forKey: "WVRFrameSynthesisMode")
-        if (1...2).contains(synthesisMode) {
-            synthesisContext = wvr_synthesis_create_v1(Unmanaged.passUnretained(layerRenderer.device as AnyObject).toOpaque(), UInt32(synthesisMode))
+        if (1...4).contains(synthesisMode) {
+            // Mode 4 (adaptive frame generation) runs the mode-2 extrapolation backend, gated by the Swift governor.
+            synthesisContext = wvr_synthesis_create_v1(Unmanaged.passUnretained(layerRenderer.device as AnyObject).toOpaque(), UInt32(synthesisMode == 4 ? 2 : synthesisMode))
             LaunchLogFile.append("synthesis", "Custom Metal reconstruction mode=\(synthesisMode) initialized=\(synthesisContext != nil); source render scale unchanged.")
         }
         if synthesisMode == 0 && UserDefaults.standard.bool(forKey: "WVRReconstructionValidation") {
@@ -258,6 +390,7 @@ private final class WindowsVRCompositorRenderer {
     deinit {
         if let reconstructionContext { wvr_reconstruction_destroy_v1(reconstructionContext) }
         if let synthesisContext { wvr_synthesis_destroy_v1(synthesisContext) }
+        retireHeldGuestFrame()
     }
 
     func run() async {
@@ -296,12 +429,16 @@ private final class WindowsVRCompositorRenderer {
                     await startTracking()
                     trackingStarted = true
                 }
+                if !renderQualityApplied {
+                    renderQualityApplied = true
+                    applyRenderQualitySetting()
+                }
                 // This task stays inside its render loop between suspension
                 // points. Retire temporary Objective-C/Metal objects per frame.
                 autoreleasepool { renderNextFrame() }
             case .invalidated:
                 Self.log.notice("Layer renderer invalidated")
-                LaunchLogFile.append("lifecycle", "Layer renderer invalidated")
+                LaunchLogFile.append("lifecycle", "Layer renderer invalidated worldTracking=\(worldTracking.state) trackingStarted=\(trackingStarted) cancelled=\(Task.isCancelled)")
                 return
             @unknown default:
                 return
@@ -309,17 +446,33 @@ private final class WindowsVRCompositorRenderer {
         }
     }
 
+    /// Applies the user's render-quality choice once the layer is running. A stored
+    /// value of 0 keeps the system default. Requests are clamped to the configured
+    /// maximum and ignored entirely unless foveation is enabled.
+    private func applyRenderQualitySetting() {
+        guard layerRenderer.configuration.isFoveationEnabled else { return }
+        let requested = Float(UserDefaults.standard.double(forKey: "WVRRenderQuality"))
+        guard requested > 0 else { return }
+        let ceiling = layerRenderer.configuration.maxRenderQuality
+        let applied = min(requested, ceiling)
+        layerRenderer.renderQuality = applied
+        LaunchLogFile.append("compositor", "Render quality requested=\(requested) applied=\(applied) max=\(ceiling)")
+    }
+
     private func startTracking() async {
         let authorization = await arSession.requestAuthorization(for: [.worldSensing, .accessoryTracking])
         Self.log.notice("ARKit authorization: worldSensing=\(String(describing: authorization[.worldSensing])) accessoryTracking=\(String(describing: authorization[.accessoryTracking]))")
+        LaunchLogFile.append("tracking", "ARKit authorization world=\(String(describing: authorization[.worldSensing])) accessory=\(String(describing: authorization[.accessoryTracking]))")
         let controllerProviders = await controllerTracking.configure(
             authorized: authorization[.accessoryTracking] == .allowed
         )
         var providers: [any DataProvider] = [worldTracking]
         providers.append(contentsOf: controllerProviders)
+        LaunchLogFile.append("tracking", "ARKit run requested providers=\(providers.count)")
         do {
             try await arSession.run(providers)
         } catch {
+            LaunchLogFile.append("tracking", "ARKit run failed; fallback to world only: \(String(String(describing: error).prefix(512)))")
             // A controller provider must never take head tracking down with it:
             // without a device anchor every drawable is dropped by the compositor.
             Self.log.error("ARKitSession.run with \(providers.count) providers failed: \(String(describing: error)); retrying with world tracking only")
@@ -327,11 +480,13 @@ private final class WindowsVRCompositorRenderer {
             do {
                 try await arSession.run([worldTracking])
             } catch {
+                LaunchLogFile.append("tracking", "ARKit world-only run failed: \(String(String(describing: error).prefix(512)))")
                 Self.log.error("ARKitSession.run (world tracking only) failed: \(String(describing: error))")
                 publishUnavailablePose()
                 return
             }
         }
+        LaunchLogFile.append("tracking", "ARKit run returned worldState=\(worldTracking.state)")
         Self.log.notice("ARKit session running; worldTracking.state=\(String(describing: self.worldTracking.state))")
     }
 
@@ -454,9 +609,12 @@ private final class WindowsVRCompositorRenderer {
         // advertise gaze-varying physical allocation dimensions to OpenXR.
         let width = UInt32(Bundle.main.object(forInfoDictionaryKey: "WVRUniformEyeWidth") as? Int ?? 1888)
         let height = UInt32(Bundle.main.object(forInfoDictionaryKey: "WVRUniformEyeHeight") as? Int ?? 1792)
+        // Guest D3D11 swapchains remain RGBA sRGB even when the compositor
+        // display target is BGRA. Presentation samples and converts the format.
+        let producerFormat = UInt32(MTLPixelFormat.rgba8Unorm_srgb.rawValue)
         let status = wvr_compositor_publish_targets_v1(
-            foveated ? width : view0.width, foveated ? height : view0.height, view0.pixelFormat,
-            foveated ? width : view1.width, foveated ? height : view1.height, view1.pixelFormat)
+            foveated ? width : view0.width, foveated ? height : view0.height, producerFormat,
+            foveated ? width : view1.width, foveated ? height : view1.height, producerFormat)
         if status == 0 {
             wvr_guest_foveation_publish_maps_v1(
                 view0.rateMap.map { Unmanaged.passUnretained($0 as AnyObject).toOpaque() }, UInt32(view0.rateMap?.layerCount ?? 0 > 1 ? view0.slice : 0),
@@ -552,6 +710,7 @@ private final class WindowsVRCompositorRenderer {
         let encodeStartedAt = CACurrentMediaTime()
         if transferStatus.failed {
             lastEyeSnapshots.removeAll()
+            retireHeldGuestFrame()
             snapshotGeneration = 0
             snapshotTracking = nil
             snapshotRenderPose = nil
@@ -575,6 +734,10 @@ private final class WindowsVRCompositorRenderer {
                 }
                 if let reconstructionContext, wvr_reconstruction_copy_stats_v1(reconstructionContext, &text, UInt32(text.count)) != 0 {
                     LaunchLogFile.append("reconstruction", String(cString: text))
+                }
+                if adaptiveGenerationEnabled {
+                    let medianFPS = adaptiveMedianInterval.map { String(format: "%.1f", 1 / $0) } ?? "n/a"
+                    LaunchLogFile.append("adaptive-fg", "engaged=\(adaptiveEngaged) engagements=\(adaptiveEngagements) pacingLock=\(adaptivePacingLocked) medianGameFPS=\(medianFPS) generatedFrames=\(adaptiveGeneratedFrames) reprojectedFrames=\(adaptiveReprojectedFrames)")
                 }
                 if wvr_metal_copy_gpu_statistics(&text,UInt32(text.count)) != 0 {
                     LaunchLogFile.append("gpu-timing",String(cString:text))
@@ -606,6 +769,11 @@ private final class WindowsVRCompositorRenderer {
             }
         }
 
+        let adaptiveWasEngaged = adaptiveEngaged
+        let adaptiveGenerate = adaptiveFrameGenerationTick(
+            hasNewFrame: hasFrame, now: CACurrentMediaTime(),
+            forecastReliable: synthesisContext.map { wvr_synthesis_forecast_reliable_v1($0) != 0 } ?? false)
+        if adaptiveWasEngaged && !adaptiveEngaged, let synthesisContext { wvr_synthesis_reset_history_v1(synthesisContext) }
         var leftTexture: (any MTLTexture)?
         var rightTexture: (any MTLTexture)?
         var readyEvent: (any MTLSharedEvent)?
@@ -627,6 +795,9 @@ private final class WindowsVRCompositorRenderer {
                                         width: Int(acquired.rightWidth), height: Int(acquired.rightHeight))
             }
         }
+        // Every command buffer that samples this lease registers as a reader; see GuestLeaseReference.
+        let freshGuestLease = acquired.lease.map { GuestLeaseReference(lease: $0) }
+        freshGuestLease?.beginRead()
 
         var producerTargets = WVRRenderTargetInfoV1()
         producerTargets.structSize = UInt32(MemoryLayout<WVRRenderTargetInfoV1>.size)
@@ -650,23 +821,24 @@ private final class WindowsVRCompositorRenderer {
         let targets = (0..<drawable.views.count).compactMap { target(for: drawable, viewIndex: $0) }
         var sources = WindowsVRStereoPair(first: leftSource, second: rightSource)
         let isNewGuestFrame = hasFrame
+        var holdsFreshGuestFrame = false
+        var presentedHeldGuestFrame = false
         if snapshotGeneration != producerTargets.generation || !hasCurrentTargets {
             lastEyeSnapshots.removeAll()
+            retireHeldGuestFrame()
             snapshotGeneration = 0
             snapshotTracking = nil
             snapshotRenderPose = nil
         }
-        if !hasFrame, lastEyeSnapshots.count == 2,
+        if !hasFrame, hasCachedEyes,
            snapshotGeneration == producerTargets.generation {
             renderTracking = snapshotTracking
             renderPose = snapshotRenderPose
-            sources = WindowsVRStereoPair(
-                first: EyeSource(texture: lastEyeSnapshots[0], slice: 0, x: 0, y: 0,
-                    width: lastEyeSnapshots[0].width, height: lastEyeSnapshots[0].height),
-                second: EyeSource(texture: lastEyeSnapshots[1], slice: 0, x: 0, y: 0,
-                    width: lastEyeSnapshots[1].width, height: lastEyeSnapshots[1].height))
+            let cached = cachedEyeSources()
+            sources = WindowsVRStereoPair(first: cached[0], second: cached[1])
+            presentedHeldGuestFrame = heldGuestFrame != nil
         }
-        let matchesTarget = (hasFrame || lastEyeSnapshots.count == 2) && hasCurrentTargets && !drawable.views.isEmpty && drawable.views.count <= 2 &&
+        let matchesTarget = (hasFrame || hasCachedEyes) && hasCurrentTargets && !drawable.views.isEmpty && drawable.views.count <= 2 &&
             targets.count == drawable.views.count && sources.count == 2 && sources.allSatisfy { $0 != nil } && (!hasFrame || readyEvent != nil) &&
             targets.indices.allSatisfy { index in
                 guard let source = sources[index] else { return false }
@@ -678,7 +850,6 @@ private final class WindowsVRCompositorRenderer {
                        source.x <= source.texture.width && source.y <= source.texture.height &&
                        source.width <= source.texture.width - source.x &&
                        source.height <= source.texture.height - source.y &&
-                       (!consumeGuestFrame || producerFormats[index] == targets[index].pixelFormat) &&
                        UInt32(source.texture.pixelFormat.rawValue) == producerFormats[index] &&
                        source.texture.device === layerRenderer.device
             }
@@ -702,6 +873,7 @@ private final class WindowsVRCompositorRenderer {
             }
             var cachedBySynthesis = false
             var synthesisAtDisplayPose = false
+            var generatedDepths: [(any MTLTexture)?] = []
             if let synthesisContext, targets.count == 2 {
                 let commandPointer = Unmanaged.passUnretained(commandBuffer as AnyObject).toOpaque()
                 var ingestOK = !hasFrame
@@ -714,6 +886,7 @@ private final class WindowsVRCompositorRenderer {
                     return Unmanaged<AnyObject>.fromOpaque(pointer).takeRetainedValue() as? any MTLTexture
                 }
                 if hasFrame && ingestOK, let left = ownedSynthesisSource(0), let right = ownedSynthesisSource(1) {
+                    retireHeldGuestFrame()
                     lastEyeSnapshots = [left, right]
                     snapshotGeneration = producerTargets.generation
                     snapshotTracking = renderTracking
@@ -722,7 +895,7 @@ private final class WindowsVRCompositorRenderer {
                 }
                 if !ingestOK { wvr_synthesis_reset_v1(synthesisContext) }
                 var synthesisStatus: Int32 = 1
-                if ingestOK {
+                if ingestOK && (!adaptiveGenerationEnabled || hasFrame || adaptiveGenerate) {
                     let displayTime = timestampSeconds(drawable.frameTiming.presentationTime)
                     // Query as late as possible and give the system the exact same
                     // SDK-predicted anchor used to reconstruct the displayed eyes.
@@ -749,6 +922,10 @@ private final class WindowsVRCompositorRenderer {
                     }
                 }
                 if synthesisStatus == 0 {
+                    func synthesizedDepth(_ eye: UInt32) -> (any MTLTexture)? {
+                        guard let pointer = wvr_synthesis_copy_display_depth_v1(synthesisContext, eye) else { return nil }
+                        return Unmanaged<AnyObject>.fromOpaque(pointer).takeRetainedValue() as? any MTLTexture
+                    }
                     func reconstructedEye(_ eye: UInt32) -> EyeSource? {
                         guard let pointer = wvr_synthesis_copy_output_v1(synthesisContext, eye),
                               let output = Unmanaged<AnyObject>.fromOpaque(pointer).takeRetainedValue() as? any MTLTexture else { return nil }
@@ -757,24 +934,41 @@ private final class WindowsVRCompositorRenderer {
                     if let left = reconstructedEye(0), let right = reconstructedEye(1) {
                         sources = WindowsVRStereoPair(first: left, second: right)
                         synthesisAtDisplayPose = true
+                        generatedDepths = [synthesizedDepth(0), synthesizedDepth(1)]
                     }
                 }
             }
+            if adaptiveGenerationEnabled && !hasFrame {
+                if synthesisAtDisplayPose { adaptiveGeneratedFrames &+= 1 } else { adaptiveReprojectedFrames &+= 1 }
+            }
+            // Game depth applies only to a fresh guest frame presented through the reprojection
+            // path. Synthesized output is already at the display pose, so it keeps the fallback plane.
+            let frameDepthGeometry = hasFrame && !synthesisAtDisplayPose
+                ? frameMatchedDepthGeometry(acquired, generation: producerTargets.generation) : nil
             presentationPlans.removeAll(keepingCapacity: true)
             for index in targets.indices {
                 guard let source = sources[index],
                       let depth = presentationDepth(projection: (index == 0 ? projections.0 : projections.1).projection, range: drawable.depthRange) else { continue }
+                let eyeProjection = index == 0 ? projections.0 : projections.1
                 presentationPlans.append(SpatialEyePlan(source: source, target: targets[index], depth: depth,
                     reprojection: synthesisAtDisplayPose ? matrix_identity_float4x4 : reprojection(for: drawable, viewIndex: index, renderPose: renderPose,
-                                               projection: index == 0 ? projections.0 : projections.1)))
+                                               projection: eyeProjection),
+                    gameDepth: gameDepthBinding(frameDepthGeometry, eye: index, drawable: drawable,
+                                                projection: eyeProjection.projection, fallbackDepth: depth),
+                    synthesizedDepth: !hasFrame && synthesisAtDisplayPose && index < generatedDepths.count ? generatedDepths[index] : nil))
             }
             if presentationPlans.count != targets.count || !encodeSpatialPresentations(presentationPlans, on: commandBuffer) {
                 for target in targets { clear(target, on: commandBuffer) }
                 Self.log.error("Unable to encode foveated stereo presentation")
             }
             presentationPlans.removeAll(keepingCapacity: true)
+            if hasFrame, zeroCopyGuestFrames, !cachedBySynthesis, let leftSource, let rightSource, let freshGuestLease {
+                holdGuestFrame(freshGuestLease, sources: [leftSource, rightSource], generation: producerTargets.generation,
+                               tracking: renderTracking, renderPose: renderPose)
+                holdsFreshGuestFrame = true
+            }
             if hasFrame, let leftSource, let rightSource,
-               (cachedBySynthesis || cacheEyes([leftSource, rightSource], generation: producerTargets.generation,
+               (cachedBySynthesis || holdsFreshGuestFrame || cacheEyes([leftSource, rightSource], generation: producerTargets.generation,
                          tracking: renderTracking, renderPose: renderPose, on: commandBuffer)) {
                 transferCount &+= 1
                 if LaunchDiagnostics.enabled {
@@ -808,15 +1002,17 @@ private final class WindowsVRCompositorRenderer {
             _ = wvr_reconstruction_validate_v1(reconstructionContext, lease, Unmanaged.passUnretained(commandBuffer as AnyObject).toOpaque())
         }
         drawable.encodePresent(commandBuffer: commandBuffer)
-        let leaseAddress = acquired.lease.map { UInt(bitPattern: $0) }
+        // A lease not adopted as the current frame is superseded now and released after this buffer completes.
+        if !holdsFreshGuestFrame { freshGuestLease?.supersede() }
+        let readHeldGuestFrame = presentedHeldGuestFrame ? heldGuestFrame : nil
+        readHeldGuestFrame?.beginRead()
         commandBuffer.addCompletedHandler { completed in
             if let error = completed.error {
                 Self.log.error("Presentation GPU command failed: \(String(describing: error), privacy: .public)")
                 LaunchLogFile.append("compositor", "Presentation GPU command failed: \(error)")
             }
-            if let leaseAddress {
-                wvr_compositor_release_acquired_frame_v1(UnsafeMutableRawPointer(bitPattern: leaseAddress))
-            }
+            freshGuestLease?.endRead()
+            readHeldGuestFrame?.endRead()
         }
         commandBuffer.commit()
         if LaunchDiagnostics.enabled && consumeGuestFrame {
@@ -852,6 +1048,7 @@ private final class WindowsVRCompositorRenderer {
     /// actually drew can be looked at without a headset.
     private func encodeFrameProbe(_ source: EyeSource, label: String, on commandBuffer: any MTLCommandBuffer) {
         let width = source.width, height = source.height, bytesPerRow = width * 4
+        let rgba = source.texture.pixelFormat == .rgba8Unorm || source.texture.pixelFormat == .rgba8Unorm_srgb
         guard width > 0, height > 0,
               let buffer = layerRenderer.device.makeBuffer(length: bytesPerRow * height, options: .storageModeShared),
               let blit = commandBuffer.makeBlitCommandEncoder() else { return }
@@ -872,7 +1069,7 @@ private final class WindowsVRCompositorRenderer {
                 var x = 0
                 while x < width {
                     let o = y * bytesPerRow + x * 4
-                    let b = Int(bytes[o]), g = Int(bytes[o + 1]), r = Int(bytes[o + 2]), a = Int(bytes[o + 3])
+                    let b = Int(bytes[o + (rgba ? 2 : 0)]), g = Int(bytes[o + 1]), r = Int(bytes[o + (rgba ? 0 : 2)]), a = Int(bytes[o + 3])
                     let m = max(r, max(g, b))
                     if m > 8 { lit += 1 }
                     if m > 64 { bright += 1 }
@@ -889,7 +1086,7 @@ private final class WindowsVRCompositorRenderer {
                let provider = CGDataProvider(data: Data(bytes: bytes, count: bytesPerRow * height) as CFData),
                let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: bytesPerRow,
                                    space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
-                                   bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue),
+                                   bitmapInfo: CGBitmapInfo(rawValue: (rgba ? CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.noneSkipLast.rawValue : CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue)),
                                    provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent),
                let destination = CGImageDestinationCreateWithURL(documents.appendingPathComponent("\(label)-probe-\((index / 3) % 4).png") as CFURL,
                                                                   "public.png" as CFString, 1, nil) {
@@ -897,6 +1094,33 @@ private final class WindowsVRCompositorRenderer {
                 CGImageDestinationFinalize(destination)
             }
         }
+    }
+
+    private var hasCachedEyes: Bool {
+        heldGuestFrame != nil ? heldGuestSources.count == 2 : lastEyeSnapshots.count == 2
+    }
+
+    private func cachedEyeSources() -> [EyeSource] {
+        if heldGuestFrame != nil { return heldGuestSources }
+        return lastEyeSnapshots.map { EyeSource(texture: $0, slice: 0, x: 0, y: 0, width: $0.width, height: $0.height) }
+    }
+
+    /// Zero-copy: the freshly acquired lease becomes the current frame. The previous one is
+    /// superseded and released once its last reading command buffer has completed.
+    private func holdGuestFrame(_ lease: GuestLeaseReference, sources: [EyeSource], generation: UInt64,
+                                tracking: WVRFrameTrackingV1?, renderPose: WindowsVRRenderPose?) {
+        heldGuestFrame?.supersede()
+        heldGuestFrame = lease
+        heldGuestSources = sources
+        snapshotGeneration = generation
+        snapshotTracking = tracking
+        snapshotRenderPose = renderPose
+    }
+
+    private func retireHeldGuestFrame() {
+        heldGuestFrame?.supersede()
+        heldGuestFrame = nil
+        heldGuestSources.removeAll()
     }
 
     private func cacheEyes(_ sources: [EyeSource], generation: UInt64,
@@ -935,13 +1159,21 @@ private final class WindowsVRCompositorRenderer {
         return true
     }
 
-    private func spatialPipeline(for format: MTLPixelFormat, depthFormat: MTLPixelFormat, sourceIsArray: Bool) -> (any MTLRenderPipelineState)? {
-        let key = (format.rawValue << 16) | (depthFormat.rawValue << 1) | (sourceIsArray ? 1 : 0)
+    private func spatialPipeline(for format: MTLPixelFormat, depthFormat: MTLPixelFormat, sourceIsArray: Bool,
+                                 writesGameDepth: Bool = false, writesSynthesizedDepth: Bool = false) -> (any MTLRenderPipelineState)? {
+        let key = (format.rawValue << 16) | (depthFormat.rawValue << 1) | (sourceIsArray ? 1 : 0) | (writesGameDepth ? 1 << 15 : 0) | (writesSynthesizedDepth ? 1 << 14 : 0)
         if let cached = spatialPipelines[key] { return cached }
+        let fragmentName: String
+        switch (writesSynthesizedDepth, writesGameDepth, sourceIsArray) {
+        case (true, _, _): fragmentName = "wvr_spatial_synth_depth_fragment"
+        case (false, true, true): fragmentName = "wvr_spatial_array_depth_fragment"
+        case (false, true, false): fragmentName = "wvr_spatial_depth_fragment"
+        case (false, false, true): fragmentName = "wvr_spatial_array_fragment"
+        case (false, false, false): fragmentName = "wvr_spatial_fragment"
+        }
         guard let spatialLibrary,
               let vertex = spatialLibrary.makeFunction(name: "wvr_spatial_vertex"),
-              let fragment = spatialLibrary.makeFunction(
-                name: sourceIsArray ? "wvr_spatial_array_fragment" : "wvr_spatial_fragment")
+              let fragment = spatialLibrary.makeFunction(name: fragmentName)
         else { return nil }
 
         let descriptor = MTLRenderPipelineDescriptor()
@@ -970,12 +1202,25 @@ private final class WindowsVRCompositorRenderer {
                 return other.texture === target.texture && other.depthTexture === target.depthTexture &&
                     other.rateMap === target.rateMap && (layered || other.slice == target.slice)
             }
+            // A single, unrotated, full-attachment draw overwrites every colour pixel, so the clear is redundant.
+            var drawsFullAttachment = false
+            if !layered, group.nonzeroBitCount == 1 {
+                let only = plans[group.trailingZeroBitCount].target
+                if only.originX == 0 && only.originY == 0 {
+                    if let rateMap = only.rateMap {
+                        let physical = rateMap.physicalSize(layer: 0)
+                        drawsFullAttachment = Double(only.width) == Double(rateMap.screenSize.width) && Double(only.height) == Double(rateMap.screenSize.height) && physical.width == only.texture.width && physical.height == only.texture.height
+                    } else {
+                        drawsFullAttachment = Int(only.width) == only.texture.width && Int(only.height) == only.texture.height
+                    }
+                }
+            }
             let pass = MTLRenderPassDescriptor()
             pass.rasterizationRateMap = target.rateMap
             pass.renderTargetArrayLength = layered ? target.rateMap!.layerCount : 1
             pass.colorAttachments[0].texture = target.texture
             pass.colorAttachments[0].slice = layered ? 0 : target.slice
-            pass.colorAttachments[0].loadAction = .clear
+            pass.colorAttachments[0].loadAction = drawsFullAttachment ? .dontCare : .clear
             pass.colorAttachments[0].storeAction = .store
             pass.colorAttachments[0].clearColor = MTLClearColorMake(0,0,0,1)
             pass.depthAttachment.texture = target.depthTexture
@@ -988,7 +1233,9 @@ private final class WindowsVRCompositorRenderer {
             for index in plans.indices where group & (1 << index) != 0 {
                 let plan = plans[index], source = plan.source, target = plan.target
                 guard let pipeline = spatialPipeline(for: target.texture.pixelFormat, depthFormat: target.depthTexture.pixelFormat,
-                                                     sourceIsArray: source.texture.textureType == .type2DArray) else {
+                                                     sourceIsArray: source.texture.textureType == .type2DArray,
+                                                     writesGameDepth: plan.gameDepth != nil,
+                                                     writesSynthesizedDepth: plan.synthesizedDepth != nil) else {
                     encoder.endEncoding(); return false
                 }
                 encoder.setRenderPipelineState(pipeline)
@@ -1003,6 +1250,18 @@ private final class WindowsVRCompositorRenderer {
                 withUnsafeBytes(of: &region) { bytes in
                     encoder.setVertexBytes(bytes.baseAddress!, length: bytes.count, index: 0)
                     encoder.setFragmentBytes(bytes.baseAddress!, length: bytes.count, index: 0)
+                }
+                if let gameDepth = plan.gameDepth {
+                    encoder.setFragmentTexture(gameDepth.texture, index: 1)
+                    var depthUniform = gameDepth.uniform
+                    withUnsafeBytes(of: &depthUniform) { bytes in
+                        encoder.setFragmentBytes(bytes.baseAddress!, length: bytes.count, index: 1)
+                    }
+                }
+                if let synthesizedDepth = plan.synthesizedDepth {
+                    encoder.setFragmentTexture(synthesizedDepth, index: 1)
+                    var fallback = plan.depth
+                    encoder.setFragmentBytes(&fallback, length: MemoryLayout<Float>.size, index: 1)
                 }
                 encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             }
@@ -1044,6 +1303,66 @@ private final class WindowsVRCompositorRenderer {
             currentProjectionInverse: projection.inverse)
     }
 
+    private var adaptiveMedianInterval: CFTimeInterval? {
+        guard adaptiveFrameIntervals.count >= 4 else { return nil }
+        return adaptiveFrameIntervals.sorted()[adaptiveFrameIntervals.count / 2]
+    }
+
+    /// Runs once per display tick. Returns true when this tick (with no new guest frame) should present
+    /// a synthesized frame instead of plain reprojection.
+    private func adaptiveFrameGenerationTick(hasNewFrame: Bool, now: CFTimeInterval, forecastReliable: Bool) -> Bool {
+        guard adaptiveGenerationEnabled else { return false }
+        if hasNewFrame {
+            if let previous = adaptiveLastRealFrameTime {
+                let interval = now - previous
+                if interval > 0.001 && interval < 0.25 {
+                    adaptiveFrameIntervals.append(interval)
+                    if adaptiveFrameIntervals.count > 16 { adaptiveFrameIntervals.removeFirst() }
+                }
+            }
+            adaptiveLastRealFrameTime = now
+            adaptiveEmptyTicks = 0
+        } else {
+            adaptiveEmptyTicks &+= 1
+        }
+        // Engage when the median real rate stays below 85 FPS for 1 s; disengage when it stays at 88 FPS or more for 2 s.
+        if let interval = adaptiveMedianInterval {
+            let fps = 1 / interval
+            if !adaptiveEngaged {
+                if fps < 85 {
+                    let since = adaptiveBelowSince ?? now
+                    adaptiveBelowSince = since
+                    if now - since >= 1 {
+                        adaptiveEngaged = true
+                        adaptiveEngagements &+= 1
+                        adaptiveBelowSince = nil
+                    }
+                } else {
+                    adaptiveBelowSince = nil
+                }
+            } else if fps >= 88 {
+                let since = adaptiveAboveSince ?? now
+                adaptiveAboveSince = since
+                if now - since >= 2 {
+                    adaptiveEngaged = false
+                    adaptiveAboveSince = nil
+                }
+            } else {
+                adaptiveAboveSince = nil
+            }
+        }
+        // Pacing lock: a stable 40-50 FPS game puts real frames on every other display tick.
+        adaptivePacingLocked = adaptiveEngaged && adaptiveFrameIntervals.count == 16 &&
+            adaptiveFrameIntervals.allSatisfy { (0.020...0.025).contains($0) }
+        guard adaptiveEngaged, !hasNewFrame, forecastReliable,
+              let interval = adaptiveMedianInterval, let lastReal = adaptiveLastRealFrameTime else { return false }
+        // Horizon clamp: extrapolate at most one real frame interval. Beyond that the game is stalled.
+        guard now - lastReal <= interval else { return false }
+        // Generated frames take the odd empty ticks while pacing is locked.
+        if adaptivePacingLocked && adaptiveEmptyTicks % 2 == 0 { return false }
+        return true
+    }
+
     private func presentationDepth(projection: simd_float4x4, range: SIMD2<Float>) -> Float? {
         // Like ALVR's color-only video plane, keep synthetic depth far away.
         // A one-metre plane causes system positional reprojection to drag the
@@ -1054,6 +1373,67 @@ private final class WindowsVRCompositorRenderer {
         let clip = projection * SIMD4<Float>(0, 0, -distance, 1)
         let depth = clip.z / clip.w
         return depth.isFinite && depth > 0 && depth <= 1 ? depth : nil
+    }
+
+    /// The game's depth for a fresh lease, accepted only when it belongs to that exact frame and target generation.
+    private func frameMatchedDepthGeometry(_ acquired: WVRAcquiredStereoFrameV2, generation: UInt64) -> WVRReconstructionSubmitV1? {
+        guard let lease = acquired.lease else { return nil }
+        var geometry = WVRReconstructionSubmitV1()
+        geometry.abiVersion = UInt32(WVR_RECONSTRUCTION_ABI)
+        geometry.structSize = UInt32(MemoryLayout<WVRReconstructionSubmitV1>.size)
+        guard wvr_compositor_copy_reconstruction_v1(lease, &geometry) == 0,
+              geometry.frameID == acquired.producerFrameID,
+              geometry.targetGeneration == generation else { return nil }
+        return geometry
+    }
+
+    /// Builds the presentation-pass depth binding for one eye. Returns nil (fallback plane) whenever
+    /// the game depth, the display anchor or the matrices are unavailable or unusable.
+    private func gameDepthBinding(_ geometry: WVRReconstructionSubmitV1?, eye: Int, drawable: LayerRenderer.Drawable,
+                                  projection: simd_float4x4, fallbackDepth: Float) -> GameDepthBinding? {
+        guard let geometry, drawable.views.indices.contains(eye), let anchor = drawable.deviceAnchor else { return nil }
+        let eyeGeometry = eye == 0 ? geometry.eyes.0 : geometry.eyes.1
+        guard let pointer = UnsafeMutableRawPointer(bitPattern: UInt(eyeGeometry.depthTexture)),
+              let depthTexture = Unmanaged<AnyObject>.fromOpaque(pointer).takeUnretainedValue() as? any MTLTexture,
+              depthTexture.device === layerRenderer.device,
+              depthTexture.pixelFormat == .depth32Float, depthTexture.sampleCount == 1,
+              eyeGeometry.depthWidth > 0, eyeGeometry.depthHeight > 0,
+              Int(eyeGeometry.depthX) + Int(eyeGeometry.depthWidth) <= depthTexture.width,
+              Int(eyeGeometry.depthY) + Int(eyeGeometry.depthHeight) <= depthTexture.height,
+              let depthView = Self.depthSliceView(depthTexture, slice: Int(eyeGeometry.depthSlice)),
+              eyeGeometry.maxDepth != eyeGeometry.minDepth
+        else { return nil }
+        let sourceProjection = WindowsVRPresentationMath.matrix(from: eyeGeometry.projection)
+        let sourceOriginFromEye = WindowsVRPresentationMath.matrix(from: eyeGeometry.originFromEye)
+        let destinationOriginFromEye = anchor.originFromAnchorTransform * drawable.views[eye].transform
+        let sourceDeterminant = simd_determinant(sourceProjection)
+        let destinationDeterminant = simd_determinant(destinationOriginFromEye)
+        guard sourceDeterminant.isFinite, sourceDeterminant != 0,
+              destinationDeterminant.isFinite, destinationDeterminant != 0,
+              projection.columns.0.x.isFinite, projection.columns.1.y.isFinite else { return nil }
+        let uniform = WVRSpatialDepthUniform(
+            sourceInverseProjection: sourceProjection.inverse,
+            destFromSourceEye: destinationOriginFromEye.inverse * sourceOriginFromEye,
+            destProjection: projection,
+            depthOrigin: SIMD2<UInt32>(eyeGeometry.depthX, eyeGeometry.depthY),
+            depthSize: SIMD2<UInt32>(eyeGeometry.depthWidth, eyeGeometry.depthHeight),
+            range: SIMD2<Float>(eyeGeometry.minDepth, eyeGeometry.maxDepth),
+            fallbackDepth: fallbackDepth,
+            padding: 0)
+        return GameDepthBinding(texture: depthView, uniform: uniform)
+    }
+
+    private static func depthSliceView(_ texture: any MTLTexture, slice: Int) -> (any MTLTexture)? {
+        switch texture.textureType {
+        case .type2D:
+            return slice == 0 ? texture : nil
+        case .type2DArray:
+            guard slice >= 0, slice < texture.arrayLength else { return nil }
+            return texture.makeTextureView(pixelFormat: texture.pixelFormat, textureType: .type2D,
+                                           levels: 0..<1, slices: slice..<(slice + 1))
+        default:
+            return nil
+        }
     }
 
     private static func writeMatrix(_ matrix: simd_float4x4, to output: UnsafeMutablePointer<Float>) {
@@ -1087,6 +1467,46 @@ private struct EyeSource {
     let height: Int
 }
 
+/// Counts command buffers reading a guest lease. A superseded lease is released once its
+/// last reader has completed, so a reusable guest image is never handed back while GPU work
+/// still samples it.
+@available(visionOS 1.0, *)
+private final class GuestLeaseReference: @unchecked Sendable {
+    private let lease: UnsafeMutableRawPointer
+    private let lock = NSLock()
+    private var readers = 0
+    private var superseded = false
+    private var released = false
+
+    init(lease: UnsafeMutableRawPointer) {
+        self.lease = lease
+    }
+
+    func beginRead() {
+        lock.lock()
+        readers += 1
+        lock.unlock()
+    }
+
+    func endRead() {
+        lock.lock()
+        readers -= 1
+        let shouldRelease = superseded && readers == 0 && !released
+        if shouldRelease { released = true }
+        lock.unlock()
+        if shouldRelease { wvr_compositor_release_acquired_frame_v1(lease) }
+    }
+
+    func supersede() {
+        lock.lock()
+        superseded = true
+        let shouldRelease = readers == 0 && !released
+        if shouldRelease { released = true }
+        lock.unlock()
+        if shouldRelease { wvr_compositor_release_acquired_frame_v1(lease) }
+    }
+}
+
 private struct WVRSpatialSourceUniform {
     var origin: SIMD2<Float>
     var extent: SIMD2<Float>
@@ -1097,9 +1517,28 @@ private struct WVRSpatialSourceUniform {
     var sourceFromDestinationClip: simd_float4x4
 }
 
+/// Layout must match `WVRSpatialDepthUniform` in the spatial shader source (224 bytes).
+private struct WVRSpatialDepthUniform {
+    var sourceInverseProjection: simd_float4x4
+    var destFromSourceEye: simd_float4x4
+    var destProjection: simd_float4x4
+    var depthOrigin: SIMD2<UInt32>
+    var depthSize: SIMD2<UInt32>
+    var range: SIMD2<Float>
+    var fallbackDepth: Float
+    var padding: UInt32
+}
+
+private struct GameDepthBinding {
+    let texture: any MTLTexture
+    let uniform: WVRSpatialDepthUniform
+}
+
 private struct SpatialEyePlan {
     let source: EyeSource
     let target: EyeTarget
     let depth: Float
     let reprojection: simd_float4x4
+    let gameDepth: GameDepthBinding?
+    var synthesizedDepth: (any MTLTexture)? = nil
 }

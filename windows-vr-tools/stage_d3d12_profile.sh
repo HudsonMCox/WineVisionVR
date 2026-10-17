@@ -56,12 +56,17 @@ required={
  "windows-vr-openxr/patches/0019-dxmt-foveation-handshake-retry.patch",
  "windows-vr-openxr/patches/0020-dxmt-cooperative-query-polling.patch",
  "windows-vr-openxr/patches/0021-dxmt-notified-query-progress.patch", "windows-vr-openxr/patches/0022-dxmt-batched-uniform-bindings.patch", "windows-vr-openxr/patches/0023-dxmt-progress-retry-contract.patch",
+ "windows-vr-openxr/patches/0024-dxmt-explicit-scene-depth.patch",
+ "windows-vr-native/include/WindowsVRReconstruction.h",
  "windows-vr-openxr/include/WindowsVRD3D11ContextExt.h","windows-vr-openxr/include/WindowsVRD3D12CommandQueueExt.h","windows-vr-openxr/include/WindowsVRWMTBridge.h",
  "windows-vr-native/include/WindowsVRCompositorBridge.h","windows-vr-native/include/WindowsVRGuestFoveation.h","windows-vr-ngx/src/WVRMetalFXWMTBridge.h","windows-vr-ngx/src/WVRMetalFXWMTBridge.inc","windows-vr-ngx/include/WindowsVRNGX.h",
  "windows-vr-metal/Sources/WindowsVRMetalABI/include/WindowsVRMetalC.h","windows-runtime-plugin/WindowsVRRuntimePlugin.mm","native-d3d12/wvr_dxmt_d3d12_native_abi.h","windows-vr-openxr/native-d3d12/generate_metallib_platform.py","windows-vr-openxr/src/WindowsVROpenXR.cpp","windows-vr-openxr/CMakeLists.txt","windows-vr-openvr/patches/0002-direct3d-openxr-build.patch","windows-vr-openvr/CMakeLists.txt","windows-vr-native/Sources/WindowsVRCompositorBridge.mm","windows-vr-tools/sources.lock.json","windows-vr-tools/llvm.lock.json",
  "windows-vr-tools/prepare_d3d12_experimental_source.sh","windows-vr-tools/prepare_d3d12_profile.sh","windows-vr-tools/build_d3d12_experimental.sh","windows-vr-tools/build_d3d12_profile.sh","windows-vr-tools/stage_d3d12_experimental.sh","windows-vr-tools/stage_d3d12_profile.sh","windows-vr-tools/stage_resources.py"
 }
-if set(inputs) != required: fail("Source profile does not record the complete D3D12 integration input set.")
+if set(inputs) != required:
+    missing = sorted(required - set(inputs))
+    unexpected = sorted(set(inputs) - required)
+    fail(f"Source profile does not record the complete D3D12 integration input set; missing={missing}, unexpected={unexpected}.")
 for name,expected in inputs.items():
     if sha(root/name) != expected: fail(f"D3D12 source input changed after preparation: {name}")
 

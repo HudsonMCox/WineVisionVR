@@ -1,0 +1,228 @@
+diff --git a/FEX/Source/Windows/ARM64EC/Module.cpp b/FEX/Source/Windows/ARM64EC/Module.cpp
+index e47b282..b3c9439 100644
+--- a/FEX/Source/Windows/ARM64EC/Module.cpp
++++ b/FEX/Source/Windows/ARM64EC/Module.cpp
+@@ -52,6 +52,7 @@ $end_info$
+ #include <cstdint>
+ #include <cstdio>
+ #include <type_traits>
++#include <algorithm>
+ #include <atomic>
+ #include <mutex>
+ #include <optional>
+@@ -1474,6 +1475,109 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After,
+   }
+ }
+ 
++/* iOS-Madeira ml715: DEFERRED ImageTracker HALF OF NotifyImageMap.
++ *
++ * NotifyImageMap() can only register InvalidationTracker intervals (see its comment), so a
++ * module reaching FEX solely through that fallback never got ImageTracker processing:
++ * volatile metadata, ForceTSO metadata and code-cache image info were all missing, and
++ * every access in it paid full TSO emulation. NotifyImageMap therefore queues {base, path}
++ * here and DrainDeferredImageMaps() runs ImageTracker::HandleImageMap() later, from a
++ * callback that is NOT inside translated code.
++ *
++ * Why the drain is safe where NotifyImageMap is not: ImageTracker::HandleImageMap takes
++ * CodeInvalidationMutex EXCLUSIVE, which self-deadlocks if this thread holds it SHARED.
++ * Every shared acquisition (WritePriorityMutex::NoteReadAcquired) bumps a per-thread depth
++ * in TEB Instrumentation[7], and NotifyReadFile's exclusive pair sets Instrumentation[9],
++ * so the drain checks both and simply leaves the queue untouched when either is set --
++ * the hold is PROVEN absent at the point of use, not assumed. Drain points are the
++ * callbacks that already take ThreadCreationMutex and invalidate under the exclusive lock
++ * (NotifyMapViewOfSection, the instruction-cache flush/dirty callbacks) plus ThreadInit,
++ * which runs before the thread executes any translated code.
++ *
++ * Blocks compiled for the module before its metadata arrived keep full TSO (correct, just
++ * slower), so after applying metadata the module range is invalidated through the same
++ * InvalidateAlignedInterval used by the flush callbacks, letting it recompile with metadata.
++ *
++ * Fast path when nothing is pending: one relaxed atomic load. */
++struct DeferredImageMap {
++  uint64_t Address;
++  fextl::string ModulePath;
++};
++constexpr size_t MaxDeferredImageMaps = 64;
++std::mutex DeferredImageMapsLock;
++fextl::vector<DeferredImageMap> DeferredImageMaps;
++std::atomic<uint32_t> DeferredImageMapCount {0};
++
++void QueueDeferredImageMap(uint64_t Address, fextl::string ModulePath) {
++  if (ImageTracker && ImageTracker->IsImageTracked(Address)) {
++    return;
++  }
++
++  std::scoped_lock Lock(DeferredImageMapsLock);
++  for (const auto& Entry : DeferredImageMaps) {
++    if (Entry.Address == Address) {
++      return;
++    }
++  }
++  if (DeferredImageMaps.size() >= MaxDeferredImageMaps) {
++    static std::atomic<uint32_t> OverflowCount {0};
++    if (++OverflowCount <= 8) {
++      LogMan::Msg::EFmt("[img-map] ml715 deferred queue full, dropping base={:X} {}", Address, ModulePath);
++    }
++    return;
++  }
++  DeferredImageMaps.push_back({Address, std::move(ModulePath)});
++  DeferredImageMapCount.store(static_cast<uint32_t>(DeferredImageMaps.size()), std::memory_order_release);
++}
++
++// Caller holds ThreadCreationMutex. An unmapped image must never be processed later.
++void DropDeferredImageMaps(uint64_t Start, uint64_t Size) {
++  if (!DeferredImageMapCount.load(std::memory_order_relaxed)) {
++    return;
++  }
++
++  std::scoped_lock Lock(DeferredImageMapsLock);
++  std::erase_if(DeferredImageMaps, [&](const DeferredImageMap& Entry) { return Entry.Address >= Start && Entry.Address < Start + Size; });
++  DeferredImageMapCount.store(static_cast<uint32_t>(DeferredImageMaps.size()), std::memory_order_release);
++}
++
++bool ThreadMayHoldCodeInvalidationLock() {
++  const auto Teb = reinterpret_cast<uintptr_t>(NtCurrentTeb());
++  const uint32_t SharedDepth = *reinterpret_cast<volatile uint32_t*>(Teb + 0x16f0); // WritePriorityMutex shared-hold depth
++  const bool InLockedRWXRead = *reinterpret_cast<volatile bool*>(Teb + 0x1700);     // BTCpu64NotifyReadFile exclusive pair
++  return SharedDepth != 0 || InLockedRWXRead;
++}
++
++// Caller holds ThreadCreationMutex.
++void DrainDeferredImageMaps() {
++  if (!DeferredImageMapCount.load(std::memory_order_relaxed)) {
++    return;
++  }
++  if (!ContextCallbacksActive() || !InvalidationTracker || !ImageTracker || ThreadMayHoldCodeInvalidationLock()) {
++    return;
++  }
++
++  fextl::vector<DeferredImageMap> Pending;
++  {
++    std::scoped_lock Lock(DeferredImageMapsLock);
++    Pending.swap(DeferredImageMaps);
++    DeferredImageMapCount.store(0, std::memory_order_release);
++  }
++
++  static std::atomic<uint32_t> Count {0};
++  for (const auto& Entry : Pending) {
++    const auto Section = ImageTracker->HandleImageMap(Entry.ModulePath, Entry.Address, false);
++    if (GetCPUArea().ThreadState() && Section.EndVA > Section.BeginVA) {
++      InvalidationTracker->InvalidateAlignedInterval(Section.BeginVA, Section.EndVA - Section.BeginVA, false);
++    }
++
++    const auto N = ++Count;
++    if (N <= 64) {
++      LogMan::Msg::EFmt("[img-map] ml715 #{} deferred ImageTracker {} base={:X}", N, FEX::Windows::BaseName(Entry.ModulePath), Entry.Address);
++    }
++  }
++}
++
+ /* iOS-Madeira ml710: LOADER-SAFE EXECUTABLE-INTERVAL REGISTRATION.
+  *
+  * This is a FALLBACK, not a second full registration path. It exists because in a child
+@@ -1496,12 +1600,11 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After,
+  *
+  * So this touches ONLY InvalidationTracker, which takes just its own IntervalsLock.
+  *
+- * WHAT THIS DOES NOT DO, and why that is still a gap: ImageTracker owns image relocation
+- * and code-cache information plus extended volatile/ForceTSO metadata. Skipping it keeps
+- * execution correct -- the intervals are what gate decoding -- but leaves that metadata
+- * incomplete for any module whose syscall notification was genuinely missed. The durable
+- * fix is to repair the pseudo-process notification gate, or to defer the ImageTracker half
+- * to a dispatcher point where no shared code-invalidation hold exists. Neither is done.
++ * The ImageTracker half (image relocation and code-cache information plus extended
++ * volatile/ForceTSO metadata) is not done here: it is queued by QueueDeferredImageMap()
++ * and applied by DrainDeferredImageMaps() at a point proven to hold no shared
++ * code-invalidation lock (ml715, above). Until then execution stays correct -- the
++ * intervals are what gate decoding -- just with full TSO for that module.
+  *
+  * Idempotent: re-registering the same intervals is harmless, and the syscall path still
+  * fires for the same module whenever its gate does let it through. */
+@@ -1516,9 +1619,10 @@ extern "C" void NotifyImageMap(void* Address) {
+   fextl::string ModulePath = FEX::Windows::GetSectionFilePath(reinterpret_cast<uint64_t>(Address));
+   fextl::string ModuleName = fextl::string {FEX::Windows::BaseName(ModulePath)};
+   InvalidationTracker->HandleImageMap(ModuleName, reinterpret_cast<uint64_t>(Address));
++  QueueDeferredImageMap(reinterpret_cast<uint64_t>(Address), std::move(ModulePath));
+ 
+   if (N <= 64) {
+-    LogMan::Msg::EFmt("[img-map] ml710 #{} intervals-only {} base={}", N, ModuleName, Address);
++    LogMan::Msg::EFmt("[img-map] ml710 #{} intervals-only (ImageTracker deferred) {} base={}", N, ModuleName, Address);
+   }
+ }
+ 
+@@ -1548,6 +1652,7 @@ NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Si
+ 
+   {
+     std::scoped_lock Lock(ThreadCreationMutex);
++    DrainDeferredImageMaps();
+     HandleImageMap(reinterpret_cast<uint64_t>(Address));
+   }
+ 
+@@ -1564,6 +1669,7 @@ void NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status) {
+     ThreadCreationMutex.lock();
+     auto [Start, Size] = InvalidationTracker->InvalidateContainingSection(reinterpret_cast<uint64_t>(Address), true);
+     if (Size) {
++      DropDeferredImageMaps(Start, Size);
+       HandleImageUnmap(Start, Size);
+     }
+   } else {
+@@ -1577,6 +1683,7 @@ void FlushInstructionCacheHeavy(const void* Address, SIZE_T Size) {
+   }
+ 
+   std::scoped_lock Lock(ThreadCreationMutex);
++  DrainDeferredImageMaps();
+   InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+ }
+ 
+@@ -1586,6 +1693,7 @@ void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
+   }
+ 
+   std::scoped_lock Lock(ThreadCreationMutex);
++  DrainDeferredImageMaps();
+   InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+ }
+ 
+@@ -1595,6 +1703,7 @@ void BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size) {
+   }
+ 
+   std::scoped_lock Lock(ThreadCreationMutex);
++  DrainDeferredImageMaps();
+   InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+ }
+ 
+@@ -1806,6 +1915,7 @@ NTSTATUS ThreadInit() {
+   }
+ #endif
+   std::scoped_lock Lock(ThreadCreationMutex);
++  DrainDeferredImageMaps(); // New thread: no translated code yet, so no shared code-invalidation hold.
+ #ifdef FEX_IOS_HOST
+   IosTiLog("[FEX-iOS] TI:lock\n");
+ #endif
+diff --git a/FEX/Source/Windows/Common/ImageTracker.cpp b/FEX/Source/Windows/Common/ImageTracker.cpp
+index 1a4d9b9..cb19f22 100644
+--- a/FEX/Source/Windows/Common/ImageTracker.cpp
++++ b/FEX/Source/Windows/Common/ImageTracker.cpp
+@@ -217,6 +217,11 @@ void ImageTracker::HandleImageUnmap(uint64_t Address, uint64_t Size) {
+   MappedImages.erase(Address);
+ }
+ 
++bool ImageTracker::IsImageTracked(uint64_t Address) {
++  std::shared_lock Lk {ImagesLock};
++  return MappedImages.contains(Address);
++}
++
+ std::optional<FEXCore::ExecutableFileSectionInfo> ImageTracker::LookupExecutableFileSection(uint64_t Address) {
+   std::shared_lock Lk {ImagesLock};
+   auto It = MappedImages.upper_bound(Address);
+diff --git a/FEX/Source/Windows/Common/ImageTracker.h b/FEX/Source/Windows/Common/ImageTracker.h
+index 4c016a2..228c87e 100644
+--- a/FEX/Source/Windows/Common/ImageTracker.h
++++ b/FEX/Source/Windows/Common/ImageTracker.h
+@@ -41,6 +41,7 @@ public:
+   ImageTracker(FEXCore::Context::Context& CTX, bool IsGeneratingCache);
+   FEXCore::ExecutableFileSectionInfo HandleImageMap(std::string_view Path, uint64_t Address, bool MainImage);
+   void HandleImageUnmap(uint64_t Address, uint64_t Size);
++  bool IsImageTracked(uint64_t Address);
+ 
+   std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(uint64_t Address);
+ 

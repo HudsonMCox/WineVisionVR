@@ -5,6 +5,8 @@
 // Old native handlers reject this version; callers then render uniformly.
 #define WVR_GUEST_FOVEATION_ABI 0x57564631u
 #define WVR_GUEST_FOVEATION_SAFE_SHADER 1u
+// Version 496 appends arrayLength. Legacy 492-byte requests are single-layer.
+#define WVR_GUEST_FOVEATION_PASS_V1_LEGACY_SIZE 492u
 #pragma pack(push, 4)
 typedef struct WVRGuestFoveationAttachmentV1 {
   uint64_t texture;
@@ -29,10 +31,12 @@ typedef struct WVRGuestFoveationPassV1 {
   uint32_t stencilSlice, stencilLoad, stencilClear;
   uint32_t depthStencilReadOnlyMask;
   uint32_t drawCalls;
+  // Operation 1 only: 1 for a single slice, 2 for a layered stereo pair.
+  uint32_t arrayLength;
 } WVRGuestFoveationPassV1;
 #pragma pack(pop)
 #ifdef __cplusplus
-static_assert(sizeof(WVRGuestFoveationPassV1) == 492);
+static_assert(sizeof(WVRGuestFoveationPassV1) == 496);
 extern "C" {
 #endif
 int wvr_guest_foveation_install_v1(void);

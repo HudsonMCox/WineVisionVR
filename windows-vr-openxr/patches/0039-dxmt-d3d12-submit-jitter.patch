@@ -1,0 +1,95 @@
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 0a8d268..731519d 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -42,7 +42,7 @@ const GUID kD3D12CommandQueueDownlevelUUID = {
+     0x38a8c5ef, 0x7ccb, 0x4e81, {0x91, 0x4f, 0xa6, 0xe9, 0xd0, 0x72, 0xc4, 0x94}
+ };
+ 
+-class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, IMTLSwapChainFactory, IMTLD3D12CommandQueueExt> {
++class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, IMTLSwapChainFactory, IMTLD3D12CommandQueueExt, IMTLD3D12CommandQueueExt2> {
+ 
+   D3D12_COMMAND_QUEUE_DESC desc_;
+ 
+@@ -184,6 +184,13 @@ public:
+       return S_OK;
+     }
+ 
++    if (riid == kWVRD3D12CommandQueueExt2IID) {
++      if (desc_.Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
++        return E_NOINTERFACE;
++      *ppvObject = ref_and_cast<IMTLD3D12CommandQueueExt2>(this);
++      return S_OK;
++    }
++
+     if (riid == __uuidof(IMTLSwapChainFactory)) {
+       *ppvObject = ref_and_cast<IMTLSwapChainFactory>(this);
+       return S_OK;
+@@ -288,6 +295,35 @@ public:
+   }
+ 
+   HRESULT STDMETHODCALLTYPE SubmitWindowsVRFrame(const WVRDXMTD3D12SubmitFrameV1 *frame) final {
++    if (!frame)
++      return E_INVALIDARG;
++    // V1 has no jitter fields, so it is submitted with the jitter flags cleared
++    WVRDXMTD3D12SubmitFrameV2 v2{};
++    v2.left = frame->left;
++    v2.right = frame->right;
++    v2.targetGeneration = frame->targetGeneration;
++    v2.frameID = frame->frameID;
++    v2.timestampNanoseconds = frame->timestampNanoseconds;
++    v2.leftArraySlice = frame->leftArraySlice;
++    v2.leftX = frame->leftX;
++    v2.leftY = frame->leftY;
++    v2.leftWidth = frame->leftWidth;
++    v2.leftHeight = frame->leftHeight;
++    v2.rightArraySlice = frame->rightArraySlice;
++    v2.rightX = frame->rightX;
++    v2.rightY = frame->rightY;
++    v2.rightWidth = frame->rightWidth;
++    v2.rightHeight = frame->rightHeight;
++    return SubmitWindowsVRFrameCommon(&v2);
++  }
++
++  HRESULT STDMETHODCALLTYPE SubmitWindowsVRFrameV2(const WVRDXMTD3D12SubmitFrameV2 *frame) final {
++    if (!frame)
++      return E_INVALIDARG;
++    return SubmitWindowsVRFrameCommon(frame);
++  }
++
++  HRESULT SubmitWindowsVRFrameCommon(const WVRDXMTD3D12SubmitFrameV2 *frame) {
+     if (!frame || !frame->left || !frame->right || frame->left == frame->right || !frame->targetGeneration)
+       return E_INVALIDARG;
+ 
+@@ -350,8 +386,9 @@ public:
+     const uint64_t producer_value = windows_vr_producer_value_.fetch_add(1, std::memory_order_relaxed) + 1;
+     cmdbuf.encodeSignalEvent(windows_vr_producer_event_, producer_value);
+ 
+-    WMTWindowsVRRequestV2 request{};
+-    request.abiVersion = WVR_COMPOSITOR_ABI_VERSION_V2;
++    // V3 is always sent from this path, matching the D3D11 submit; it carries the jitter and render-source fields
++    WMTWindowsVRRequestV3 request{};
++    request.abiVersion = WMT_WINDOWSVR_REQUEST_ABI_V3;
+     request.structSize = sizeof(request);
+     request.status = WVRCompositorStatusInvalidArgument;
+     request.commandBuffer = cmdbuf.handle;
+@@ -372,7 +409,18 @@ public:
+     request.rightY = frame->rightY;
+     request.rightWidth = frame->rightWidth;
+     request.rightHeight = frame->rightHeight;
+-    const int32_t bridge_status = WMTWindowsVRBridgeCallV2(&request);
++    if (frame->jitterFlags & WVRDXMTJitterValid) {
++      request.jitterFlags = WMT_WINDOWSVR_JITTER_VALID;
++      request.jitterPixelX = frame->jitterPixelX;
++      request.jitterPixelY = frame->jitterPixelY;
++      request.jitterNdcX = frame->jitterNdcX;
++      request.jitterNdcY = frame->jitterNdcY;
++    }
++    // Eye rects below the producer targets mean the guest renders a scaled source image.
++    if (request.leftWidth < targets.width[0] || request.leftHeight < targets.height[0] ||
++        request.rightWidth < targets.width[1] || request.rightHeight < targets.height[1])
++      request.renderFlags = WMT_WINDOWSVR_RENDER_SOURCE_SCALED;
++    const int32_t bridge_status = WMTWindowsVRBridgeCallV3(&request);
+     if (bridge_status != WVRCompositorStatusOK)
+       return bridge_status == WVRCompositorStatusNoFrameAvailable ? S_FALSE : E_FAIL;
+     if (!request.consumerEvent || !request.compositorTicket) {

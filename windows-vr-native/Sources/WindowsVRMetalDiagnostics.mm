@@ -214,7 +214,9 @@ static void Write64(uint8_t *bytes, uint64_t value) {
 // The prebuilt DXMT writer labels Metal 3.2/AIR 2.7 shaders as 3.1/2.6.
 // Its generator target must also be repaired to xros2.0 (see the prebuilt
 // repair script). Xros's raw BC payload also needs the Darwin bitcode wrapper
-// emitted by Apple's linker. Preserve the IR bytes and update container sizes
+// emitted by Apple's linker. The local legacy writer already targets xros2;
+// both known xros1/xros2 inputs need this same container correction. Preserve
+// the IR bytes and update container sizes
 // and hashes to describe the wrapped payload.
 static dispatch_data_t CorrectContainerVersions(dispatch_data_t input) {
     const void *mappedBytes = nullptr;
@@ -223,7 +225,8 @@ static dispatch_data_t CorrectContainerVersions(dispatch_data_t input) {
     if (!mapped || !mappedBytes || size < 96 || size > 8 * 1024 * 1024) return input;
     const uint8_t *bytes = (const uint8_t *)mappedBytes;
     if (memcmp(bytes, "MTLB", 4) || Read16(bytes + 4) != 1 || bytes[11] != 0x8b ||
-        Read16(bytes + 6) != 2 || Read16(bytes + 8) != 7 || Read16(bytes + 12) != 1 ||
+        Read16(bytes + 6) != 2 || Read16(bytes + 8) != 7 ||
+        (Read16(bytes + 12) != 1 && Read16(bytes + 12) != 2) ||
         Read64(bytes + 16) != size) return input;
     uint64_t offset = Read64(bytes + 24), sectionSize = Read64(bytes + 32);
     uint64_t bitcodeOffset = Read64(bytes + 72), bitcodeSize = Read64(bytes + 80);

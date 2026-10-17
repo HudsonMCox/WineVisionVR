@@ -1,0 +1,114 @@
+--- a/scripts/stubs/codegen.py
++++ b/scripts/stubs/codegen.py
+@@ -7,6 +7,51 @@
+ cflag_spec = re.compile(r"\[(?P<name>\w+)\]\s*=\s*(?P<value>.*)")
+ 
+ 
++# These OpenVR POD returns use a hidden result pointer on Windows x64.
++# MSVC member calls put this in RCX and result in RDX; MinGW reverses them.
++_MS_SRET_TYPES = {"HmdMatrix34_t", "HmdMatrix44_t", "DistortionCoordinates_t",
++                  "HiddenAreaMesh_t", "HmdColor_t"}
++
++
++def _ms_sret_functions(iface):
++    return [(n, f) for n, f in enumerate(iface.functions)
++            if f.return_type.split("::")[-1] in _MS_SRET_TYPES]
++
++
++def _write_msabi_thunks(fi, ver):
++    functions = _ms_sret_functions(ver)
++    if not functions:
++        return
++    cname = ver.proxy_class_name()
++    fi.write("#if defined(__MINGW32__) && defined(__x86_64__)\n")
++    for n, f in functions:
++        args = (", " + f.args_str()) if f.args_str() else ""
++        fi.write(f"static {f.return_type} *msabi_{cname}_{n}({cname} *self, {f.return_type} *result{args}) {{\n"
++                 f"  static_assert(sizeof({f.return_type}) > 8, \"Expected an indirect Windows x64 return\");\n"
++                 f"  *result = self->{cname}::{f.name}({f.args_names()});\n"
++                 "  return result;\n}\n")
++    fi.write(f"void {cname}::_PrepareMSABI() {{\n"
++             "  if (_nativeVTable) return;\n"
++             "  void **original = *reinterpret_cast<void***>(this);\n"
++             "  _nativeVTable = original;\n"
++             f"  for (unsigned n = 0; n < {len(ver.functions)}; ++n) _msVTable[n] = original[n];\n")
++    for n, f in functions:
++        fi.write(f"  _msVTable[{n}] = reinterpret_cast<void*>(&msabi_{cname}_{n});\n")
++    fi.write("  *reinterpret_cast<void***>(this) = _msVTable;\n}\n#endif\n")
++
++
++def _write_deleter(fi, ver):
++    cname = ver.proxy_class_name()
++    fi.write(f"void {cname}::Delete() {{\n")
++    if _ms_sret_functions(ver):
++        fi.write("#if defined(__MINGW32__) && defined(__x86_64__)\n"
++                 "  // delete uses the complete derived vtable, including its destructor.\n"
++                 "  // The outward table intentionally contains only OpenVR API slots.\n"
++                 "  if (_nativeVTable) *reinterpret_cast<void***>(this) = _nativeVTable;\n"
++                 "#endif\n")
++    fi.write("  delete this;\n}\n")
++
++
+ def write_header(filename, iface):
+     header = open(filename, "w", newline='\n')
+     header.write("#pragma once\n")
+@@ -43,6 +88,13 @@
+     for func in iface.functions:
+         fi.write(f"\t{func.return_type} {func.name}({func.args_str()}) override;\n")
+ 
++    if _ms_sret_functions(iface):
++        fi.write("#if defined(__MINGW32__) && defined(__x86_64__)\n"
++                 "  void _PrepareMSABI() override;\n"
++                 "private:\n"
++                 "  void **_nativeVTable = nullptr;\n"
++                 f"  void *_msVTable[{len(iface.functions)}];\n"
++                 "#endif\n")
+     fi.write("};\n")
+ 
+ 
+@@ -109,11 +161,13 @@
+                      f"\t\tOOVR_LOG(\"Entered function (from interface {ver.namespace()})\");\n"
+                      f"\t{return_str} base->{f.name}({nargs});\n}}\n")
+ 
++        _write_msabi_thunks(fi, ver)
++
+         # Generate the fntable
+         _build_fntable(fi, ver)
+ 
+         # Generate the deleter (see BaseCommon.h for the rationale here)
+-        fi.write(f"void {cname}::Delete() {{ delete this; }}\n")
++        _write_deleter(fi, ver)
+ 
+ 
+ def _build_fntable(fi, ver: InterfaceDef):
+@@ -128,7 +182,7 @@
+ 
+     # Generate the stub functions
+     for func in ver.functions:
+-        call_stmt = f"return {inst_name}->{func.name}({func.args_names()});"
++        call_stmt = f"return {inst_name}->{cname}::{func.name}({func.args_names()});"
+ 
+         fi.write(
+             f"static {func.return_type} OPENVR_FNTABLE_CALLTYPE {func_name_template % func.name}({func.args_str()}) {{ {call_stmt} }}\n")
+--- a/OpenOVR/BaseCommon.h
++++ b/OpenOVR/BaseCommon.h
+@@ -15,6 +15,9 @@
+ 
+ 	virtual void** _GetStatFuncList() = 0;
+ 
++	// Prepare only the outward OpenVR vtable; CVRCommon stays native.
++	virtual void _PrepareMSABI() {}
++
+ 	// Given an object which implements CVRCommon as it's not-first interface, the compiler (or at least GCC) can't
+ 	// figure out where the real vtable is with our InheritCVRLayout. It can do virtual function calls just fine for
+ 	// whatever reasons, so use that to implement a deletor.
+--- a/OCOVR/openvr_api.cpp
++++ b/OCOVR/openvr_api.cpp
+@@ -123,6 +123,7 @@
+ 
+ 	CVRCorrectLayout* impl = (CVRCorrectLayout*)CreateInterfaceByName(interfaceVersion);
+ 	if (impl) {
++		impl->_PrepareMSABI();
+ 		correct_layout_unique ptr(impl, [](CVRCorrectLayout* cl) {
+ 			cl->Delete();
+ 		});

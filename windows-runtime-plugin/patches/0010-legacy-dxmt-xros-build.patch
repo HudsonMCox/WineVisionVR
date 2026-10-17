@@ -1,0 +1,439 @@
+diff --git a/dxmt/src/winemetal/unix/winemetal_unix.c b/dxmt/src/winemetal/unix/winemetal_unix.c
+--- a/dxmt/src/winemetal/unix/winemetal_unix.c
++++ b/dxmt/src/winemetal/unix/winemetal_unix.c
+@@ -9,8 +9,9 @@
+ #include <stdlib.h>
+ #include <dlfcn.h>
+ #include <TargetConditionals.h>
+-#if TARGET_OS_IOS
+-#import <UIKit/UIKit.h>
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
++#import <Foundation/Foundation.h>
++#import <CoreGraphics/CoreGraphics.h>
+ /* iOS lacks CGDirectDisplay: provide minimal stubs for single-display use. */
+ typedef uint32_t CGDirectDisplayID;
+ #define kCGNullDirectDisplay ((CGDirectDisplayID)0)
+@@ -18,20 +19,20 @@
+ #else
+ #import <Cocoa/Cocoa.h>
+ #endif
+-#if !TARGET_OS_IOS
++#if !(TARGET_OS_IOS || TARGET_OS_VISION)
+ #import <ColorSync/ColorSync.h>
+ #endif
+ #import <CoreFoundation/CFRunLoop.h>
+ #import <Metal/Metal.h>
+ #import <MetalFX/MetalFX.h>
+ #import <QuartzCore/QuartzCore.h>
+-#if TARGET_OS_IOS
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
+ #include <objc/message.h>
+ #include <objc/runtime.h>
+ #else
+ #include "objc/objc-runtime.h"
+ #endif
+-#if TARGET_OS_IOS
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
+ /* iOS SDK omits bootstrap.h but the functions exist in libsystem. */
+ typedef char name_t[128];
+ extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
+@@ -68,7 +69,7 @@
+  * forces it either way: "0" disables it for every caller, any other
+  * non-empty value enables it for every caller. The PE-side counterpart is
+  * dxmt::madeiraSwitch (util_madeira_switch.hpp). */
+-#if TARGET_OS_IOS
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
+ extern unsigned long ios_wow_base(void);
+ #endif
+ static inline int
+@@ -76,7 +77,7 @@
+   const char *e = getenv(name);
+   if (e && *e)
+     return strcmp(e, "0") != 0;
+-#if TARGET_OS_IOS
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
+   return ios_wow_base() != 0;
+ #else
+   return 0;
+@@ -133,7 +134,7 @@
+   }
+   if (env >= 0)
+     return env;
+-#if TARGET_OS_IOS
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
+   return ios_wow_base() != 0;
+ #else
+   return 0;
+@@ -144,6 +145,7 @@
+ #define STATUS_SUCCESS 0
+ #define STATUS_UNSUCCESSFUL 0xC0000001
+ #define STATUS_NOT_IMPLEMENTED 0xC0000002
++#define STATUS_NOT_SUPPORTED 0xC00000BB
+ /* MADEIRA (WOW64_DESIGN.md section 7.4, rule 4: no fake success): the 32-bit
+  * variants below fail the call when an argument block cannot be converted, so
+  * they need the two NT status values for that. */
+@@ -3023,7 +3025,7 @@
+ static NTSTATUS
+ _MTLBuffer_didModifyRange(void *obj) {
+   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
+-#if !TARGET_OS_IOS
++#if !(TARGET_OS_IOS || TARGET_OS_VISION)
+   [(id<MTLBuffer>)params->handle didModifyRange:NSMakeRange(params->arg, params->ret)];
+ #else
+   (void)params; /* iOS unified memory — no range invalidation needed. */
+@@ -3236,6 +3238,23 @@
+  * (motionVectorScale, default 1) and MADEIRA_FRAMEGEN_MVSIGN (-1 flips the
+  * vectors) tune it. The FPS caps do not apply while it is on (RAW keeps its
+  * own path): the game's own rate is what gets doubled. */
++#if TARGET_OS_VISION
++/* MetalFX frame interpolation is explicitly unavailable in the visionOS SDK.
++ * Reject this optional experimental mode; the real-frame present path remains active. */
++static int madeira_fg_enabled(void) {
++  static int reported;
++  const char *requested = getenv("MADEIRA_FRAMEGEN");
++  if (!reported && requested && *requested && *requested != '0') {
++    dprintf(STDERR_FILENO, "[framegen] unavailable on visionOS -- presenting real game frames\n");
++    reported = 1;
++  }
++  return 0;
++}
++static int madeira_fg_present(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable) {
++  (void)cb; (void)drawable;
++  return 0;
++}
++#else
+ static int g_fg_on = -1;
+ static int madeira_fg_enabled(void) {
+   if (g_fg_on < 0) {
+@@ -3517,6 +3536,8 @@
+   return r;
+ }
+ 
++#endif /* !TARGET_OS_VISION: optional MetalFX frame interpolation */
++
+ static NTSTATUS
+ _MTLCommandBuffer_presentDrawable(void *obj) {
+   struct unixcall_generic_obj_obj_noret *params = obj;
+@@ -4004,7 +4025,7 @@
+     layer.opaque = props->opaque;
+     layer.framebufferOnly = madeira_fg_enabled() ? NO : props->framebuffer_only;   /* frame generation reads the drawable */
+     layer.contentsScale = props->contents_scale;
+-#if !TARGET_OS_IOS
++#if !(TARGET_OS_IOS || TARGET_OS_VISION)
+     layer.displaySyncEnabled = props->display_sync_enabled;
+ #endif
+     layer.drawableSize = CGSizeMake(props->drawable_width, props->drawable_height);
+@@ -4033,7 +4054,7 @@
+   props->opaque = layer.opaque;
+   props->framebuffer_only = layer.framebufferOnly;
+   props->contents_scale = layer.contentsScale;
+-#if TARGET_OS_IOS
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
+   /* ml1140: WSI window extents are Windows pixels, not UIKit points. Applying
+    * the phone's 3x scale again made a 720p present render into a 4K drawable.
+    * Core Animation already maps that drawable onto the host view in points.
+@@ -4303,7 +4324,7 @@
+     wmtr_call(RM_OP_DEVICE_SET_MAXCC, &a, sizeof a, 0, 0, 0);
+     return STATUS_SUCCESS;
+   }
+-#if !TARGET_OS_IOS
++#if !(TARGET_OS_IOS || TARGET_OS_VISION)
+   [(id<MTLDevice>)params->handle setShouldMaximizeConcurrentCompilation:(BOOL)params->arg];
+ #else
+   /* setShouldMaximizeConcurrentCompilation: is macOS-only — iOS MTLDevice
+@@ -4395,13 +4416,13 @@
+  * for a process that has no guest window, which collapses this back to the
+  * plain zero-extension: a 64-bit caller reaching here, and every non-iOS
+  * build, behave exactly as before.  NULL is preserved in both directions. */
+-#if TARGET_OS_IOS
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
+ extern unsigned long ios_wow_base(void);
+ #endif
+ 
+ static inline void *
+ UInt32ToPtr(uint32_t v) {
+-#if TARGET_OS_IOS
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
+   return v ? (void *)(ios_wow_base() + (uint64_t)v) : NULL;
+ #else
+   return (void *)(uint64_t)v;
+@@ -4415,7 +4436,7 @@
+  * zero, which is what the i386 accessor asserts on. */
+ static inline void *
+ PtrToUInt32Ptr(void *host) {
+-#if TARGET_OS_IOS
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
+   return host ? (void *)(uint64_t)(uint32_t)((unsigned long)host - ios_wow_base()) : NULL;
+ #else
+   return (void *)(uint64_t)(uint32_t)(uintptr_t)host;
+@@ -5089,7 +5110,7 @@
+   struct unixcall_generic_obj_ret *params = obj;
+   params->ret = kCGNullDirectDisplay;
+ 
+-#if !TARGET_OS_IOS
++#if !(TARGET_OS_IOS || TARGET_OS_VISION)
+   uint32_t count = 0;
+   CGGetOnlineDisplayList(0, NULL, &count);
+ 
+@@ -5114,7 +5135,7 @@
+   return STATUS_SUCCESS;
+ }
+ 
+-#if !TARGET_OS_IOS
++#if !(TARGET_OS_IOS || TARGET_OS_VISION)
+ typedef struct icc_XYZ_t {
+   uint32_t sig;      // 0x205a5958
+   uint32_t reserved; // 0
+@@ -5156,9 +5177,9 @@
+              profile, kColorSyncSigBlueColorantTag, &desc_out->blue_primaries[0], &desc_out->blue_primaries[1]
+          );
+ }
+-#endif /* !TARGET_OS_IOS — end of ColorSync/NSScreen block */
+-
+-#if !TARGET_OS_IOS
++#endif /* !(TARGET_OS_IOS || TARGET_OS_VISION) — end of ColorSync/NSScreen block */
++
++#if !(TARGET_OS_IOS || TARGET_OS_VISION)
+ NSScreen *
+ GetNSScreenForDisplayID(CGDirectDisplayID display_id) {
+   for (NSScreen *screen in [NSScreen screens]) {
+@@ -5175,7 +5196,7 @@
+ _WMTGetDisplayDescription(void *obj) {
+   struct unixcall_generic_obj_ptr_noret *params = obj;
+   struct WMTDisplayDescription *desc_out = params->arg.ptr;
+-#if TARGET_OS_IOS
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
+   (void)params;
+   desc_out->maximum_edr_color_component_value = 1.0;
+   desc_out->maximum_reference_edr_color_component_value = 0.0;
+@@ -5217,7 +5238,7 @@
+   value->maximum_edr_color_component_value = 1.0;
+   value->maximum_potential_edr_color_component_value = 1.0;
+ 
+-#if !TARGET_OS_IOS
++#if !(TARGET_OS_IOS || TARGET_OS_VISION)
+   if (![layer.delegate isKindOfClass:NSView.class])
+     return STATUS_SUCCESS;
+ 
+@@ -5335,7 +5356,7 @@
+     ios_frame_game_tick();
+ 
+   params->version = 0;
+-#if TARGET_OS_IOS
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
+   (void)layer;
+   return STATUS_SUCCESS;
+ #else
+@@ -5556,7 +5577,7 @@
+     return STATUS_SUCCESS;
+   }
+   memcpy((void *)((char *)[(id<MTLBuffer>)params->buffer contents] + params->offset), params->data.ptr, params->length);
+-#if !TARGET_OS_IOS
++#if !(TARGET_OS_IOS || TARGET_OS_VISION)
+   /* Managed storage mode doesn't exist on iOS (unified memory). */
+   if ([(id<MTLBuffer>)params->buffer storageMode] == MTLStorageModeManaged)
+     [(id<MTLBuffer>)params->buffer didModifyRange:NSMakeRange(params->offset, params->length)];
+@@ -5669,7 +5690,7 @@
+     id<MTLTexture> ret = [device newSharedTextureWithDescriptor:desc];
+     params->ret = (obj_handle_t)ret;
+     info->gpu_resource_id = [ret gpuResourceID]._impl;
+-#if TARGET_OS_IOS
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
+     /* An iOS app cannot bootstrap-register the port, so the caller could only
+      * fail the creation (Crysis Remastered then crashed on the views it never
+      * got). Without a port DXMT keeps the texture unshared (ml866). */
+@@ -6664,7 +6685,7 @@
+   return STATUS_NOT_IMPLEMENTED;
+ }
+ 
+-#if TARGET_OS_IOS
++#if (TARGET_OS_IOS || TARGET_OS_VISION)
+ /* On iOS we statically link DXMT's unix side into the host app (Madeira.app),
+  * alongside ntdll's own __wine_unix_call_funcs. Rename ours so the linker
+  * doesn't get a duplicate symbol; our ntdll's load_builtin_unixlib picks
+diff --git a/dxmt/src/airconv/airconv_context.cpp b/dxmt/src/airconv/airconv_context.cpp
+--- a/dxmt/src/airconv/airconv_context.cpp
++++ b/dxmt/src/airconv/airconv_context.cpp
+@@ -25,6 +25,9 @@
+ #include "llvm/Transforms/Utils/Mem2Reg.h"
+ 
+ #include "airconv_context.hpp"
++#if defined(DXMT_VISIONOS)
++#include "wvr_metallib_platform.h"
++#endif
+ 
+ #include "air_msad.h"
+ #include "air_samplepos.h"
+@@ -38,14 +41,22 @@
+ 
+ void initializeModule(llvm::Module &M) {
+   M.setSourceFileName("airconv_generated.metal");
++#if defined(DXMT_VISIONOS)
++  M.setTargetTriple("air64-apple-xros2.0");
++#else
+   M.setTargetTriple("air64-apple-macosx14.0.0");
++#endif
+   M.setDataLayout(
+     "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:"
+     "64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-"
+     "v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:"
+     "16:32"
+   );
++#if defined(DXMT_VISIONOS)
++  M.setSDKVersion(VersionTuple(WVR_METALLIB_SDK_MAJOR, WVR_METALLIB_SDK_MINOR));
++#else
+   M.setSDKVersion(VersionTuple(15, 0));
++#endif
+   M.addModuleFlag(Module::ModFlagBehavior::Error, "wchar_size", 4);
+   M.addModuleFlag(Module::ModFlagBehavior::Max, "frame-pointer", 2);
+   M.addModuleFlag(Module::ModFlagBehavior::Max, "air.max_device_buffers", 31);
+diff --git a/dxmt/src/airconv/dxbc_converter.cpp b/dxmt/src/airconv/dxbc_converter.cpp
+--- a/dxmt/src/airconv/dxbc_converter.cpp
++++ b/dxmt/src/airconv/dxbc_converter.cpp
+@@ -389,7 +389,11 @@
+     airLangVersion->addOperand(MDTuple::get(
+         context, {createString("Metal"), createUnsignedInteger(3), createUnsignedInteger(2), createUnsignedInteger(0)}
+     ));
+-    module.setTargetTriple("air64-apple-macosx15.0.0");
++  #if defined(DXMT_VISIONOS)
++  module.setTargetTriple("air64-apple-xros2.0");
++#else
++  module.setTargetTriple("air64-apple-macosx15.0.0");
++#endif
+     break;
+   }
+   default: {
+diff --git a/dxmt/src/airconv/dxso_compile.cpp b/dxmt/src/airconv/dxso_compile.cpp
+--- a/dxmt/src/airconv/dxso_compile.cpp
++++ b/dxmt/src/airconv/dxso_compile.cpp
+@@ -96,7 +96,11 @@
+   // missing these. Mirrors dxbc::setup_metal_version's
+   // SM50_SHADER_METAL_320 arm.
+   auto u32_md = [&](uint32_t v) { return ConstantAsMetadata::get(ConstantInt::get(context, APInt{32, v})); };
++#if defined(DXMT_VISIONOS)
++  module.setTargetTriple("air64-apple-xros2.0");
++#else
+   module.setTargetTriple("air64-apple-macosx15.0.0");
++#endif
+   module.getOrInsertNamedMetadata("air.version")->addOperand(MDTuple::get(context, {u32_md(2), u32_md(7), u32_md(0)}));
+   module.getOrInsertNamedMetadata("air.language_version")
+       ->addOperand(MDTuple::get(context, {MDString::get(context, "Metal"), u32_md(3), u32_md(2), u32_md(0)}));
+diff --git a/dxmt/src/airconv/ffp_compile.cpp b/dxmt/src/airconv/ffp_compile.cpp
+--- a/dxmt/src/airconv/ffp_compile.cpp
++++ b/dxmt/src/airconv/ffp_compile.cpp
+@@ -31,7 +31,11 @@
+ void
+ stamp_metal_version(LLVMContext &context, Module &module) {
+   auto u32_md = [&](uint32_t v) { return ConstantAsMetadata::get(ConstantInt::get(context, APInt{32, v})); };
++#if defined(DXMT_VISIONOS)
++  module.setTargetTriple("air64-apple-xros2.0");
++#else
+   module.setTargetTriple("air64-apple-macosx15.0.0");
++#endif
+   module.getOrInsertNamedMetadata("air.version")->addOperand(MDTuple::get(context, {u32_md(2), u32_md(7), u32_md(0)}));
+   module.getOrInsertNamedMetadata("air.language_version")
+       ->addOperand(MDTuple::get(context, {MDString::get(context, "Metal"), u32_md(3), u32_md(2), u32_md(0)}));
+diff --git a/dxmt/src/airconv/metallib_writer.cpp b/dxmt/src/airconv/metallib_writer.cpp
+--- a/dxmt/src/airconv/metallib_writer.cpp
++++ b/dxmt/src/airconv/metallib_writer.cpp
+@@ -1,4 +1,7 @@
+ #include "metallib_writer.hpp"
++#if defined(DXMT_VISIONOS)
++#include "wvr_metallib_platform.h"
++#endif
+ #include "llvm/Bitcode/BitcodeWriter.h"
+ #include "llvm/IR/Constants.h"
+ 
+@@ -391,12 +394,19 @@
+   header.BitcodeSize = bitcode.size();
+ 
+   header.Type = FileType::MTLBType_Executable; // executable
+-  header.Platform = Platform::MTLBPlatform_macOS;
+   header.VersionMajor = 2;
+   header.VersionMinor = 7;
++#if defined(DXMT_VISIONOS)
++  header.Platform = static_cast<Platform>(WVR_METALLIB_TARGET_PLATFORM);
++  header.OS = static_cast<enum OS>(WVR_METALLIB_TARGET_OS);
++  header.OSVersionMajor = WVR_METALLIB_TARGET_OS_MAJOR;
++  header.OSVersionMinor = WVR_METALLIB_TARGET_OS_MINOR;
++#else
++  header.Platform = Platform::MTLBPlatform_macOS;
+   header.OS = OS::MTLBOS_macOS;
+   header.OSVersionMajor = 14;
+   header.OSVersionMinor = 4;
++#endif
+ 
+   // write to stream
+   OS << value(header);
+diff --git a/build/dxmt-ios/build.sh b/build/dxmt-ios/build.sh
+--- a/build/dxmt-ios/build.sh
++++ b/build/dxmt-ios/build.sh
+@@ -17,7 +17,7 @@
+ 
+ mkdir -p "$OBJ_DIR"
+ 
+-COMMON_FLAGS="-arch arm64 -isysroot $SDK -target arm64-apple-xros27.0 -fblocks -O2"
++COMMON_FLAGS="-arch arm64 -isysroot $SDK -target arm64-apple-xros27.0 -fblocks -O2 -DDXMT_VISIONOS=1"
+ INCLUDES="-I$DXMT_ROOT/include -I$DXMT_ROOT/libs -I$DXMT_SRC/winemetal -I$DXMT_SRC/airconv"
+ INCLUDES_DIRECTX="-I$DXMT_ROOT/include/native/directx -I$DXMT_ROOT/include/native/windows"
+ INCLUDES_SHADERS="-I$BUILD_DIR/shader-headers"
+@@ -176,6 +176,25 @@
+     fi
+ fi
+ 
++echo "=== xros AIR helpers and command metallib ==="
++mkdir -p "$BUILD_DIR/shader-headers" "$BUILD_DIR/metal-module-cache"
++DXMT_METAL_STD="${DXMT_METAL_STD:-metal3.1}"
++for name in air_msad air_samplepos air_tessellation; do
++    xcrun --sdk xros metal -isysroot "$SDK" -fmodules-cache-path="$BUILD_DIR/metal-module-cache" \
++        -std="$DXMT_METAL_STD" --target=air64-apple-xros2.0 \
++        -c "$DXMT_SRC/airconv/shaders/$name.metal" -o "$BUILD_DIR/shader-headers/$name.air"
++    xxd -n "$name" -i "$BUILD_DIR/shader-headers/$name.air" "$BUILD_DIR/shader-headers/$name.h"
++done
++xcrun --sdk xros metal -isysroot "$SDK" -fmodules-cache-path="$BUILD_DIR/metal-module-cache" \
++    -std="$DXMT_METAL_STD" --target=air64-apple-xros2.0 \
++    -c "$DXMT_SRC/dxmt/dxmt_command.metal" -o "$BUILD_DIR/shader-headers/dxmt_command.air"
++xcrun --sdk xros metallib -o "$BUILD_DIR/shader-headers/dxmt_command.metallib" "$BUILD_DIR/shader-headers/dxmt_command.air"
++xxd -n dxmt_command -i "$BUILD_DIR/shader-headers/dxmt_command.metallib" "$BUILD_DIR/shader-headers/dxmt_command.h"
++python3 "$BUILD_DIR/generate_metallib_platform.py" \
++    --reference "$BUILD_DIR/shader-headers/dxmt_command.metallib" \
++    --sdk-version "$(xcrun --sdk xros --show-sdk-version)" \
++    --output "$BUILD_DIR/shader-headers/wvr_metallib_platform.h"
++
+ echo "=== winemetal unix (Objective-C) ==="
+ compile_objc "$DXMT_SRC/winemetal/unix/winemetal_unix.c" winemetal_unix
+ compile_objc "$DXMT_SRC/winemetal/unix/cache.c"          cache
+@@ -231,20 +250,7 @@
+ # DXMT's meson build (the container format must also be one the OS reads). The
+ # script's own timestamp is part of
+ # the cache check so that a flag change here regenerates the header.
+-DXMT_METAL_STD="${DXMT_METAL_STD:-metal3.1}"
+-if [ ! -f "$BUILD_DIR/shader-headers/dxmt_command.h" ] \
+-   || [ "$DXMT_SRC/dxmt/dxmt_command.metal" -nt "$BUILD_DIR/shader-headers/dxmt_command.h" ] \
+-   || [ "$0" -nt "$BUILD_DIR/shader-headers/dxmt_command.h" ]; then
+-    mkdir -p "$BUILD_DIR/shader-headers"
+-    (cd "$BUILD_DIR/shader-headers" \
+-     && xcrun -sdk macosx metal -std="$DXMT_METAL_STD" --target=air64-apple-macos14.0 \
+-          -o dxmt_command.air -c "$DXMT_SRC/dxmt/dxmt_command.metal" \
+-     && xcrun -sdk macosx metallib -o dxmt_command.metallib dxmt_command.air \
+-     && xxd -n dxmt_command -i dxmt_command.metallib dxmt_command.h)
+-    echo "  dxmt_command.h                           OK (-std=$DXMT_METAL_STD)"
+-else
+-    echo "  dxmt_command.h                           CACHED"
+-fi
++# The command metallib/header were generated for xros before airconv compilation.
+ 
+ echo "=== MADEIRA: dxmt_madeira_native -- util ==="
+ # MADEIRA (WOW64_DESIGN.md, ml1070): util_futex.cpp carries dxmt::futex's
+diff --git a/dxmt/src/airconv/shaders/air_tessellation.metal b/dxmt/src/airconv/shaders/air_tessellation.metal
+--- a/dxmt/src/airconv/shaders/air_tessellation.metal
++++ b/dxmt/src/airconv/shaders/air_tessellation.metal
+@@ -150,7 +150,7 @@
+ 
+ int
+ get_next_index(threadgroup int *out_count) {
+-  return __metal_atomic_fetch_add_explicit(out_count, 1, int(memory_order_relaxed), __METAL_MEMORY_SCOPE_THREADGROUP__);
++  return atomic_fetch_add_explicit(reinterpret_cast<threadgroup atomic_int *>(out_count), 1, memory_order_relaxed);
+ }
+ 
+ template <partitioning partition>

@@ -81,16 +81,22 @@ if ! grep -Fq 'programs/wineboot/arm64ec-windows/wineboot.exe:' "$wine_build/Mak
         enable_wineboot=arm64ec enable_services=arm64ec enable_rpcss=arm64ec \
             enable_winedevice=arm64ec enable_plugplay=arm64ec \
             PATH="$AVPPLAY_LLVM_MINGW_ROOT/bin:$PATH" \
-            ../configure --enable-archs=arm64ec --without-x --disable-tests --enable-winegstreamer
+            ../configure --enable-archs=arm64ec --without-x --without-freetype --disable-tests --enable-winegstreamer
     )
 fi
 bash "$runtime_root/build/wine-pe/build-ntdll.sh"
 JOBS="${AVPPLAY_BUILD_JOBS:-4}" bash "$runtime_root/build/wine-pe/build-modules.sh" \
-    cryptsp d3dx11_43 msvcp110 msvcr110 xaudio2_7 \
+    cryptsp crypt32 cryptbase rsaenh d3dx11_43 msvcp110 msvcr110 xaudio2_7 \
     kernel32 kernelbase advapi32 shell32 shlwapi version user32 gdi32 \
     setupapi newdev wininet ws2_32 ole32 rpcrt4 secur32 bcrypt msvcrt winmm \
     apisetschema mswsock dnsapi iphlpapi winhttp \
-    ucrtbase userenv ntoskrnl.exe cfgmgr32 combase coml2 mpr msacm32 sechost shcore win32u
+    ucrtbase userenv ntoskrnl.exe cfgmgr32 combase coml2 mpr msacm32 sechost shcore win32u \
+    cabinet comctl32 comdlg32 cryptnet cryptui d3dcompiler_47 dhcpcsvc dinput8 \
+    gdiplus imm32 jsproxy mfplat mfreadwrite mlang netapi32 nsi oleaut32 propsys \
+    shdocvw urlmon windowscodecs winspool.drv wintrust \
+    advpack compstui hid imagehlp mf netutils rtworkq wined3d \
+    dbghelp evr opengl32 d3d9 dxva2 glu32 ieframe sspicli psapi \
+    dwmapi wsock32 avrt vcruntime140 msvcp140 mmdevapi
 # Create the four core Wine executables as ARM64EC PE files, then strip only
 # debug sections before placing them in the guest farm.
 core_program_targets=(
@@ -115,7 +121,7 @@ if ! grep -Fq 'programs/winedevice/aarch64-windows/winedevice.exe:' \
     (
         cd "$wine_aarch64_build"
         enable_winedevice=aarch64 PATH="$AVPPLAY_LLVM_MINGW_ROOT/bin:$PATH" \
-            ../configure --enable-archs=aarch64 --without-x --disable-tests
+            ../configure --enable-archs=aarch64 --without-x --without-freetype --disable-tests
     )
 fi
 aarch64_winedevice_target=programs/winedevice/aarch64-windows/winedevice.exe
@@ -147,15 +153,34 @@ if [[ "${AVPPLAY_ENABLE_D3D12:-0}" != "1" ]]; then
 # Madeira docs/BUILDING.md records this DXMT ARM64EC Meson/Ninja route.
 dxmt_root="$runtime_root/dxmt"
 dxmt_build="$dxmt_root/build-arm64ec"
+dxmt_cross="$wine_build/dxmt-cross-arm64ec.txt"
+# Meson's GLOBAL_SOURCE_ROOT is the DXMT subdirectory. Use the explicitly
+# selected external toolchain instead of assuming toolchains lives inside it.
+cat > "$dxmt_cross" <<EOF
+[binaries]
+c = '$AVPPLAY_LLVM_MINGW_ROOT/bin/arm64ec-w64-mingw32-clang'
+cpp = '$AVPPLAY_LLVM_MINGW_ROOT/bin/arm64ec-w64-mingw32-clang++'
+ar = '$AVPPLAY_LLVM_MINGW_ROOT/bin/arm64ec-w64-mingw32-ar'
+strip = '$AVPPLAY_LLVM_MINGW_ROOT/bin/arm64ec-w64-mingw32-strip'
+windres = '$AVPPLAY_LLVM_MINGW_ROOT/bin/arm64ec-w64-mingw32-windres'
+[properties]
+needs_exe_wrapper = true
+[host_machine]
+system = 'windows'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
+EOF
 if [[ ! -f "$dxmt_build/build.ninja" ]]; then
     meson setup "$dxmt_build" "$dxmt_root" \
-        -Dbuildtype=release \
-        -Dwine_build_path=../../wine/build-arm64ec \
-        --cross-file="$dxmt_root/build-arm64ec-win.txt"
+        -Dbuildtype=release -Dwine_builtin_dll=true \
+        -Dwine_build_path="$wine_build" --cross-file="$dxmt_cross"
 fi
-ninja -C "$dxmt_build" src/winemetal/winemetal.dll src/d3d11/d3d11.dll
-cp "$dxmt_build/src/winemetal/winemetal.dll" "$wine_farm/winemetal.dll"
-cp "$dxmt_build/src/d3d11/d3d11.dll" "$wine_farm/d3d11.dll"
+ninja -C "$dxmt_build" src/winemetal/winemetal.dll src/d3d11/d3d11.dll \
+    src/dxgi/dxgi.dll src/d3d10/d3d10core.dll
+for module in winemetal/winemetal.dll d3d11/d3d11.dll dxgi/dxgi.dll d3d10/d3d10core.dll; do
+    cp "$dxmt_build/src/$module" "$wine_farm/$(basename "$module")"
+done
 fi
 
 for required in "$runtime_root/app/Madeira/aarch64-windows" "$runtime_root/app/Madeira/nls" "$runtime_root/app/Madeira/legal"; do
@@ -174,6 +199,16 @@ if [[ "${AVPPLAY_ENABLE_D3D12:-0}" == "1" ]]; then
 fi
 
 cp "$runtime_root/dxmt/LICENSE" "$runtime_root/app/Madeira/legal/DXMT-LICENSE"
+
+if [[ "${AVPPLAY_ENABLE_X86:-0}" == 1 ]]; then
+    if [[ "${AVPPLAY_ENABLE_D3D12:-0}" == 1 ]]; then
+        echo "Experimental x86 requires matching legacy D3D11 graphics, not modern DXMT." >&2
+        exit 1
+    fi
+    AVPPLAY_BUILD_WINE_I386=1 AVPPLAY_I386_RUNTIME_SOURCE="$runtime_root" \
+        AVPPLAY_ALLOW_I386_ACTIVE_CANDIDATE=1 \
+        bash "$repo_root/windows-vr-tools/build_wine_i386_resources.sh"
+fi
 
 python3 "$repo_root/windows-vr-tools/resource_receipt.py" guest \
     --runtime-source "$runtime_root" \

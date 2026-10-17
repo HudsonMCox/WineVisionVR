@@ -15,12 +15,11 @@
          WARN("wvr-foveation capability status=",caps.status," size=",sizeof(caps));
        }
        static thread_local uint64_t passes=0, safePasses=0, eligiblePasses=0;
-@@ -1031,8 +1033,11 @@
+@@ -1031,7 +1033,11 @@
        WMT::RenderCommandEncoder encoder{};
        if (foveation.status == 0 && foveation.encoder) encoder.handle = foveation.encoder;
        else encoder = cmdbuf.renderCommandEncoder(render_pass_info);
--      if (foveationPeer && foveation.status != 0 && data->foveation_draw_calls > 0 &&
--          render_pass_info.render_target_width >= 256 && render_pass_info.render_target_height >= 256) {
+-      if (foveationPeer && foveation.status != 0) {
 +      // Legacy companions need operation 3. New companions expose their
 +      // process-lifetime identity buffer during capability negotiation.
 +      // Small/unsafe uniform passes still need it for transformed SV_Position.

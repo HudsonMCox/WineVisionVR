@@ -67,6 +67,11 @@ def main():
                    "sourcesSha256": {str(path.relative_to(ROOT)): sha(path) for path in (
                        ROOT / "windows-runtime-plugin/patches/0004-fex-persistent-code-cache.patch",
                        ROOT / "windows-runtime-plugin/patches/0005-fex-native-dispatch-fastpath.patch",
+                       ROOT / "windows-runtime-plugin/patches/0011-fex-stack-derived-nontso.patch",
+                       ROOT / "windows-runtime-plugin/patches/0012-fex-lookup-path-contention.patch",
+                       ROOT / "windows-runtime-plugin/patches/0013-fex-thread-local-nontso.patch",
+                       ROOT / "windows-runtime-plugin/patches/0014-fex-deferred-image-tracking.patch",
+                       ROOT / "windows-runtime-plugin/patches/0016-arm64ec-call-boundary.patch",
                        ROOT / "windows-runtime-plugin/cache/WindowsVRCacheLauncher.cpp",
                        ROOT / "windows-runtime-plugin/cache/WindowsCommandLine.h")}}
         (args.output / "AVPPLAY_FEX_CACHE_RECEIPT.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")

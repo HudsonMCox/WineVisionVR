@@ -19,6 +19,7 @@ public final class NativePluginWindowsRuntime: WindowsRuntime, @unchecked Sendab
     private var launchFunction: LaunchFunction?
     private var preflightFunction: LaunchFunction?
     private var graphicsCapabilitiesFunction: GraphicsCapabilitiesFunction?
+    private var presentationCapabilitiesFunction: GraphicsCapabilitiesFunction?
     private var guestArchitectureFunction: GuestArchitectureFunction?
     private var stopFunction: StopFunction?
     private var statusFunction: StatusFunction?
@@ -73,6 +74,9 @@ public final class NativePluginWindowsRuntime: WindowsRuntime, @unchecked Sendab
         if let capabilitiesAddress = dlsym(handle, "windows_vr_graphics_capabilities_v1") {
             graphicsCapabilitiesFunction = unsafeBitCast(capabilitiesAddress, to: GraphicsCapabilitiesFunction.self)
         }
+        if let address = dlsym(handle, "windows_vr_presentation_capabilities_v1") {
+            presentationCapabilitiesFunction = unsafeBitCast(address, to: GraphicsCapabilitiesFunction.self)
+        }
         stopFunction = unsafeBitCast(stopAddress, to: StopFunction.self)
         statusFunction = unsafeBitCast(statusAddress, to: StatusFunction.self)
         lastErrorFunction = unsafeBitCast(lastErrorAddress, to: LastErrorFunction.self)
@@ -103,6 +107,9 @@ public final class NativePluginWindowsRuntime: WindowsRuntime, @unchecked Sendab
 
     private func prepareRequest(manifest: WindowsGameManifest, gameDirectory: URL) throws -> String {
         try manifest.validate()
+        guard supportsPresentation(manifest.presentation) else {
+            throw WindowsRuntimeError.presentationUnavailable(manifest.presentation)
+        }
         guard supportsGraphics(manifest.graphics) else {
             throw WindowsRuntimeError.graphicsPackageMissing(manifest.graphics)
         }
@@ -134,7 +141,9 @@ public final class NativePluginWindowsRuntime: WindowsRuntime, @unchecked Sendab
             gameDirectory: rootURL.path,
             executablePath: executableURL.path,
             arguments: manifest.launchArguments,
-            environment: manifest.environment
+            environment: manifest.environment,
+            presentation: manifest.presentation.rawValue,
+            guestArchitecture: manifest.guestArchitecture?.rawValue
         )
         let requestData = try JSONEncoder().encode(request)
         guard let requestJSON = String(data: requestData, encoding: .utf8) else {
@@ -142,6 +151,12 @@ public final class NativePluginWindowsRuntime: WindowsRuntime, @unchecked Sendab
         }
 
         return requestJSON
+    }
+
+    public func supportsPresentation(_ mode: WindowsPresentationMode) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return launchFunction != nil && mode.isSupported(by: presentationCapabilitiesFunction?())
     }
 
     public func supportsGraphics(_ graphics: WindowsGraphicsAPI) -> Bool {
@@ -233,5 +248,7 @@ public final class NativePluginWindowsRuntime: WindowsRuntime, @unchecked Sendab
         let executablePath: String
         let arguments: [String]
         let environment: [String: String]
+        let presentation: String
+        let guestArchitecture: String?
     }
 }

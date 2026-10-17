@@ -220,6 +220,32 @@ struct SteamAppInfo {
         }
     }
 
+    /// Full-install estimates from metadata already fetched for the library.
+    /// Never display a partial depot sum or call uncompressed bytes a download.
+    func installSizeEstimates(for os: String = "windows") -> (download: UInt64?, installed: UInt64?) {
+        // Include unresolved shared depots in selection so they cannot silently
+        // disappear from the total. No metadata or network access is changed.
+        var selection = self
+        for index in selection.depots.indices where selection.depots[index].publicManifestID == nil {
+            if selection.depots[index].fromApp != nil { selection.depots[index].manifests["public"] = 0 }
+        }
+        let selected = selection.installDepots(os: os)
+        guard !selected.isEmpty, selected.allSatisfy({ $0.publicManifestID != 0 }) else { return (nil, nil) }
+        func total(_ value: (DepotInfo) -> UInt64) -> UInt64? {
+            var result: UInt64 = 0
+            for depot in selected {
+                let bytes = value(depot)
+                guard bytes > 0 else { return nil }
+                let (sum, overflow) = result.addingReportingOverflow(bytes)
+                guard !overflow, sum <= UInt64(Int64.max) else { return nil }
+                result = sum
+            }
+            return result
+        }
+        return (total { $0.publicDownloadBytes },
+                total { $0.publicSizeBytes > 0 ? $0.publicSizeBytes : $0.maxSize })
+    }
+
     // MARK: - Parsing
 
     /// Parse app info from a PICS text-VDF buffer.

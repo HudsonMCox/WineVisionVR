@@ -1,0 +1,21 @@
+# Experimental x86 packaging is explicit: XcodeGen optional resource entries
+# otherwise produce copy steps even when their files or folders are absent.
+include:
+  - project.yml
+targets:
+  VisionOSWindowsVR:
+    sources:
+      # Required experimental x86 bootstrap; the complete farm stays in Runtime.
+      - path: Resources/Runtime/i386-windows/ntdll.dll
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: i386-windows
+      - path: Resources/Runtime/i386-windows/apisetschema.dll
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: i386-windows
+      - path: Resources/VRSmokeX86
+        type: folder
+        buildPhase: resources

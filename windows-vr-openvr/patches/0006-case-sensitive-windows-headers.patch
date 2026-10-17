@@ -1,0 +1,81 @@
+diff --git a/OpenOVR/Compositor/dx12compositor.cpp b/OpenOVR/Compositor/dx12compositor.cpp
+--- a/OpenOVR/Compositor/dx12compositor.cpp
++++ b/OpenOVR/Compositor/dx12compositor.cpp
+@@ -7,7 +7,7 @@
+ #include <string>
+ 
+ 
+-#include <DirectXMath.h>
++#include <directxmath.h>
+ #include <d3dcompiler.h>
+ 
+ #include <d3d12.h>
+diff --git a/OpenOVR/Misc/debug_helper.cpp b/OpenOVR/Misc/debug_helper.cpp
+--- a/OpenOVR/Misc/debug_helper.cpp
++++ b/OpenOVR/Misc/debug_helper.cpp
+@@ -8,7 +8,7 @@
+ static const int MaxNameLen = 256;
+ 
+ #include "dbghelp.h"
+-#include <Windows.h>
++#include <windows.h>
+ #include <sstream>
+ #pragma comment(lib, "Dbghelp.lib")
+ 
+diff --git a/OpenOVR/Reimpl/BaseClientCore.cpp b/OpenOVR/Reimpl/BaseClientCore.cpp
+--- a/OpenOVR/Reimpl/BaseClientCore.cpp
++++ b/OpenOVR/Reimpl/BaseClientCore.cpp
+@@ -11,7 +11,7 @@
+ #include "json/json.h"
+ 
+ #ifdef _WIN32
+-#include <ShlObj.h>
++#include <shlobj.h>
+ #endif
+ 
+ using namespace vr;
+diff --git a/OpenOVR/targetver.h b/OpenOVR/targetver.h
+--- a/OpenOVR/targetver.h
++++ b/OpenOVR/targetver.h
+@@ -5,4 +5,4 @@
+ // If you wish to build your application for a previous Windows platform, include WinSDKVer.h and
+ // set the _WIN32_WINNT macro to the platform you wish to support before including SDKDDKVer.h.
+ 
+-#include <SDKDDKVer.h>
++#include <sdkddkver.h>
+diff --git a/DrvOpenXR/XrBackend.cpp b/DrvOpenXR/XrBackend.cpp
+--- a/DrvOpenXR/XrBackend.cpp
++++ b/DrvOpenXR/XrBackend.cpp
+@@ -8,7 +8,7 @@
+ 
+ #ifdef _WIN32
+ #define WIN32_LEAN_AND_MEAN
+-#include <Windows.h>
++#include <windows.h>
+ #endif
+ 
+ #if defined(SUPPORT_GL) && !defined(_WIN32)
+diff --git a/libs/openxr-sdk/src/common/filesystem_utils.cpp b/libs/openxr-sdk/src/common/filesystem_utils.cpp
+--- a/libs/openxr-sdk/src/common/filesystem_utils.cpp
++++ b/libs/openxr-sdk/src/common/filesystem_utils.cpp
+@@ -88,7 +88,7 @@
+ #endif
+ 
+ #if defined(XR_USE_PLATFORM_WIN32)
+-#include <PathCch.h>
++#include <pathcch.h>
+ #endif
+ 
+ #if defined(XR_USE_PLATFORM_WIN32)
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -196,7 +196,7 @@
+ 	target_include_directories(OpenXR PUBLIC ${XrDir}/include)
+ 	# Platform-dependent flags
+ 	if (WIN32)
+-		target_link_libraries(OpenXR PUBLIC advapi32 pathcch OpenGL32)
++		target_link_libraries(OpenXR PUBLIC advapi32 pathcch opengl32)
+ 	else()
+ 		target_link_libraries(OpenXR PUBLIC -ldl)
+ 	endif()

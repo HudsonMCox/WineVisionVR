@@ -13,7 +13,8 @@ extern "C" {
 /// The plugin must enqueue the selected backend's launch and return promptly. It returns zero
 /// only after accepting that launch request; nonzero values identify rejection or failure.
 /// `request_json` is UTF-8 JSON with schemaVersion, backend, graphics, gameDirectory,
-/// executablePath, arguments, optional gameID (isolated prefix identity), and optional environment.
+/// executablePath, arguments, optional gameID (isolated prefix identity), optional environment,
+/// and optional presentation (immersiveVR by default, or desktop).
 /// Zero confirms enqueueing, not game readiness.
 /// The plugin must reject unsupported backends instead of selecting a fallback.
 typedef int32_t (*windows_vr_launch_v1_fn)(const char *request_json);
@@ -34,6 +35,8 @@ int32_t windows_vr_preflight_v1(const char *request_json);
 #define WINDOWS_VR_GRAPHICS_D3D11 (1u << 0)
 #define WINDOWS_VR_GRAPHICS_D3D12 (1u << 1)
 uint32_t windows_vr_graphics_capabilities_v1(void);
+/// Bit 0 = immersive VR, bit 1 = desktop. Missing export means immersive VR only.
+uint32_t windows_vr_presentation_capabilities_v1(void);
 int32_t windows_vr_stop_v1(void);
 
 /// Native state: 0 idle, 1 preparing, 2 wineserver startup, 3 launching,

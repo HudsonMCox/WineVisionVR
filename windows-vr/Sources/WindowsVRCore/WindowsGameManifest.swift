@@ -5,10 +5,26 @@ public enum WindowsRuntimeBackend: String, Codable, Sendable, Equatable {
     case nativeARM64
 }
 
+/// VR DLL architecture for a game started through a separate launcher.
+/// Nil uses the architecture of the executable being launched.
+public enum WindowsGuestArchitecture: String, Codable, Sendable, Equatable {
+    case x86, x64, arm64ec
+}
+
 public enum WindowsGraphicsAPI: String, Codable, Sendable, Equatable {
     case direct3D11
     case direct3D12
     case vulkan
+}
+
+public enum WindowsPresentationMode: String, Codable, Sendable, CaseIterable {
+    case immersiveVR
+    case desktop
+
+    /// Older plugins support only immersive VR. Desktop must be advertised.
+    public func isSupported(by capabilityMask: UInt32?) -> Bool {
+        (capabilityMask ?? 1) & (self == .desktop ? 2 : 1) != 0
+    }
 }
 
 public enum WindowsGameManifestError: Error, LocalizedError, Sendable, Equatable {
@@ -42,6 +58,8 @@ public struct WindowsGameManifest: Codable, Sendable, Equatable {
     public let graphics: WindowsGraphicsAPI
     public let launchArguments: [String]
     public let environment: [String: String]
+    public let presentation: WindowsPresentationMode
+    public let guestArchitecture: WindowsGuestArchitecture?
     public let schemaVersion: Int
 
     public init(
@@ -52,6 +70,8 @@ public struct WindowsGameManifest: Codable, Sendable, Equatable {
         graphics: WindowsGraphicsAPI,
         launchArguments: [String],
         environment: [String: String] = [:],
+        presentation: WindowsPresentationMode = .immersiveVR,
+        guestArchitecture: WindowsGuestArchitecture? = nil,
         schemaVersion: Int
     ) throws {
         self.id = id
@@ -61,6 +81,8 @@ public struct WindowsGameManifest: Codable, Sendable, Equatable {
         self.graphics = graphics
         self.launchArguments = launchArguments
         self.environment = environment
+        self.presentation = presentation
+        self.guestArchitecture = guestArchitecture
         self.schemaVersion = schemaVersion
         try validate()
     }
@@ -129,6 +151,8 @@ public struct WindowsGameManifest: Codable, Sendable, Equatable {
         case graphics
         case launchArguments
         case environment
+        case presentation
+        case guestArchitecture
         case schemaVersion
     }
 
@@ -141,6 +165,8 @@ public struct WindowsGameManifest: Codable, Sendable, Equatable {
         graphics = try container.decode(WindowsGraphicsAPI.self, forKey: .graphics)
         launchArguments = try container.decode([String].self, forKey: .launchArguments)
         environment = try container.decodeIfPresent([String: String].self, forKey: .environment) ?? [:]
+        presentation = try container.decodeIfPresent(WindowsPresentationMode.self, forKey: .presentation) ?? .immersiveVR
+        guestArchitecture = try container.decodeIfPresent(WindowsGuestArchitecture.self, forKey: .guestArchitecture)
         schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
         try validate()
     }
@@ -154,6 +180,8 @@ public struct WindowsGameManifest: Codable, Sendable, Equatable {
         try container.encode(graphics, forKey: .graphics)
         try container.encode(launchArguments, forKey: .launchArguments)
         try container.encode(environment, forKey: .environment)
+        try container.encode(presentation, forKey: .presentation)
+        try container.encodeIfPresent(guestArchitecture, forKey: .guestArchitecture)
         try container.encode(schemaVersion, forKey: .schemaVersion)
     }
 }

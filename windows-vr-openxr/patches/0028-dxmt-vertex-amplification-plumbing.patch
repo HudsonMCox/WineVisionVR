@@ -1,0 +1,508 @@
+diff --git a/src/airconv/air_signature.cpp b/src/airconv/air_signature.cpp
+index 6bba459..b88ccec 100644
+--- a/src/airconv/air_signature.cpp
++++ b/src/airconv/air_signature.cpp
+@@ -776,6 +776,14 @@ auto FunctionSignatureBuilder::CreateFunction(
+             ->string("mtl_vertex_id");
+           return msl_uint.get_llvm_type(context);
+         },
++        [&](const InputAmplificationID &) {
++          metadata_field.string("air.amplification_id")
++            ->string("air.arg_type_name")
++            ->string("uint") // HARDCODED
++            ->string("air.arg_name")
++            ->string("mtl_amplification_id");
++          return msl_uint.get_llvm_type(context);
++        },
+         [&](const InputBaseVertex &) {
+           metadata_field.string("air.base_vertex")
+             ->string("air.arg_type_name")
+diff --git a/src/airconv/air_signature.hpp b/src/airconv/air_signature.hpp
+index 112c680..4de55a3 100644
+--- a/src/airconv/air_signature.hpp
++++ b/src/airconv/air_signature.hpp
+@@ -509,6 +509,7 @@ struct InputInstanceID {};
+ struct InputBaseInstance {};
+ struct InputViewportArrayIndex {};
+ struct InputRenderTargetArrayIndex {};
++struct InputAmplificationID {};
+ 
+ struct InputPrimitiveID {};
+ struct InputFrontFacing {};
+@@ -589,7 +590,7 @@ using FunctionInput = template_concat_t<
+   FunctionArguments,
+   std::variant<
+     /* vertex */
+-    InputVertexID, InputInstanceID,     //
++    InputVertexID, InputInstanceID, InputAmplificationID, //
+     InputBaseVertex, InputBaseInstance, //
+     InputVertexStageIn,
+     /* fragment */
+diff --git a/src/airconv/airconv_public.h b/src/airconv/airconv_public.h
+index e167ae4..31a4d3d 100644
+--- a/src/airconv/airconv_public.h
++++ b/src/airconv/airconv_public.h
+@@ -31,6 +31,9 @@ enum SM50_BINDING_INDEX: uint32_t {
+   /* For multiple stages in the same shader function */
+   SM50_BINDING_INDEX_CONSTANT_BUFFER2 = 6,
+   SM50_BINDING_INDEX_ARGUMENT_TABLE2 = 7,
++  /* per-eye tables for vertex amplification (stereo) */
++  SM50_BINDING_INDEX_ARGUMENT_TABLE_EYE1 = 8,
++  SM50_BINDING_INDEX_CONSTANT_BUFFER_EYE1 = 9,
+ 
+   SM50_BINDING_INDEX_ROOT_ARGUMENTS = 0,
+   SM50_BINDING_INDEX_STATIC_SAMPLERS = 1,
+@@ -204,6 +207,7 @@ enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE {
+   SM50_SHADER_PSO_TESSELLATOR = 7,
+   SM50_SHADER_ROOT_SIGNATURE = 8,
+   SM50_SHADER_ROOT_SIGNATURE2 = 9,
++  SM50_SHADER_STEREO_AMPLIFICATION = 10,
+   SM50_SHADER_ARGUMENT_TYPE_MAX = 0xffffffff,
+ };
+ 
+@@ -304,6 +308,12 @@ struct SM50_SHADER_PSO_TESSELLATOR_DATA {
+   uint32_t max_potential_tess_factor;
+ };
+ 
++struct SM50_SHADER_STEREO_AMPLIFICATION_DATA {
++  void *next;
++  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
++  bool enabled;
++};
++
+ struct SM50_SHADER_ROOT_SIGNATURE_DATA {
+   void *next;
+   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+diff --git a/src/airconv/dxbc_binding_sm50.cpp b/src/airconv/dxbc_binding_sm50.cpp
+index 78e1e91..27138b9 100644
+--- a/src/airconv/dxbc_binding_sm50.cpp
++++ b/src/airconv/dxbc_binding_sm50.cpp
+@@ -14,7 +14,14 @@ public:
+   llvm::Value *
+   GetArgument(llvm::air::AIRBuilder &AIR, uint32_t TableIndex, uint32_t Index) {
+     auto Fn = AIR.builder.GetInsertBlock()->getParent();
+-    auto Arg = Fn->getArg(TableIndex);
++    llvm::Value *Arg = Fn->getArg(TableIndex);
++    if (AmplificationIndex != ~0u) {
++      auto Eye1 = EyeTableIndices.find(TableIndex);
++      if (Eye1 != EyeTableIndices.end()) {
++        auto IsEye1 = AIR.builder.CreateICmpEQ(Fn->getArg(AmplificationIndex), AIR.builder.getInt32(1));
++        Arg = AIR.builder.CreateSelect(IsEye1, Fn->getArg(Eye1->second), Arg);
++      }
++    }
+     auto TyArg = llvm::cast<llvm::PointerType>(Arg->getType())->getNonOpaquePointerElementType();
+     auto TyStruct = llvm::cast<llvm::StructType>(TyArg);
+     return AIR.builder.CreateLoad(TyStruct->getElementType(Index), AIR.builder.CreateStructGEP(TyStruct, Arg, Index));
+@@ -144,6 +151,9 @@ public:
+ 
+   uint32_t ConstantBufferTableIndex = ~0u;
+   uint32_t BindingTableIndex = ~0u;
++  /* stereo: function input carrying the amplification id, and table -> eye1 table input */
++  uint32_t AmplificationIndex = ~0u;
++  std::map<uint32_t, uint32_t> EyeTableIndices;
+ 
+   std::map<RangeId, ConstantBufferInfo> ConstantBuffers;
+   std::map<RangeId, SamplerInfo> Samplers;
+@@ -154,7 +164,7 @@ public:
+ std::unique_ptr<BindingMap>
+ setup_binding_table2(
+     const ShaderInfo *shader_info, air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
+-    uint32_t argbuffer_constant_slot, uint32_t argbuffer_slot
++    uint32_t argbuffer_constant_slot, uint32_t argbuffer_slot, bool stereo_eye1
+ ) {
+   auto binding_map = std::make_unique<SM50BindingMap>();
+ 
+@@ -172,6 +182,18 @@ setup_binding_table2(
+         .struct_type_info = metadata,
+         .arg_name = arg_name,
+     });
++    if (stereo_eye1) {
++      binding_map->EyeTableIndices[binding_map->BindingTableIndex] =
++          func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
++              .location_index = SM50_BINDING_INDEX_ARGUMENT_TABLE_EYE1,
++              .array_size = 1,
++              .memory_access = air::MemoryAccess::read,
++              .address_space = air::AddressSpace::constant,
++              .struct_type = type,
++              .struct_type_info = metadata,
++              .arg_name = "binding_table_eye1",
++          });
++    }
+   }
+   if (!shader_info->binding_table_cbuffer.Empty()) {
+     auto [type, metadata] = shader_info->binding_table_cbuffer.Build(module.getContext(), module.getDataLayout());
+@@ -187,6 +209,21 @@ setup_binding_table2(
+         .struct_type_info = metadata,
+         .arg_name = arg_name,
+     });
++    if (stereo_eye1) {
++      binding_map->EyeTableIndices[binding_map->ConstantBufferTableIndex] =
++          func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
++              .location_index = SM50_BINDING_INDEX_CONSTANT_BUFFER_EYE1,
++              .array_size = 1,
++              .memory_access = air::MemoryAccess::read,
++              .address_space = air::AddressSpace::constant,
++              .struct_type = type,
++              .struct_type_info = metadata,
++              .arg_name = "cbuffer_table_eye1",
++          });
++    }
++  }
++  if (stereo_eye1) {
++    binding_map->AmplificationIndex = func_signature.DefineInput(air::InputAmplificationID{});
+   }
+ 
+   binding_map->ConstantBuffers = shader_info->cbufferMap;
+diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
+index 430a88d..b501abe 100644
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -612,6 +612,23 @@ llvm::Error convert_dxbc_vertex_shader(
+   }
+   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
+   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
++  SM50_SHADER_STEREO_AMPLIFICATION_DATA *stereo_data = nullptr;
++  bool stereo_amplified =
++      args_get_data<SM50_SHADER_STEREO_AMPLIFICATION, SM50_SHADER_STEREO_AMPLIFICATION_DATA>(pArgs, &stereo_data) &&
++      stereo_data->enabled;
++  if (stereo_amplified) {
++    /* view mappings route the layer / viewport index, so the shader must not write it itself */
++    bool writes_layer_index = false;
++    for (auto &out : pShaderInternal->output_signature) {
++      if (out.systemValue() == D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX ||
++          out.systemValue() == D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX)
++        writes_layer_index = true;
++    }
++    if (writes_layer_index || vertex_so || rootsig ||
++        (gs_passthrough && (gs_passthrough->Data.RenderTargetArrayIndexReg != 255 ||
++                            gs_passthrough->Data.ViewportArrayIndexReg != 255)))
++      return llvm::make_error<UnsupportedFeature>("Vertex amplification is not supported for this shader");
++  }
+ 
+   IREffect prologue([](auto) { return std::monostate(); });
+   IRValue epilogue([](struct context ctx) -> pvalue {
+@@ -712,7 +729,10 @@ llvm::Error convert_dxbc_vertex_shader(
+                                    shader_info, func_signature, module, D3D10_SB_VERTEX_SHADER, rootsig->bytecode,
+                                    rootsig->bytecode_length
+                                )
+-                             : setup_binding_table2(shader_info, func_signature, module);
++                             : setup_binding_table2(
++                                   shader_info, func_signature, module, SM50_BINDING_INDEX_CONSTANT_BUFFER,
++                                   SM50_BINDING_INDEX_ARGUMENT_TABLE, stereo_amplified
++                               );
+ 
+   uint32_t rta_idx_out = ~0u;
+   if (gs_passthrough && gs_passthrough->Data.RenderTargetArrayIndexReg != 255) {
+diff --git a/src/airconv/dxbc_converter.hpp b/src/airconv/dxbc_converter.hpp
+index a64f6e0..2f5e1a1 100644
+--- a/src/airconv/dxbc_converter.hpp
++++ b/src/airconv/dxbc_converter.hpp
+@@ -401,6 +401,8 @@ public:
+     return system_value_ != microsoft::D3D10_SB_NAME_UNDEFINED;
+   }
+ 
++  microsoft::D3D10_SB_NAME systemValue() const { return system_value_; }
++
+   RegisterComponentType componentType() const {
+     return (RegisterComponentType)component_type_;
+   }
+@@ -474,7 +476,8 @@ size_t estimate_mesh_size(SM50ShaderInternal *pDomainStage, uint32_t max_potenti
+ 
+ std::unique_ptr<BindingMap> setup_binding_table2(
+     const ShaderInfo *shader_info, air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
+-    uint32_t argbuffer_constant_slot = SM50_BINDING_INDEX_CONSTANT_BUFFER, uint32_t argbuffer_slot = SM50_BINDING_INDEX_ARGUMENT_TABLE
++    uint32_t argbuffer_constant_slot = SM50_BINDING_INDEX_CONSTANT_BUFFER, uint32_t argbuffer_slot = SM50_BINDING_INDEX_ARGUMENT_TABLE,
++    bool stereo_eye1 = false
+ );
+ 
+ std::unique_ptr<BindingMap> setup_binding_rootsig(
+diff --git a/src/d3d11/d3d11_pipeline.cpp b/src/d3d11/d3d11_pipeline.cpp
+index 8ea32be..14bf373 100644
+--- a/src/d3d11/d3d11_pipeline.cpp
++++ b/src/d3d11/d3d11_pipeline.cpp
+@@ -18,7 +18,7 @@ public:
+         topology_class(pDesc->TopologyClass), device_(pDevice),
+         pBlendState(pDesc->BlendState),
+         RasterizationEnabled(pDesc->RasterizationEnabled),
+-        SampleCount(pDesc->SampleCount) {
++        SampleCount(pDesc->SampleCount), StereoAmplified(pDesc->StereoAmplified) {
+     uint32_t unorm_output_reg_mask = 0;
+     for (unsigned i = 0; i < num_rtvs; i++) {
+       rtv_formats[i] = pDesc->ColorAttachmentFormats[i];
+@@ -31,7 +31,7 @@ public:
+               pDesc->InputLayout, (uint64_t)pDesc->SOLayout});
+     } else {
+       VertexShader = pDesc->VertexShader->get_shader(ShaderVariantVertex{
+-          pDesc->InputLayout, pDesc->GSPassthrough, !pDesc->RasterizationEnabled});
++          pDesc->InputLayout, pDesc->GSPassthrough, !pDesc->RasterizationEnabled, pDesc->StereoAmplified});
+     }
+ 
+     if (pDesc->PixelShader) {
+@@ -93,6 +93,8 @@ public:
+ 
+     info.input_primitive_topology = topology_class;
+     info.raster_sample_count = SampleCount;
++    if (StereoAmplified)
++      info.max_vertex_amplification_count = 2;
+     info.immutable_vertex_buffers = (1 << 16) | (1 << 29) | (1 << 30);
+     info.immutable_fragment_buffers = (1 << 29) | (1 << 30);
+ 
+@@ -129,6 +131,7 @@ private:
+   WMT::Reference<WMT::RenderPipelineState> state_;
+   bool RasterizationEnabled;
+   UINT SampleCount;
++  bool StereoAmplified;
+ };
+ 
+ std::unique_ptr<MTLCompiledGraphicsPipeline>
+diff --git a/src/d3d11/d3d11_pipeline.hpp b/src/d3d11/d3d11_pipeline.hpp
+index 1a9c4f4..b376aaa 100644
+--- a/src/d3d11/d3d11_pipeline.hpp
++++ b/src/d3d11/d3d11_pipeline.hpp
+@@ -26,6 +26,7 @@ struct MTL_GRAPHICS_PIPELINE_DESC {
+   SM50_INDEX_BUFFER_FORMAT IndexBufferFormat;
+   uint32_t SampleMask;
+   uint32_t GSPassthrough;
++  bool StereoAmplified = false;
+ };
+ 
+ struct MTL_COMPUTE_PIPELINE_DESC {
+@@ -64,6 +65,7 @@ template <> struct hash<MTL_GRAPHICS_PIPELINE_DESC> {
+     state.add((size_t)v.GSStripTopology);
+     state.add((size_t)v.SampleMask);
+     state.add((size_t)v.GSPassthrough);
++    state.add((size_t)v.StereoAmplified);
+     state.add((size_t)v.SampleCount);
+     state.add((size_t)v.NumColorAttachments);
+     for (unsigned i = 0; i < v.NumColorAttachments; i++) {
+@@ -133,7 +135,8 @@ template <> struct equal_to<MTL_GRAPHICS_PIPELINE_DESC> {
+            (x.SampleCount == y.SampleCount) &&
+            (x.IndexBufferFormat == y.IndexBufferFormat) &&
+            (x.SampleMask == y.SampleMask) &&
+-           (x.GSPassthrough == y.GSPassthrough);
++           (x.GSPassthrough == y.GSPassthrough) &&
++           (x.StereoAmplified == y.StereoAmplified);
+   }
+ };
+ } // namespace std
+diff --git a/src/d3d11/d3d11_pipeline_cache.cpp b/src/d3d11/d3d11_pipeline_cache.cpp
+index 8fd703c..4712de7 100644
+--- a/src/d3d11/d3d11_pipeline_cache.cpp
++++ b/src/d3d11/d3d11_pipeline_cache.cpp
+@@ -74,6 +74,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+     Sha1Digest sha1_;
+     MTL_SHADER_REFLECTION reflection_;
+     bool foveation_safe_ = false;
++    bool stereo_safe_ = false;
+     MTL_SM50_SHADER_ARGUMENT *arguments_info_buffer;
+     std::unordered_map<ShaderVariant, std::unique_ptr<CompiledShader>> variants;
+ 
+@@ -95,6 +96,17 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+             foveation_safe_ = false;
+         }
+       }
++      microsoft::CSignatureParser output;
++      if (SUCCEEDED(microsoft::DXBCGetOutputSignature(bytecode, &output))) {
++        const microsoft::D3D11_SIGNATURE_PARAMETER *parameters = nullptr;
++        const auto count = output.GetParameters(&parameters);
++        stereo_safe_ = true;
++        for (unsigned i = 0; i < count; ++i) {
++          if (parameters[i].SystemValue == microsoft::D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX ||
++              parameters[i].SystemValue == microsoft::D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX)
++            stereo_safe_ = false;
++        }
++      }
+       if (reflection_.NumConstantBuffers + reflection_.NumArguments) {
+         arguments_info_buffer = (MTL_SM50_SHADER_ARGUMENT *)malloc(
+             sizeof(MTL_SM50_SHADER_ARGUMENT) *
+@@ -122,6 +134,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+     virtual sm50_shader_t handle() { return shader; };
+     virtual MTL_SHADER_REFLECTION &reflection() { return reflection_; }
+     bool allowsFoveatedRaster() const override { return foveation_safe_; }
++    bool allowsStereoAmplification() const override { return stereo_safe_; }
+     virtual MTL_SM50_SHADER_ARGUMENT *constant_buffers_info() {
+       return arguments_info_buffer;
+     };
+@@ -410,6 +423,28 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+     *ppPipeline = iter->second.get();
+   }
+ 
++  MTLCompiledGraphicsPipeline *GetStereoGraphicsPipeline(MTL_GRAPHICS_PIPELINE_DESC *pDesc) override {
++    if (pDesc->GeometryShader || pDesc->HullShader || pDesc->DomainShader || pDesc->SOLayout ||
++        !pDesc->VertexShader || !pDesc->VertexShader->allowsStereoAmplification())
++      return nullptr;
++    MTL_GRAPHICS_PIPELINE_DESC stereo_desc = *pDesc;
++    stereo_desc.StereoAmplified = true;
++    std::lock_guard<dxmt::mutex> lock(mutex_);
++    auto iter = pipelines_.find(stereo_desc);
++    if (iter == pipelines_.end()) {
++      auto [inserted_iter, inserted] = pipelines_.insert({stereo_desc, CreateGraphicsPipeline(device, &stereo_desc)});
++      if (!inserted) {
++        D3D11_ASSERT(0 && "duplicated stereo graphics pipeline");
++      } else {
++        scheduler_.submit(inserted_iter->second.get());
++      }
++      return nullptr;
++    }
++    if (!iter->second->GetIsDone())
++      return nullptr;
++    return iter->second.get();
++  }
++
+   void GetGeometryPipeline(
+       MTL_GRAPHICS_PIPELINE_DESC *pDesc,
+       MTLCompiledGeometryPipeline **ppPipeline) override {
+diff --git a/src/d3d11/d3d11_pipeline_cache.hpp b/src/d3d11/d3d11_pipeline_cache.hpp
+index 5439520..36ee6cf 100644
+--- a/src/d3d11/d3d11_pipeline_cache.hpp
++++ b/src/d3d11/d3d11_pipeline_cache.hpp
+@@ -25,6 +25,12 @@ public:
+   virtual HRESULT AddBlendState(const D3D11_BLEND_DESC1 *pBlendDesc, IMTLD3D11BlendState **ppBlendState) = 0;
+   virtual void
+   GetGraphicsPipeline(MTL_GRAPHICS_PIPELINE_DESC *pPipelineDesc, MTLCompiledGraphicsPipeline **ppPipeline) = 0;
++  /**
++  returns nullptr if stereo amplification is unsupported for this pipeline, or while the stereo
++  variant is still compiling. Never blocks; once it returns non-null, GetPipeline() on the result does not block.
++  The PSO may still be null if the driver rejected it, so check GetPipeline() output.
++  */
++  virtual MTLCompiledGraphicsPipeline *GetStereoGraphicsPipeline(MTL_GRAPHICS_PIPELINE_DESC *pDesc) = 0;
+   virtual void GetGeometryPipeline(MTL_GRAPHICS_PIPELINE_DESC *pDesc, MTLCompiledGeometryPipeline **ppPipeline) = 0;
+   virtual void
+   GetTessellationPipeline(MTL_GRAPHICS_PIPELINE_DESC *pDesc, MTLCompiledTessellationMeshPipeline **ppPipeline) = 0;
+diff --git a/src/d3d11/d3d11_shader.cpp b/src/d3d11/d3d11_shader.cpp
+index e11d16c..295d667 100644
+--- a/src/d3d11/d3d11_shader.cpp
++++ b/src/d3d11/d3d11_shader.cpp
+@@ -124,6 +124,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+   h.update(getGlobalShaderFlag());
+   h.update(variant.gs_passthrough);
+   h.update(variant.rasterization_disabled);
++  h.update(variant.stereo_amplified);
+   if (variant.input_layout_handle)
+     h.update(variant.input_layout_handle->sha1());
+   auto variant_digest = h.final();
+@@ -146,6 +147,14 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+           (MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC **)&data_ia_layout.elements);
+     }
+ 
++    SM50_SHADER_STEREO_AMPLIFICATION_DATA data_stereo;
++    if (variant.stereo_amplified) {
++      data_stereo.type = SM50_SHADER_STEREO_AMPLIFICATION;
++      data_stereo.enabled = true;
++      data_stereo.next = data_gs_passthrough.next;
++      data_gs_passthrough.next = &data_stereo;
++    }
++
+     sm50_bitcode_t compile_result = nullptr;
+     sm50_error_t sm50_err = nullptr;
+     if (SM50Compile(
+diff --git a/src/d3d11/d3d11_shader.hpp b/src/d3d11/d3d11_shader.hpp
+index 255b3f3..f7a619e 100644
+--- a/src/d3d11/d3d11_shader.hpp
++++ b/src/d3d11/d3d11_shader.hpp
+@@ -91,10 +91,12 @@ struct ShaderVariantVertex {
+   ManagedInputLayout input_layout_handle;
+   uint32_t gs_passthrough;
+   bool rasterization_disabled;
++  bool stereo_amplified = false;
+   bool operator==(const this_type &rhs) const {
+     return input_layout_handle == rhs.input_layout_handle &&
+            gs_passthrough == rhs.gs_passthrough &&
+-           rasterization_disabled == rhs.rasterization_disabled;
++           rasterization_disabled == rhs.rasterization_disabled &&
++           stereo_amplified == rhs.stereo_amplified;
+   }
+ };
+ 
+@@ -210,6 +212,7 @@ public:
+   /* FIXME: exposed implementation detail */
+   virtual MTL_SHADER_REFLECTION &reflection() = 0;
+   virtual bool allowsFoveatedRaster() const = 0;
++  virtual bool allowsStereoAmplification() const = 0;
+   virtual MTL_SM50_SHADER_ARGUMENT *constant_buffers_info() = 0;
+   virtual MTL_SM50_SHADER_ARGUMENT *arguments_info() = 0;
+   virtual CompiledShader *get_shader(ShaderVariant variant) = 0;
+diff --git a/src/winemetal/Metal.hpp b/src/winemetal/Metal.hpp
+index 8224a0c..9b8eb7d 100644
+--- a/src/winemetal/Metal.hpp
++++ b/src/winemetal/Metal.hpp
+@@ -1148,6 +1148,7 @@ InitializeRenderPipelineInfo(WMTRenderPipelineInfo &info) {
+ 
+   info.input_primitive_topology = WMTPrimitiveTopologyClassUnspecified;
+   info.max_tessellation_factor = 16.0f;
++  info.max_vertex_amplification_count = 1;
+   info.tessellation_factor_step = WMTTessellationFactorStepFunctionConstant;
+   info.tessellation_partition_mode = WMTTessellationPartitionModePow2;
+   info.tessellation_output_winding_order = WMTWindingClockwise;
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 6902483..d8b9f95 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -614,6 +614,8 @@ _MTLDevice_newRenderPipelineState(void *obj) {
+   descriptor.vertexFunction = (id<MTLFunction>)info->vertex_function;
+   descriptor.fragmentFunction = (id<MTLFunction>)info->fragment_function;
+   descriptor.supportIndirectCommandBuffers = info->support_indirect_command_buffers;
++  if (info->max_vertex_amplification_count > 1)
++    descriptor.maxVertexAmplificationCount = info->max_vertex_amplification_count;
+ 
+   if (info->num_binary_archives_for_lookup && info->binary_archives_for_lookup.ptr)
+     descriptor.binaryArchives = [NSArray arrayWithObjects:(id<MTLBinaryArchive> *)info->binary_archives_for_lookup.ptr
+@@ -1039,6 +1041,16 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       [encoder setDepthStencilState:(id<MTLDepthStencilState>)body->depth_stencil_state];
+       break;
+     }
++    case WMTRenderCommandSetVertexAmplification: {
++      struct wmtcmd_render_setvertexamplification *body = (struct wmtcmd_render_setvertexamplification *)next;
++      MTLVertexAmplificationViewMapping mappings[2];
++      for (unsigned i = 0; i < 2; i++) {
++        mappings[i].viewportArrayIndexOffset = body->mappings[i].viewport_array_index_offset;
++        mappings[i].renderTargetArrayIndexOffset = body->mappings[i].render_target_array_index_offset;
++      }
++      [encoder setVertexAmplificationCount:body->count viewMappings:mappings];
++      break;
++    }
+     case WMTRenderCommandSetBlendFactorAndStencilRef: {
+       struct wmtcmd_render_setblendcolor *body = (struct wmtcmd_render_setblendcolor *)next;
+       [encoder setBlendColorRed:body->red green:body->green blue:body->blue alpha:body->alpha];
+diff --git a/src/winemetal/winemetal.h b/src/winemetal/winemetal.h
+index 97fffc7..7e834c0 100644
+--- a/src/winemetal/winemetal.h
++++ b/src/winemetal/winemetal.h
+@@ -828,7 +828,8 @@ struct WMTRenderPipelineInfo {
+   uint8_t num_binary_archives_for_lookup;
+   bool fail_on_binary_archive_miss;
+   bool support_indirect_command_buffers;
+-  uint8_t padding[5];
++  uint8_t max_vertex_amplification_count;
++  uint8_t padding[4];
+ };
+ 
+ struct WMTMeshRenderPipelineInfo {
+@@ -1229,6 +1230,7 @@ enum WMTRenderCommandType : uint16_t {
+   WMTRenderCommandSetBlendFactor,
+   WMTRenderCommandSetStencilRef,
+   WMTRenderCommandSetDepthStencilState,
++  WMTRenderCommandSetVertexAmplification,
+ };
+ 
+ struct wmtcmd_render_nop {
+@@ -1486,6 +1488,19 @@ struct wmtcmd_render_setdepthstencilstate {
+   obj_handle_t depth_stencil_state;
+ };
+ 
++struct WMTVertexAmplificationViewMapping {
++  uint32_t viewport_array_index_offset;
++  uint32_t render_target_array_index_offset;
++};
++
++struct wmtcmd_render_setvertexamplification {
++  enum WMTRenderCommandType type;
++  uint16_t reserved[3];
++  struct WMTMemoryPointer next;
++  uint32_t count;
++  struct WMTVertexAmplificationViewMapping mappings[2];
++};
++
+ struct wmtcmd_render_setblendcolor {
+   enum WMTRenderCommandType type;
+   uint16_t reserved[3];

@@ -56,6 +56,16 @@ targets:
       - path: Resources/Runtime
         type: folder
         buildPhase: resources
+      # Native ntdll init_paths() reads NLS from <bundle>/nls, independently
+      # of the PE DLL search path and the wineserver NLS directory.
+      - path: Resources/Runtime/nls
+        type: folder
+        buildPhase: resources
+      # win32u scans the native loader's data_dir/fonts. Preserve the pinned
+      # Wine font folder, including its font sources and copyright notices.
+      - path: ${AVPPLAY_RUNTIME_SOURCE}/wine/fonts
+        type: folder
+        buildPhase: resources
       # Required at bundle root by Wine's bootstrap loader.
       - path: Resources/Runtime/aarch64-windows/ntdll.dll
         buildPhase:
@@ -78,6 +88,12 @@ targets:
             destination: resources
             subpath: arm64ec-windows
       - path: Resources/WindowsVR
+        type: folder
+        buildPhase: resources
+      - path: Resources/VRSmoke
+        type: folder
+        buildPhase: resources
+      - path: Resources/DesktopDemo
         type: folder
         buildPhase: resources
       # Copy helper files individually: a folder resource would replace the
@@ -106,6 +122,7 @@ targets:
         basedOnDependencyAnalysis: false
         inputFiles:
           - $(SRCROOT)/../windows-vr-tools/verify_wine_bundle.sh
+          - $(SRCROOT)/../windows-vr-tools/verify_wine_imports.py
           - $(SRCROOT)/../windows-vr-tools/verify_dxmt_bundle.py
           - $(SRCROOT)/../windows-vr-tools/verify_openvr_bundle.py
           - $(SRCROOT)/../windows-runtime-plugin/WindowsVRRuntimePlugin.mm
@@ -114,8 +131,6 @@ targets:
     type: framework
     platform: visionOS
     dependencies:
-      - framework: ../dist/windows-vr-air-writer-foveation/libWindowsVRAIRWriter.a
-        embed: false
       - sdk: QuartzCore.framework
       - sdk: Metal.framework
       - sdk: AVFAudio.framework
@@ -126,8 +141,6 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.avpplay.windows-vr.native-bridge
-        GCC_PREPROCESSOR_DEFINITIONS: ["$(inherited)", "WVR_SOURCE_AIR_WRITER=1"]
-        LIBRARY_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/../dist/windows-vr-air-writer-foveation"]
         EXPORTED_SYMBOLS_FILE: $(SRCROOT)/../windows-vr-native/shader-compiler/NativeBridge.exports
         GENERATE_INFOPLIST_FILE: YES
         CLANG_ENABLE_OBJC_ARC: YES
@@ -217,6 +230,10 @@ targets:
           # Optional legacy DXMT release diagnostics are absent in the modern
           # backend; preserve the existing weak-import/null-check semantics.
           - -Wl,-U,_madeira_wmt_released_class
+          # Modern-profile probes are optional in the legacy x86 build.
+          # Mach-O requires explicit unresolved-weak permission at link time.
+          - -Wl,-U,_wvr_dxmt_d3d12_unix_call_count_v1
+          - -Wl,-U,_wvr_dxmt_d3d12_transport_abi_v1
           - -framework
           - IOKit
           - -framework

@@ -1,0 +1,315 @@
+diff --git a/OpenOVR/Compositor/WVRTextureBounds.h b/OpenOVR/Compositor/WVRTextureBounds.h
+new file mode 100644
+index 0000000..160bdd2
+--- /dev/null
++++ b/OpenOVR/Compositor/WVRTextureBounds.h
+@@ -0,0 +1,28 @@
++#pragma once
++#include <cmath>
++#include <cstring>
++
++// Matches the HLSL float4 at b0. Signed extent is deliberately retained for
++// GPU inversion; submitted OpenXR rectangles remain positive and eye-local.
++struct WVRBoundsUniform { float originX, originY, extentX, extentY; };
++static_assert(sizeof(WVRBoundsUniform) == 16);
++inline bool WVRMakeBoundsUniform(float uMin, float uMax, float vMin, float vMax,
++                                WVRBoundsUniform& out)
++{
++    if (!std::isfinite(uMin) || !std::isfinite(uMax) ||
++        !std::isfinite(vMin) || !std::isfinite(vMax) ||
++        uMin < 0 || uMin > 1 || uMax < 0 || uMax > 1 ||
++        vMin < 0 || vMin > 1 || vMax < 0 || vMax > 1 ||
++        uMin == uMax || vMin == vMax) return false;
++    out = {uMin, vMin, uMax - uMin, vMax - vMin};
++    return true;
++}
++
++// Resolver allocation depends on the full source, not only its eye crop.
++template<class Desc> inline bool WVRSameSourceShape(const Desc& a, const Desc& b)
++{
++    return a.Width == b.Width && a.Height == b.Height &&
++        a.ArraySize == b.ArraySize && a.MipLevels == b.MipLevels &&
++        a.Format == b.Format && a.SampleDesc.Count == b.SampleDesc.Count &&
++        a.SampleDesc.Quality == b.SampleDesc.Quality;
++}
+diff --git a/OpenOVR/Compositor/compositor.cpp b/OpenOVR/Compositor/compositor.cpp
+index c9456b5..f231cff 100644
+--- a/OpenOVR/Compositor/compositor.cpp
++++ b/OpenOVR/Compositor/compositor.cpp
+@@ -11,9 +11,14 @@ Compositor::~Compositor()
+ 	}
+ }
+ 
++bool Compositor::InvertBoundsInCompositor(const vr::VRTextureBounds_t*) const
++{
++	return oovr_global_configuration.InvertUsingShaders();
++}
++
+ void Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, XrSwapchainSubImage& subImage, std::optional<XruEye> eye, vr::EVRSubmitFlags submitFlags)
+ {
+-	bool invertInCompositor = oovr_global_configuration.InvertUsingShaders();
++	bool invertInCompositor = InvertBoundsInCompositor(bounds);
+ 	if (bounds && bounds->vMin == 0.0f && bounds->vMax == 1.0f && bounds->uMin == 0.0f && bounds->uMax == 1.0f)
+ 		bounds = nullptr;
+ 	CopyToSwapchain(texture, invertInCompositor ? bounds : nullptr, eye, submitFlags);
+diff --git a/OpenOVR/Compositor/compositor.h b/OpenOVR/Compositor/compositor.h
+index a9b0335..574d4bb 100644
+--- a/OpenOVR/Compositor/compositor.h
++++ b/OpenOVR/Compositor/compositor.h
+@@ -41,6 +41,7 @@ public:
+ 	virtual void ResetSubmitContext() {};
+ 
+ protected:
++	virtual bool InvertBoundsInCompositor(const vr::VRTextureBounds_t* bounds) const;
+ 	virtual void CopyToSwapchain(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, std::optional<XruEye> eye, vr::EVRSubmitFlags submitFlags) = 0;
+ 
+ 	XrSwapchain chain = XR_NULL_HANDLE;
+diff --git a/OpenOVR/Compositor/dx11compositor.cpp b/OpenOVR/Compositor/dx11compositor.cpp
+index 50d31ae..9cb28a0 100644
+--- a/OpenOVR/Compositor/dx11compositor.cpp
++++ b/OpenOVR/Compositor/dx11compositor.cpp
+@@ -3,6 +3,7 @@
+ #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+ 
+ #include "dx11compositor.h"
++#include "WVRTextureBounds.h"
+ 
+ #include "../Misc/Config.h"
+ #include "../Misc/xr_ext.h"
+@@ -15,6 +16,12 @@ constexpr char fs_shader_code[] = R"_(
+ Texture2D shaderTexture : register(t0);
+ 
+ SamplerState SampleType : register(s0);
++cbuffer WVRBounds : register(b0) { float4 wvr_uvOriginExtent; };
++
++float2 wvr_map_bounds(float2 uv, float4 originExtent)
++{
++	return originExtent.xy + uv * originExtent.zw;
++}
+ 
+ struct psIn {
+ 	float4 pos : SV_POSITION;
+@@ -26,7 +33,7 @@ psIn vs_fs(uint vI : SV_VERTEXID)
+ 	psIn output;
+     output.tex = float2(vI&1,vI>>1);
+     output.pos = float4((output.tex.x-0.5f)*2,-(output.tex.y-0.5f)*2,0,1);
+-	output.tex.y = 1.0f - output.tex.y;
++	output.tex = wvr_map_bounds(output.tex, wvr_uvOriginExtent);
+ 	return output;
+ }
+ 
+@@ -104,6 +111,15 @@ DX11Compositor::DX11Compositor(ID3D11Texture2D* initial)
+ {
+ 	initial->GetDevice(&device);
+ 	device->GetImmediateContext(&context);
++	// ExecuteCommandList(TRUE) preserves every Unity pipeline binding. The
++	// immediate context must not be left with our fullscreen shaders/targets.
++	OOVR_FAILED_DX_ABORT(device->CreateDeferredContext(0, &boundsContext));
++	D3D11_BUFFER_DESC uvDesc{};
++	uvDesc.ByteWidth = sizeof(WVRBoundsUniform);
++	uvDesc.Usage = D3D11_USAGE_DYNAMIC;
++	uvDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++	uvDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
++	OOVR_FAILED_DX_ABORT(device->CreateBuffer(&uvDesc, nullptr, &boundsUniform));
+ 
+ 	// Shaders for inverting copy
+ 	ID3DBlob* fs_vert_shader_blob = d3d_compile_shader(fs_shader_code, "vs_fs", "vs_5_0");
+@@ -143,10 +159,19 @@ DX11Compositor::~DX11Compositor()
+ 
+ 	resolvedMSAATextures.clear();
+ 
++	if (boundsUniform) boundsUniform->Release();
++	if (boundsContext) boundsContext->Release();
+ 	context->Release();
+ 	device->Release();
+ }
+ 
++bool DX11Compositor::InvertBoundsInCompositor(const vr::VRTextureBounds_t* bounds) const
++{
++	// OpenXR image rectangles cannot encode OpenVR's negative-height bounds.
++	return Compositor::InvertBoundsInCompositor(bounds) ||
++	    (bounds && bounds->vMin > bounds->vMax);
++}
++
+ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, bool cube)
+ {
+ 	XrSwapchainCreateInfo& desc = createInfo;
+@@ -155,6 +180,7 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
+ 
+ 	D3D11_TEXTURE2D_DESC srcDesc;
+ 	src->GetDesc(&srcDesc);
++	const D3D11_TEXTURE2D_DESC fullSource = srcDesc;
+ 
+ 	if (bounds) {
+ 		if (std::fabs(bounds->uMax - bounds->uMin) > 0.1)
+@@ -169,9 +195,11 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
+ 		srcDesc.Height = srcDesc.Width = std::min(srcDesc.Height, srcDesc.Width);
+ 	}
+ 
+-	bool usable = chain == NULL ? false : CheckChainCompatible(srcDesc, texture->eColorSpace);
++	bool usable = chain != NULL && CheckChainCompatible(srcDesc, texture->eColorSpace) &&
++	    WVRSameSourceShape(sourceShape, fullSource);
+ 
+ 	if (!usable) {
++		sourceShape = fullSource;
+ 		OOVR_LOG("Generating new swap chain");
+ 
+ 		if (bounds)
+@@ -261,15 +289,23 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
+ 			swapchain_rtvs[i] = d3d_make_rtv(device, (XrBaseInStructure&)imagesHandles[i], type);
+ 		}
+ 
+-		if (srcDesc.SampleDesc.Count > 1) {
++		if (srcDesc.SampleDesc.Count > 1 || srcDesc.ArraySize > 1) {
+ 			OOVR_LOGF("Creating resolver textures for MSAA source with sample count x%d", srcDesc.SampleDesc.Count);
+-			D3D11_TEXTURE2D_DESC resDesc = srcDesc;
++			D3D11_TEXTURE2D_DESC resDesc{};
++			src->GetDesc(&resDesc); // Full source: cropping happens in the shader.
+ 			resDesc.SampleDesc.Count = 1;
++			resDesc.SampleDesc.Quality = 0;
++			resDesc.ArraySize = 1;
++			resDesc.MipLevels = 1;
++			resDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++			resDesc.MiscFlags = 0;
++			resDesc.Usage = D3D11_USAGE_DEFAULT;
++			resDesc.CPUAccessFlags = 0;
+ 
+ 			resolvedMSAATextures.resize(imageCount, nullptr);
+ 
+ 			for (uint32_t i = 0; i < imageCount; i++) {
+-				device->CreateTexture2D(&resDesc, nullptr, &resolvedMSAATextures[i]);
++				OOVR_FAILED_DX_ABORT(device->CreateTexture2D(&resDesc, nullptr, &resolvedMSAATextures[i]));
+ 			}
+ 		}
+ 
+@@ -325,65 +361,48 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 	sourceRegion.front = 0;
+ 	sourceRegion.back = 1;
+ 
+-	// Bounds describe an inverted image so copy texture using pixel shader inverting on copy
+-	if (bounds && bounds->vMin > bounds->vMax && oovr_global_configuration.InvertUsingShaders() && !swapchain_rtvs.empty()) {
+-		auto* src = (ID3D11Texture2D*)texture->handle;
+-
+-		OOVR_FAILED_DX_ABORT(device->CreateShaderResourceView(src, nullptr, &quad_texture_view));
+-
+-		float blend_factor[4] = { 1.f, 1.f, 1.f, 1.f };
+-		context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+-
+-		UINT numViewPorts;
+-		context->RSGetViewports(&numViewPorts, nullptr);
+-		std::vector<D3D11_VIEWPORT> viewports;
+-		viewports.resize(numViewPorts);
+-		context->RSGetViewports(&numViewPorts, viewports.data());
+-
+-		UINT numScissors;
+-		context->RSGetScissorRects(&numScissors, nullptr);
+-		std::vector<D3D11_RECT> scissors;
+-		scissors.resize(numScissors);
+-		context->RSGetScissorRects(&numScissors, scissors.data());
+-
+-		ID3D11RasterizerState* pRSState;
+-		context->RSGetState(&pRSState);
+-		context->RSSetState(nullptr);
+-
+-		D3D11_VIEWPORT viewport = { 0.0f, 0.0f, static_cast<float>(createInfo.width), static_cast<float>(createInfo.height), 0.0f, 1.0f };
+-		context->RSSetViewports(1, &viewport);
+-		D3D11_RECT rects[1];
+-		rects[0].top = 0;
+-		rects[0].left = 0;
+-		rects[0].bottom = createInfo.height;
+-		rects[0].right = createInfo.width;
+-		context->RSSetScissorRects(1, rects);
+-
+-		// Set up for rendering
+-		context->OMSetRenderTargets(1, &swapchain_rtvs[currentIndex], nullptr);
+-		float clear_colour[4] = { 0.f, 0.f, 0.f, 0.f };
+-		context->ClearRenderTargetView(swapchain_rtvs[currentIndex], clear_colour);
+-
+-		// Set the active shaders and constant buffers.
+-		context->PSSetShaderResources(0, 1, &quad_texture_view);
+-		context->VSSetShader(fs_vshader, nullptr, 0);
+-		context->PSSetShader(fs_pshader, nullptr, 0);
+-		context->PSSetSamplers(0, 1, &quad_sampleState);
+-
+-		// Set up the mesh's information
+-		D3D11_PRIMITIVE_TOPOLOGY currTopology;
+-		context->IAGetPrimitiveTopology(&currTopology);
+-		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+-		context->Draw(4, 0);
+-		context->IASetPrimitiveTopology(currTopology);
++	// The base compositor passes bounds here when this path owns the crop.
++	// Apply eye selection and vertical inversion in one sample operation.
++	if (bounds && !swapchain_rtvs.empty()) {
++		WVRBoundsUniform uv{};
++		OOVR_FALSE_ABORT(WVRMakeBoundsUniform(bounds->uMin, bounds->uMax,
++		    bounds->vMin, bounds->vMax, uv));
++		ID3D11Texture2D* sampleTexture = src;
++		const UINT eyeSlice = srcDesc.ArraySize > 1 && eye.has_value() ? static_cast<UINT>(*eye) : 0;
++		if (srcDesc.SampleDesc.Count > 1 || srcDesc.ArraySize > 1) {
++			sampleTexture = resolvedMSAATextures[currentIndex];
++			const UINT sourceSubresource = D3D11CalcSubresource(0, eyeSlice, srcDesc.MipLevels);
++			if (srcDesc.SampleDesc.Count > 1)
++				context->ResolveSubresource(sampleTexture, 0, src, sourceSubresource, static_cast<DXGI_FORMAT>(createInfo.format));
++			else
++				context->CopySubresourceRegion(sampleTexture, 0, 0, 0, 0, src, sourceSubresource, nullptr);
++		}
++		D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
++		srv.Format = static_cast<DXGI_FORMAT>(createInfo.format);
++		srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
++		srv.Texture2D.MipLevels = 1;
++		OOVR_FAILED_DX_ABORT(device->CreateShaderResourceView(sampleTexture, &srv, &quad_texture_view));
++		D3D11_MAPPED_SUBRESOURCE mapped{};
++		OOVR_FAILED_DX_ABORT(boundsContext->Map(boundsUniform, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
++		std::memcpy(mapped.pData, &uv, sizeof(uv));
++		boundsContext->Unmap(boundsUniform, 0);
++		D3D11_VIEWPORT viewport{0, 0, static_cast<float>(createInfo.width), static_cast<float>(createInfo.height), 0, 1};
++		boundsContext->RSSetViewports(1, &viewport);
++		boundsContext->RSSetState(nullptr);
++		boundsContext->OMSetRenderTargets(1, &swapchain_rtvs[currentIndex], nullptr);
++		boundsContext->VSSetShader(fs_vshader, nullptr, 0);
++		boundsContext->VSSetConstantBuffers(0, 1, &boundsUniform);
++		boundsContext->PSSetShader(fs_pshader, nullptr, 0);
++		boundsContext->PSSetShaderResources(0, 1, &quad_texture_view);
++		boundsContext->PSSetSamplers(0, 1, &quad_sampleState);
++		boundsContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
++		boundsContext->Draw(4, 0);
++		ID3D11CommandList* commands = nullptr;
++		OOVR_FAILED_DX_ABORT(boundsContext->FinishCommandList(FALSE, &commands));
++		context->ExecuteCommandList(commands, TRUE);
++		commands->Release();
+ 		quad_texture_view->Release();
+-
+-		if (numViewPorts)
+-			context->RSSetViewports(numViewPorts, viewports.data());
+-		if (numScissors)
+-			context->RSSetScissorRects(numScissors, scissors.data());
+-
+-		context->RSSetState(pRSState);
++		quad_texture_view = nullptr;
+ 	} else {
+ 		// Apparently SteamVR supports apps just sending array textures without specifying what's what.
+ 		const int arrayIndex = (srcDesc.ArraySize > 1 && eye.has_value()) ? static_cast<int>(*eye) : 0;
+@@ -391,7 +410,7 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 			D3D11_TEXTURE2D_DESC resDesc = srcDesc;
+ 			resDesc.SampleDesc.Count = 1;
+ 			context->ResolveSubresource(resolvedMSAATextures[currentIndex], 0, src, arrayIndex, resDesc.Format);
+-			context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0, 0, 0, 0, resolvedMSAATextures[currentIndex], arrayIndex, &sourceRegion);
++			context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0, 0, 0, 0, resolvedMSAATextures[currentIndex], 0, &sourceRegion);
+ 		} else {
+ 			context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0, 0, 0, 0, src, arrayIndex, &sourceRegion);
+ 		}
+diff --git a/OpenOVR/Compositor/dx11compositor.h b/OpenOVR/Compositor/dx11compositor.h
+index 1f8fa64..13846c2 100644
+--- a/OpenOVR/Compositor/dx11compositor.h
++++ b/OpenOVR/Compositor/dx11compositor.h
+@@ -17,6 +17,10 @@ public:
+ 	ID3D11Device* GetDevice() { return device; }
+ 
+ protected:
++	bool InvertBoundsInCompositor(const vr::VRTextureBounds_t* bounds) const override;
++	ID3D11DeviceContext* boundsContext = nullptr;
++	ID3D11Buffer* boundsUniform = nullptr;
++	D3D11_TEXTURE2D_DESC sourceShape{};
+ 	void CheckCreateSwapChain(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, bool cube);
+ 
+ 	void ThrowIfFailed(HRESULT test);

@@ -93,6 +93,9 @@ fi
 bash "$runtime_root/build/freetype-ios/build.sh"
 bash "$runtime_root/build/ntdll-unix/build.sh"
 bash "$runtime_root/build/wineserver/build.sh"
+# The upstream script merges FreeType into this output. Starting with its
+# previous merged archive retains duplicate FreeType members on repeat builds.
+rm -f "$runtime_root/build/win32u-unix/obj/libwin32u_unix.a"
 bash "$runtime_root/build/win32u-unix/build.sh"
 if [[ "${AVPPLAY_ENABLE_D3D12:-0}" != "1" ]]; then
     bash "$runtime_root/build/dxmt-ios/build.sh"

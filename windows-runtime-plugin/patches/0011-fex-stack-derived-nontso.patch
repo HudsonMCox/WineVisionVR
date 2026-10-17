@@ -1,0 +1,172 @@
+diff --git a/FEX/FEXCore/Source/Interface/Config/Config.json.in b/FEX/FEXCore/Source/Interface/Config/Config.json.in
+index d1fb9c5..2f70e75 100644
+--- a/FEX/FEXCore/Source/Interface/Config/Config.json.in
++++ b/FEX/FEXCore/Source/Interface/Config/Config.json.in
+@@ -496,6 +496,13 @@
+           "Can be dangerous due to aligned loadstores through the same code now become non-atomic."
+         ]
+       },
++      "StackDerivedNonTSO": {
++        "Type": "bool",
++        "Default": "false",
++        "Desc": [
++          "Treat accesses through registers holding RSP plus a constant, derived within the current block, as non-TSO like RSP itself."
++        ]
++      },
+       "StrictInProcessSplitLocks": {
+         "Type": "bool",
+         "Default": "false",
+diff --git a/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 3c42f47..83a4667 100644
+--- a/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -143,7 +143,9 @@ void OpDispatchBuilder::LEAOp(OpcodeArgs) {
+   }
+ 
+   auto Src = LoadSourceGPR_WithOpSize(Op, Op->Src[0], SrcSize, Op->Flags, {.LoadData = false, .AllowUpperGarbage = SrcSize > DstSize});
++  const bool StackDerived = DstSize == OpSize::i64Bit && IsStackDerivedAddress(Op, Op->Src[0]);
+   StoreResultGPR_WithOpSize(Op, Op->Dest, Src, DstSize);
++  SetStackDerivedReg(Op->Dest, StackDerived);
+ }
+ 
+ void OpDispatchBuilder::NOPOp(OpcodeArgs) {}
+@@ -4413,7 +4415,8 @@ AddressMode OpDispatchBuilder::DecodeAddress(const X86Tables::DecodedOp& Op, con
+       A.Offset = static_cast<int32_t>(Operand.Data.SIB.Offset);
+     }
+ 
+-    A.NonTSO |= IsNonTSOReg(AccessType, Operand.Data.SIB.Base) || IsNonTSOReg(AccessType, Operand.Data.SIB.Index);
++    // Only the base can be the stack. An index register is scaled, so it does not keep the RSP-derived property.
++    A.NonTSO |= IsNonTSOReg(AccessType, Operand.Data.SIB.Base);
+   } else if (Operand.IsLiteralRelocation()) {
+     A.Base = _EntrypointOffset(GPRSize, Operand.Data.LiteralRelocation.EntrypointOffset);
+   } else {
+@@ -4659,6 +4662,7 @@ void OpDispatchBuilder::ResetWorkingList() {
+   CurrentCodeBlock = nullptr;
+   RegCache.Written = 0;
+   RegCache.Cached = 0;
++  StackDerivedRegs = 0;
+ }
+ 
+ void OpDispatchBuilder::UnhandledOp(OpcodeArgs) {
+@@ -4669,7 +4673,11 @@ void OpDispatchBuilder::MOVGPROp(OpcodeArgs, uint32_t SrcIndex) {
+   // StoreResult will store with the same size as the input, so we allow upper
+   // garbage on the input. The zero extension would be pointless.
+   Ref Src = LoadSourceGPR(Op, Op->Src[SrcIndex], Op->Flags, {.Align = OpSize::i8Bit, .AllowUpperGarbage = true});
++
++  // The source must be checked before the store, which may overwrite it.
++  const bool StackDerived = OpSizeFromDst(Op) == OpSize::i64Bit && Op->Src[SrcIndex].IsGPR() && IsStackDerivedReg(Op->Src[SrcIndex].Data.GPR.GPR);
+   StoreResultGPR(Op, Src, OpSize::i8Bit);
++  SetStackDerivedReg(Op->Dest, StackDerived);
+ }
+ 
+ void OpDispatchBuilder::MOVGPRNTOp(OpcodeArgs) {
+@@ -4706,6 +4714,10 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
+     RoundedSize = std::max(OpSize::i32Bit, RoundedSize);
+   }
+ 
++  // Adding or subtracting a constant keeps an RSP-derived destination RSP-derived.
++  const bool StackDerived = (ALUIROp == FEXCore::IR::IROps::OP_ADD || ALUIROp == FEXCore::IR::IROps::OP_SUB) && Size == OpSize::i64Bit &&
++                            Op->Src[SrcIdx].IsLiteral() && Op->Dest.IsGPR() && IsStackDerivedReg(Op->Dest.Data.GPR.GPR);
++
+   // X86 basic ALU ops just do the operation between the destination and a single source
+   Ref Src = LoadSourceGPR(Op, Op->Src[SrcIdx], Op->Flags, {.AllowUpperGarbage = true});
+ 
+@@ -4779,6 +4791,8 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
+   if (!DestIsLockedMem(Op)) {
+     StoreResultGPR_WithOpSize(Op, Op->Dest, Result, ResultSize, OpSize::iInvalid, MemoryAccessType::DEFAULT);
+   }
++
++  SetStackDerivedReg(Op->Dest, StackDerived);
+ }
+ 
+ void OpDispatchBuilder::LSLOp(OpcodeArgs) {
+diff --git a/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index c663454..934db42 100644
+--- a/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -136,6 +136,9 @@ public:
+ 
+     it->second.HaveEmitted = true;
+ 
++    // Control can arrive here from other predecessors, so RSP-derived state from the fallthrough is not valid.
++    StackDerivedRegs = 0;
++
+     if (CurrentCodeBlock->Wrapped(DualListData.ListBegin()).ID() == it->second.BlockEntry->Wrapped(DualListData.ListBegin()).ID()) {
+       return;
+     }
+@@ -152,6 +155,7 @@ public:
+     CFInverted = CFInvertedABI;
+ 
+     FlushRegisterCache();
++    StackDerivedRegs = 0;
+ 
+     // Start block in X87 state.
+     // This is important to ensure that blocks always start with the same state independently of predecessors
+@@ -1304,6 +1308,7 @@ protected:
+ 
+ private:
+   FEX_CONFIG_OPT(ReducedPrecisionMode, X87REDUCEDPRECISION);
++  FEX_CONFIG_OPT(StackDerivedNonTSO, STACKDERIVEDNONTSO);
+ 
+   struct JumpTargetInfo {
+     Ref BlockEntry;
+@@ -1522,9 +1527,45 @@ private:
+     return !(Load && (Operand.IsLiteral() || Operand.IsLiteralRelocation())) && !Operand.IsGPR();
+   }
+ 
++  // GPRs known to hold RSP plus a constant within the current block.
++  uint16_t StackDerivedRegs {};
++
++  [[nodiscard]]
++  bool IsStackDerivedReg(uint8_t Reg) const {
++    return Reg == X86State::REG_RSP || (Reg < 16 && (StackDerivedRegs & (1u << Reg)) != 0);
++  }
++
++  // Whether a memory operand is RSP plus a constant with no index register, as used by LEA.
+   [[nodiscard]]
+-  static bool IsNonTSOReg(MemoryAccessType Access, uint8_t Reg) {
+-    return Access == MemoryAccessType::DEFAULT && Reg == X86State::REG_RSP;
++  bool IsStackDerivedAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand) const {
++    if (Op->Flags & X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) {
++      return false;
++    }
++
++    if (Operand.IsGPRDirect()) {
++      return IsStackDerivedReg(Operand.Data.GPR.GPR);
++    } else if (Operand.IsGPRIndirect()) {
++      return IsStackDerivedReg(Operand.Data.GPRIndirect.GPR);
++    } else if (Operand.IsSIB()) {
++      return Operand.Data.SIB.Index == X86State::REG_INVALID && Operand.Data.SIB.Base != X86State::REG_INVALID &&
++             IsStackDerivedReg(Operand.Data.SIB.Base);
++    }
++
++    return false;
++  }
++
++  // Only a 64-bit GPR destination can keep the RSP-derived property.
++  void SetStackDerivedReg(const X86Tables::DecodedOperand& Dest, bool Derived) {
++    if (!Derived || !Dest.IsGPR() || Dest.Data.GPR.GPR >= 16 || Dest.Data.GPR.GPR == X86State::REG_RSP) {
++      return;
++    }
++
++    StackDerivedRegs = static_cast<uint16_t>(StackDerivedRegs | (1u << Dest.Data.GPR.GPR));
++  }
++
++  [[nodiscard]]
++  bool IsNonTSOReg(MemoryAccessType Access, uint8_t Reg) const {
++    return Access == MemoryAccessType::DEFAULT && (Reg == X86State::REG_RSP || (StackDerivedNonTSO() && IsStackDerivedReg(Reg)));
+   }
+ 
+   AddressMode DecodeAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, MemoryAccessType AccessType, bool IsLoad);
+@@ -2053,6 +2094,11 @@ private:
+   }
+ 
+   void StoreRegister(uint8_t Reg, bool FPR, Ref Value) {
++    if (!FPR && Reg < 16) {
++      // Writing a register invalidates what was derived from its old value. Writing RSP invalidates all of it.
++      StackDerivedRegs = Reg == X86State::REG_RSP ? 0 : static_cast<uint16_t>(StackDerivedRegs & ~(1u << Reg));
++    }
++
+     StoreContext(Reg + (FPR ? FPR0Index : GPR0Index), Value);
+   }
+ 

@@ -1,0 +1,42 @@
+--- a/scripts/stubs/codegen.py
++++ b/scripts/stubs/codegen.py
+@@ -38,13 +38,29 @@
+     for n, f in functions:
+         fi.write(f"  _msVTable[{n}] = reinterpret_cast<void*>(&msabi_{cname}_{n});\n")
+     fi.write("  *reinterpret_cast<void***>(this) = _msVTable;\n}\n#endif\n")
++    # On i386 MSVC uses ECX for this and a stack result pointer, including
++    # 8-byte HiddenAreaMesh_t. MinGW may instead return small PODs in registers.
++    fi.write("#if defined(__MINGW32__) && defined(__i386__)\n")
++    for n, f in functions:
++        args = (", " + f.args_str()) if f.args_str() else ""
++        fi.write(f"static {f.return_type} *__attribute__((thiscall)) msabi32_{cname}_{n}({cname} *self, {f.return_type} *result{args}) {{\n"
++                 f"  *result = self->{cname}::{f.name}({f.args_names()});\n"
++                 "  return result;\n}\n")
++    fi.write(f"void {cname}::_PrepareMSABI() {{\n"
++             "  if (_nativeVTable) return;\n"
++             "  void **original = *reinterpret_cast<void***>(this);\n"
++             "  _nativeVTable = original;\n"
++             f"  for (unsigned n = 0; n < {len(ver.functions)}; ++n) _msVTable[n] = original[n];\n")
++    for n, f in functions:
++        fi.write(f"  _msVTable[{n}] = reinterpret_cast<void*>(&msabi32_{cname}_{n});\n")
++    fi.write("  *reinterpret_cast<void***>(this) = _msVTable;\n}\n#endif\n")
+ 
+ 
+ def _write_deleter(fi, ver):
+     cname = ver.proxy_class_name()
+     fi.write(f"void {cname}::Delete() {{\n")
+     if _ms_sret_functions(ver):
+-        fi.write("#if defined(__MINGW32__) && defined(__x86_64__)\n"
++        fi.write("#if defined(__MINGW32__) && (defined(__x86_64__) || defined(__i386__))\n"
+                  "  // delete uses the complete derived vtable, including its destructor.\n"
+                  "  // The outward table intentionally contains only OpenVR API slots.\n"
+                  "  if (_nativeVTable) *reinterpret_cast<void***>(this) = _nativeVTable;\n"
+@@ -89,7 +105,7 @@
+         fi.write(f"\t{func.return_type} {func.name}({func.args_str()}) override;\n")
+ 
+     if _ms_sret_functions(iface):
+-        fi.write("#if defined(__MINGW32__) && defined(__x86_64__)\n"
++        fi.write("#if defined(__MINGW32__) && (defined(__x86_64__) || defined(__i386__))\n"
+                  "  void _PrepareMSABI() override;\n"
+                  "private:\n"
+                  "  void **_nativeVTable = nullptr;\n"

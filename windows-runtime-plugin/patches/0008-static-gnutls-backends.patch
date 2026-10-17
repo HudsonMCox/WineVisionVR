@@ -1,0 +1,49 @@
+diff --git a/build/crypto-unix/ios_gnutls_shim.h b/build/crypto-unix/ios_gnutls_shim.h
+--- a/build/crypto-unix/ios_gnutls_shim.h
++++ b/build/crypto-unix/ios_gnutls_shim.h
+@@ -19,6 +19,16 @@
+  * of these files loads something else too. */
+ #pragma once
+ 
++/* Host configure probes macOS dependencies, not the separately built mobile
++ * static GnuTLS archive. Enable the real Unix crypto backends here, after the
++ * host config, only for translation units using this static resolver. The
++ * library name is a resolver token; it never opens a target-side dylib. */
++#include "config.h"
++#undef HAVE_GNUTLS_CIPHER_INIT
++#define HAVE_GNUTLS_CIPHER_INIT 1
++#undef SONAME_LIBGNUTLS
++#define SONAME_LIBGNUTLS "libgnutls-static"
++
+ extern void *ios_gnutls_dlopen(const char *name, int flags);
+ extern void *ios_gnutls_dlsym(void *handle, const char *name);
+ extern int   ios_gnutls_dlclose(void *handle);
+diff --git a/build/ntdll-unix/build.sh b/build/ntdll-unix/build.sh
+--- a/build/ntdll-unix/build.sh
++++ b/build/ntdll-unix/build.sh
+@@ -202,7 +202,25 @@
+ echo "Results: $SUCCEEDED succeeded, $FAILED failed"
+ if [ -n "$FAILED_FILES" ]; then
+     echo "Failed:$FAILED_FILES"
++    exit 1
+ fi
++
++# Guard against host configure silently compiling out the mobile crypto
++# backends. Both dispatch ABIs and the static resolver must survive compilation;
++# crypt32 otherwise still exports tables but returns STATUS_NOT_SUPPORTED.
++for crypto in bcrypt secur32 crypt32; do
++    symbols=$(nm -g "$OBJ_DIR/${crypto}_unixlib.o")
++    for table in "${crypto}_unix_call_funcs" "${crypto}_unix_call_wow64_funcs"; do
++        if ! awk -v symbol="_$table" '$NF == symbol && $(NF - 1) != "U" { found = 1 } END { exit !found }' <<< "$symbols"; then
++            echo "Missing real crypto dispatch table: $table" >&2
++            exit 1
++        fi
++    done
++    if ! awk '$NF == "_ios_gnutls_dlsym" && $(NF - 1) == "U" { found = 1 } END { exit !found }' <<< "$symbols"; then
++        echo "Missing static GnuTLS backend in ${crypto}_unixlib.o" >&2
++        exit 1
++    fi
++done
+ 
+ echo ""
+ echo "=== Building libntdll_unix.a ==="

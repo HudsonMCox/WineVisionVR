@@ -1,0 +1,784 @@
+diff --git a/src/d3d11/d3d11_pipeline.cpp b/src/d3d11/d3d11_pipeline.cpp
+index 14bf373..efc5fba 100644
+--- a/src/d3d11/d3d11_pipeline.cpp
++++ b/src/d3d11/d3d11_pipeline.cpp
+@@ -19,6 +19,7 @@ public:
+         pBlendState(pDesc->BlendState),
+         RasterizationEnabled(pDesc->RasterizationEnabled),
+         SampleCount(pDesc->SampleCount), StereoAmplified(pDesc->StereoAmplified) {
++    record_desc_ = *pDesc;
+     uint32_t unorm_output_reg_mask = 0;
+     for (unsigned i = 0; i < num_rtvs; i++) {
+       rtv_formats[i] = pDesc->ColorAttachmentFormats[i];
+@@ -104,6 +105,7 @@ public:
+       ERR("Failed to create PSO: ", err.description().getUTF8String());
+       return this;
+     }
++    WarmupRecordGraphicsPipeline(record_desc_);
+ 
+     TRACE("Compiled 1 PSO");
+ 
+@@ -126,6 +128,7 @@ private:
+   MTLD3D11Device *device_;
+   std::atomic_bool ready_;
+   CompiledShader *VertexShader;
++  MTL_GRAPHICS_PIPELINE_DESC record_desc_ = {};
+   CompiledShader *PixelShader;
+   IMTLD3D11BlendState *pBlendState;
+   WMT::Reference<WMT::RenderPipelineState> state_;
+@@ -145,6 +148,7 @@ class MTLCompiledComputePipelineImpl
+ public:
+   MTLCompiledComputePipelineImpl(MTLD3D11Device *pDevice, ManagedShader shader)
+       : device_(pDevice) {
++    record_shader_ = shader;
+     ComputeShader = shader->get_shader(ShaderVariantDefault{});
+     uint32_t total_tgsize = shader->reflection().ThreadgroupSize[0] *
+                             shader->reflection().ThreadgroupSize[1] *
+@@ -181,6 +185,7 @@ public:
+       ERR("Failed to create compute PSO: ", err.description().getUTF8String());
+       return this;
+     }
++    WarmupRecordComputePipeline(record_shader_);
+ 
+     TRACE("Compiled 1 PSO");
+ 
+@@ -198,6 +203,7 @@ private:
+   MTLD3D11Device *device_;
+   std::atomic_bool ready_;
+   CompiledShader *ComputeShader;
++  ManagedShader record_shader_ = nullptr;
+   WMT::Reference<WMT::ComputePipelineState> state_;
+   bool tgsize_is_multiple_of_sgwidth;
+ };
+diff --git a/src/d3d11/d3d11_pipeline.hpp b/src/d3d11/d3d11_pipeline.hpp
+index b376aaa..0e5279e 100644
+--- a/src/d3d11/d3d11_pipeline.hpp
++++ b/src/d3d11/d3d11_pipeline.hpp
+@@ -177,4 +177,9 @@ CreateGeometryPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDes
+ std::unique_ptr<MTLCompiledTessellationMeshPipeline>
+ CreateTessellationMeshPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDesc);
+ 
++// Shader warm-up store (d3d11_pipeline_cache.cpp). Called on the compile worker after a PSO
++// compiled successfully; the store deduplicates and skips pipelines it cannot replay.
++void WarmupRecordGraphicsPipeline(const MTL_GRAPHICS_PIPELINE_DESC &desc);
++void WarmupRecordComputePipeline(ManagedShader shader);
++
+ }; // namespace dxmt
+\ No newline at end of file
+diff --git a/src/d3d11/d3d11_pipeline_cache.cpp b/src/d3d11/d3d11_pipeline_cache.cpp
+index 4712de7..69c0932 100644
+--- a/src/d3d11/d3d11_pipeline_cache.cpp
++++ b/src/d3d11/d3d11_pipeline_cache.cpp
+@@ -12,6 +12,13 @@
+ #include <cstring>
+ #include "DXBCParser/DXBCUtils.h"
+ #include <shared_mutex>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <unordered_map>
++#include <unordered_set>
++#include "util_env.hpp"
++#include "util_string.hpp"
+ 
+ namespace dxmt {
+ 
+@@ -66,6 +73,277 @@ template <> struct task_trait<ThreadpoolWork *> {
+   void set_done(ThreadpoolWork *task) { task->SetIsDone(true); }
+ };
+ 
++namespace {
++
++// Set only on the warm-up thread: shader variants and pipelines it creates queue at low priority.
++thread_local bool tl_warmup_worker = false;
++
++template <typename T> std::string Num(T value) {
++  return std::to_string(static_cast<unsigned long long>(value));
++}
++
++using WarmupBlobs = std::vector<std::pair<std::string, const std::vector<uint8_t> *>>;
++
++// Per-executable store under the existing cache root "dxmt\<exe>" (cwd-relative, next to shaders_N.db),
++// or %LOCALAPPDATA%\dxmt\<exe> when that cache is disabled or uses a unix path.
++//   pipelines.txt        one line per pipeline variant: key fields, shader hashes, blend state
++//   shaders\<sha1>.dxbc  DXBC blob of each shader referenced by a line, stored once
++//   warmup-progress      "done total" or "done total complete" (replaced atomically)
++class WarmupStore {
++public:
++  static WarmupStore &Instance() {
++    static WarmupStore store;
++    return store;
++  }
++
++  bool Enabled() const { return enabled_; }
++  bool ReplayEnabled() const { return replay_; }
++
++  // Returns false when no store exists yet.
++  bool LoadRecords(std::vector<std::string> *lines) {
++    std::string text;
++    if (!enabled_ || !ReadWholeFile(RecordsPath(), &text))
++      return false;
++    std::lock_guard<dxmt::mutex> lock(mutex_);
++    size_t start = 0;
++    while (start < text.size()) {
++      size_t end = text.find('\n', start);
++      if (end == std::string::npos)
++        end = text.size();
++      std::string line = text.substr(start, end - start);
++      if (!line.empty() && line.back() == '\r')
++        line.pop_back();
++      if (!line.empty()) {
++        lines->push_back(line);
++        recorded_.insert(line);
++      }
++      start = end + 1;
++    }
++    return true;
++  }
++
++  bool ReadBlob(const std::string &hash, std::vector<uint8_t> *bytes) {
++    std::string data;
++    if (!enabled_ || !ReadWholeFile(ShaderPath(hash), &data))
++      return false;
++    bytes->assign(data.begin(), data.end());
++    return true;
++  }
++
++  // Append-only; called on the compile worker. Each line and each blob is written at most once per store.
++  void Record(const std::string &line, const WarmupBlobs &blobs) {
++    if (!enabled_)
++      return;
++    std::lock_guard<dxmt::mutex> lock(mutex_);
++    if (recorded_.count(line))
++      return;
++    for (const auto &[hash, bytes] : blobs) {
++      if (stored_.count(hash))
++        continue;
++      const std::string path = ShaderPath(hash);
++      if (!FileExists(path) && !WriteWholeFile(path, std::string(bytes->begin(), bytes->end()), false)) {
++        ERR("Shader warm-up: could not write ", path);
++        return;
++      }
++      stored_.insert(hash);
++    }
++    if (!WriteWholeFile(RecordsPath(), line + "\n", true)) {
++      ERR("Shader warm-up: could not append to ", RecordsPath());
++      return;
++    }
++    recorded_.insert(line);
++  }
++
++  // Called only from the warm-up thread.
++  void WriteProgress(size_t done, size_t total, bool complete) {
++    const std::string text = std::to_string(done) + " " + std::to_string(total) + (complete ? " complete\n" : "\n");
++    const std::string temp = root_ + "\\warmup-progress.tmp";
++    if (!WriteWholeFile(temp, text, false))
++      return;
++    const std::wstring wtemp = str::tows(temp.c_str());
++    const std::wstring wfinal = str::tows((root_ + "\\warmup-progress").c_str());
++    MoveFileExW(wtemp.c_str(), wfinal.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
++  }
++
++private:
++  WarmupStore() {
++    const std::string exe = env::getExeName();
++    if (env::getEnvVar("DXMT_SHADER_CACHE") != "0" && !env::getEnvVar("DXMT_SHADER_CACHE_PATH").starts_with("/")) {
++      root_ = "dxmt\\" + exe;
++    } else {
++      const std::string local = env::getEnvVar("LOCALAPPDATA");
++      if (!local.empty())
++        root_ = local + "\\dxmt\\" + exe;
++    }
++    if (root_.empty())
++      return;
++    env::createDirectory(root_.substr(0, root_.rfind('\\')));
++    env::createDirectory(root_);
++    env::createDirectory(root_ + "\\shaders");
++    replay_ = env::getEnvVar("DXMT_SHADER_WARMUP") != "0";
++    enabled_ = true;
++  }
++
++  std::string RecordsPath() const { return root_ + "\\pipelines.txt"; }
++  std::string ShaderPath(const std::string &hash) const { return root_ + "\\shaders\\" + hash + ".dxbc"; }
++
++  static bool FileExists(const std::string &path) {
++    return GetFileAttributesW(str::tows(path.c_str()).c_str()) != INVALID_FILE_ATTRIBUTES;
++  }
++
++  static bool ReadWholeFile(const std::string &path, std::string *out) {
++    FILE *file = _wfopen(str::tows(path.c_str()).c_str(), L"rb");
++    if (!file)
++      return false;
++    out->clear();
++    char buffer[65536];
++    size_t count;
++    while ((count = fread(buffer, 1, sizeof(buffer), file)) > 0)
++      out->append(buffer, count);
++    fclose(file);
++    return true;
++  }
++
++  static bool WriteWholeFile(const std::string &path, const std::string &data, bool append) {
++    FILE *file = _wfopen(str::tows(path.c_str()).c_str(), append ? L"ab" : L"wb");
++    if (!file)
++      return false;
++    const size_t written = fwrite(data.data(), 1, data.size(), file);
++    const int closed = fclose(file);
++    return written == data.size() && closed == 0;
++  }
++
++  std::string root_;
++  bool enabled_ = false;
++  bool replay_ = false;
++  dxmt::mutex mutex_;
++  std::unordered_set<std::string> recorded_;
++  std::unordered_set<std::string> stored_;
++};
++
++// Parses "key=value" tokens; the first token is the record kind.
++std::unordered_map<std::string, std::string> ParseFields(const std::string &line) {
++  std::unordered_map<std::string, std::string> fields;
++  size_t start = 0;
++  while (start <= line.size()) {
++    size_t end = line.find(' ', start);
++    if (end == std::string::npos)
++      end = line.size();
++    const std::string token = line.substr(start, end - start);
++    const size_t eq = token.find('=');
++    if (eq != std::string::npos)
++      fields[token.substr(0, eq)] = token.substr(eq + 1);
++    start = end + 1;
++  }
++  return fields;
++}
++
++std::vector<std::string> SplitBy(const std::string &text, char separator) {
++  std::vector<std::string> parts;
++  if (text.empty())
++    return parts;
++  size_t start = 0;
++  while (true) {
++    size_t end = text.find(separator, start);
++    parts.push_back(text.substr(start, end == std::string::npos ? std::string::npos : end - start));
++    if (end == std::string::npos)
++      break;
++    start = end + 1;
++  }
++  return parts;
++}
++
++bool ParseNumbers(const std::string &csv, std::vector<unsigned long long> *out) {
++  out->clear();
++  if (csv.empty())
++    return true;
++  for (const auto &part : SplitBy(csv, ',')) {
++    if (part.empty() || part.find_first_not_of("0123456789") != std::string::npos)
++      return false;
++    out->push_back(std::strtoull(part.c_str(), nullptr, 10));
++  }
++  return true;
++}
++
++// Serializes a graphics PSO key. Returns false for pipelines the warm-up cannot replay.
++bool SerializeGraphics(const MTL_GRAPHICS_PIPELINE_DESC &desc, std::string *line, WarmupBlobs *blobs) {
++  if (!desc.VertexShader || !desc.BlendState || desc.HullShader || desc.DomainShader || desc.GeometryShader ||
++      desc.SOLayout || desc.NumColorAttachments > 8)
++    return false;
++  std::string s = "g";
++  blobs->emplace_back(desc.VertexShader->sha1().string(), &desc.VertexShader->bytecode_blob());
++  s += " vs=" + desc.VertexShader->sha1().string();
++  s += " ps=";
++  if (desc.PixelShader) {
++    blobs->emplace_back(desc.PixelShader->sha1().string(), &desc.PixelShader->bytecode_blob());
++    s += desc.PixelShader->sha1().string();
++  } else {
++    s += "-";
++  }
++  s += " il=";
++  if (!desc.InputLayout) {
++    s += "-";
++  } else {
++    MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC *elements = nullptr;
++    const uint32_t count = desc.InputLayout->input_layout_element(&elements);
++    for (uint32_t i = 0; i < count; ++i) {
++      if (i)
++        s += ";";
++      const auto &e = elements[i];
++      s += Num(e.Index) + "," + Num(e.Slot) + "," + Num(e.Offset) + "," + Num(e.Format) + "," +
++           Num(e.StepFunction) + "," + Num(e.InstanceStepRate);
++    }
++  }
++  D3D11_BLEND_DESC1 bd = {};
++  desc.BlendState->GetDesc1(&bd);
++  s += " bs=" + Num(bd.AlphaToCoverageEnable) + "," + Num(bd.IndependentBlendEnable);
++  for (const auto &rt : bd.RenderTarget) {
++    s += "," + Num(rt.BlendEnable) + "," + Num(rt.LogicOpEnable) + "," + Num(rt.SrcBlend) + "," + Num(rt.DestBlend) +
++         "," + Num(rt.BlendOp) + "," + Num(rt.SrcBlendAlpha) + "," + Num(rt.DestBlendAlpha) + "," +
++         Num(rt.BlendOpAlpha) + "," + Num(rt.LogicOp) + "," + Num(rt.RenderTargetWriteMask);
++  }
++  s += " nrt=" + Num(desc.NumColorAttachments);
++  s += " fmt=";
++  for (unsigned i = 0; i < desc.NumColorAttachments; ++i) {
++    if (i)
++      s += ",";
++    s += Num(desc.ColorAttachmentFormats[i]);
++  }
++  s += " dsf=" + Num(desc.DepthStencilFormat);
++  s += " topo=" + Num(desc.TopologyClass);
++  s += " rast=" + Num(desc.RasterizationEnabled);
++  s += " samples=" + Num(desc.SampleCount);
++  s += " ib=" + Num(desc.IndexBufferFormat);
++  s += " gss=" + Num(desc.GSStripTopology);
++  s += " smask=" + Num(desc.SampleMask);
++  s += " gspt=" + Num(desc.GSPassthrough);
++  s += " sa=" + Num(desc.StereoAmplified);
++  s += " fov=" + Num(desc.PixelShader ? desc.PixelShader->allowsFoveatedRaster() : false);
++  *line = s;
++  return true;
++}
++
++} // namespace
++
++void WarmupRecordGraphicsPipeline(const MTL_GRAPHICS_PIPELINE_DESC &desc) {
++  WarmupStore &store = WarmupStore::Instance();
++  if (!store.Enabled())
++    return;
++  std::string line;
++  WarmupBlobs blobs;
++  if (SerializeGraphics(desc, &line, &blobs))
++    store.Record(line, blobs);
++}
++
++void WarmupRecordComputePipeline(ManagedShader shader) {
++  WarmupStore &store = WarmupStore::Instance();
++  if (!store.Enabled() || !shader)
++    return;
++  WarmupBlobs blobs;
++  blobs.emplace_back(shader->sha1().string(), &shader->bytecode_blob());
++  store.Record("c cs=" + shader->sha1().string(), blobs);
++}
++
+ class PipelineCache : public MTLD3D11PipelineCacheBase {
+ 
+   class CachedSM50Shader final : public Shader {
+@@ -76,13 +354,18 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+     bool foveation_safe_ = false;
+     bool stereo_safe_ = false;
+     MTL_SM50_SHADER_ARGUMENT *arguments_info_buffer;
++    std::vector<uint8_t> bytecode_blob_;
++    dxmt::mutex variants_mutex_;
+     std::unordered_map<ShaderVariant, std::unique_ptr<CompiledShader>> variants;
+ 
+   public:
+     CachedSM50Shader(PipelineCache *cache, sm50_shader_t shader_transferred,
+-                     const Sha1Digest &hash, MTL_SHADER_REFLECTION &reflection, const void *bytecode)
++                     const Sha1Digest &hash, MTL_SHADER_REFLECTION &reflection, const void *bytecode,
++                     size_t blob_size)
+         : cache(cache), shader(shader_transferred), sha1_(hash),
+           reflection_(reflection) {
++      bytecode_blob_.assign(static_cast<const uint8_t *>(bytecode),
++                            static_cast<const uint8_t *>(bytecode) + blob_size);
+       microsoft::CSignatureParser input;
+       if (SUCCEEDED(microsoft::DXBCGetInputSignature(bytecode, &input))) {
+         const microsoft::D3D11_SIGNATURE_PARAMETER *parameters = nullptr;
+@@ -142,6 +425,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+       return arguments_info_buffer + reflection_.NumConstantBuffers;
+     };
+     virtual CompiledShader *get_shader(ShaderVariant variant) {
++      std::lock_guard<dxmt::mutex> lock(variants_mutex_);
+       auto c = variants.insert({variant, nullptr});
+       if (c.second) {
+         c.first->second = std::visit(
+@@ -149,10 +433,14 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+               return CreateVariantShader(cache->device, this, var);
+             },
+             variant);
+-        cache->scheduler_.submit(c.first->second.get());
++        if (tl_warmup_worker)
++          cache->scheduler_.submit_low(c.first->second.get());
++        else
++          cache->scheduler_.submit(c.first->second.get());
+       }
+       return c.first->second.get();
+     }
++    const std::vector<uint8_t> &bytecode_blob() override { return bytecode_blob_; }
+     virtual const Sha1Digest &sha1() { return sha1_; };
+ 
+ #ifdef DXMT_DEBUG
+@@ -246,6 +534,10 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+   std::unordered_map<ManagedShader, std::unique_ptr<MTLCompiledComputePipeline>> pipelines_cs_;
+   dxmt::mutex mutex_cs_;
+ 
++  std::atomic_bool warmup_cancel_ = false;
++  dxmt::thread warmup_thread_;
++  std::vector<IMTLD3D11BlendState *> warm_blend_refs_;
++
+   CachedSM50Shader *CreateShader(const void *pBytecode,
+                                  uint32_t BytecodeLength) {
+     auto sha1 = Sha1HashState::compute(pBytecode, BytecodeLength);
+@@ -264,20 +556,25 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+       SM50FreeError(err);
+       return nullptr;
+     }
+-    auto shader = std::make_unique<CachedSM50Shader>(this, sm50, sha1, reflection, pBytecode);
++    auto shader = std::make_unique<CachedSM50Shader>(this, sm50, sha1, reflection, pBytecode, BytecodeLength);
++    CachedSM50Shader *result_shader = nullptr;
+     {
+       std::unique_lock<std::shared_mutex> lock(mutex_shares);
+       auto result = shaders_.find(sha1);
+       if (result != shaders_.end()) {
+-        return shaders_.at(sha1).get();
+-      }
++        result_shader = result->second.get();
++      } else {
+ #ifdef DXMT_DEBUG
+-      shader->bytecode = malloc(BytecodeLength);
+-      shader->bytecode_length = BytecodeLength;
+-      memcpy(shader->bytecode, pBytecode, BytecodeLength);
++        shader->bytecode = malloc(BytecodeLength);
++        shader->bytecode_length = BytecodeLength;
++        memcpy(shader->bytecode, pBytecode, BytecodeLength);
+ #endif
+-      return shaders_.emplace(sha1, std::move(shader)).first->second.get();
++        result_shader = shaders_.emplace(sha1, std::move(shader)).first->second.get();
++      }
+     }
++    // Start the default variant's DXBC->AIR conversion now so loading screens absorb it. No-op if started.
++    result_shader->get_shader(ShaderVariantDefault{});
++    return result_shader;
+   }
+ 
+   virtual HRESULT AddVertexShader(const void *pBytecode,
+@@ -412,6 +709,8 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+ 
+     if (auto iter = pipelines_.find(*pDesc); iter != pipelines_.end()) {
+       *ppPipeline = iter->second.get();
++      if (!iter->second->GetIsDone())
++        scheduler_.promote(iter->second.get());
+       return;
+     }
+     auto [iter, inserted] = pipelines_.insert({*pDesc, CreateGraphicsPipeline(device, pDesc)});
+@@ -440,8 +739,10 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+       }
+       return nullptr;
+     }
+-    if (!iter->second->GetIsDone())
++    if (!iter->second->GetIsDone()) {
++      scheduler_.promote(iter->second.get());
+       return nullptr;
++    }
+     return iter->second.get();
+   }
+ 
+@@ -498,12 +799,209 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+     *ppPipeline = iter->second.get();
+   }
+ 
++  // Runs on the warm-up thread: recreates recorded shaders and PSOs at low priority and reports progress.
++  void RunWarmup() {
++    tl_warmup_worker = true;
++    WarmupStore &store = WarmupStore::Instance();
++    std::vector<std::string> lines;
++    if (!store.LoadRecords(&lines) || lines.empty())
++      return;
++
++    std::unordered_map<std::string, CachedSM50Shader *> warm_shaders;
++    auto warm_shader = [&](const std::string &hash) -> CachedSM50Shader * {
++      auto found = warm_shaders.find(hash);
++      if (found != warm_shaders.end())
++        return found->second;
++      CachedSM50Shader *shader = nullptr;
++      std::vector<uint8_t> bytes;
++      if (store.ReadBlob(hash, &bytes) && !bytes.empty()) {
++        shader = CreateShader(bytes.data(), static_cast<uint32_t>(bytes.size()));
++        if (shader && shader->sha1().string() != hash)
++          shader = nullptr;
++      }
++      warm_shaders.emplace(hash, shader);
++      return shader;
++    };
++
++    std::vector<ThreadpoolWork *> pending;
++    for (const auto &line : lines) {
++      if (warmup_cancel_.load())
++        return;
++      const auto fields = ParseFields(line);
++      auto field = [&](const char *key, const char *fallback) -> std::string {
++        auto value = fields.find(key);
++        return value == fields.end() ? std::string(fallback) : value->second;
++      };
++      auto number = [&](const char *key) -> unsigned long long {
++        return std::strtoull(field(key, "0").c_str(), nullptr, 10);
++      };
++
++      if (line.compare(0, 2, "c ") == 0) {
++        CachedSM50Shader *shader = warm_shader(field("cs", ""));
++        if (!shader) {
++          WARN("Shader warm-up: skipped compute record with a missing shader");
++          continue;
++        }
++        ManagedShader key = shader;
++        std::lock_guard<dxmt::mutex> lock(mutex_cs_);
++        if (!pipelines_cs_.contains(key)) {
++          auto result = pipelines_cs_.insert({key, CreateComputePipeline(device, key)});
++          scheduler_.submit_low(result.first->second.get());
++          pending.push_back(result.first->second.get());
++        }
++        continue;
++      }
++      if (line.compare(0, 2, "g ") != 0)
++        continue;
++
++      const std::string ps_hash = field("ps", "-");
++      CachedSM50Shader *vs = warm_shader(field("vs", ""));
++      CachedSM50Shader *ps = ps_hash == "-" ? nullptr : warm_shader(ps_hash);
++      if (!vs || (ps_hash != "-" && !ps)) {
++        WARN("Shader warm-up: skipped graphics record with a missing shader");
++        continue;
++      }
++
++      ManagedInputLayout layout = nullptr;
++      const std::string il = field("il", "-");
++      if (il != "-") {
++        MTL_INPUT_LAYOUT_DESC elements;
++        bool valid = true;
++        for (const auto &element : SplitBy(il, ';')) {
++          std::vector<unsigned long long> n;
++          if (!ParseNumbers(element, &n) || n.size() != 6) {
++            valid = false;
++            break;
++          }
++          MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC e = {};
++          e.Index = static_cast<uint32_t>(n[0]);
++          e.Slot = static_cast<uint32_t>(n[1]);
++          e.Offset = static_cast<uint32_t>(n[2]);
++          e.Format = static_cast<uint32_t>(n[3]);
++          e.StepFunction = static_cast<D3D11_INPUT_CLASSIFICATION>(n[4]);
++          e.InstanceStepRate = static_cast<uint32_t>(n[5]);
++          elements.push_back(e);
++        }
++        if (!valid) {
++          WARN("Shader warm-up: skipped record with an invalid input layout");
++          continue;
++        }
++        std::lock_guard<dxmt::mutex> lock(mutex_ia_);
++        MTL_INPUT_LAYOUT_DESC key = elements;
++        if (!input_layouts.contains(key)) {
++          uint32_t mask = 0;
++          for (const auto &e : elements)
++            mask |= (1u << e.Slot);
++          input_layouts.emplace(key, std::make_unique<CachedInputLayout>(std::move(elements), mask));
++        }
++        layout = input_layouts.at(key).get();
++      }
++
++      std::vector<unsigned long long> bs;
++      if (!ParseNumbers(field("bs", ""), &bs) || bs.size() != 82) {
++        WARN("Shader warm-up: skipped record with an invalid blend state");
++        continue;
++      }
++      D3D11_BLEND_DESC1 blend_desc = {};
++      blend_desc.AlphaToCoverageEnable = static_cast<BOOL>(bs[0]);
++      blend_desc.IndependentBlendEnable = static_cast<BOOL>(bs[1]);
++      for (unsigned i = 0; i < 8; ++i) {
++        const unsigned long long *v = &bs[2 + i * 10];
++        auto &rt = blend_desc.RenderTarget[i];
++        rt.BlendEnable = static_cast<BOOL>(v[0]);
++        rt.LogicOpEnable = static_cast<BOOL>(v[1]);
++        rt.SrcBlend = static_cast<D3D11_BLEND>(v[2]);
++        rt.DestBlend = static_cast<D3D11_BLEND>(v[3]);
++        rt.BlendOp = static_cast<D3D11_BLEND_OP>(v[4]);
++        rt.SrcBlendAlpha = static_cast<D3D11_BLEND>(v[5]);
++        rt.DestBlendAlpha = static_cast<D3D11_BLEND>(v[6]);
++        rt.BlendOpAlpha = static_cast<D3D11_BLEND_OP>(v[7]);
++        rt.LogicOp = static_cast<D3D11_LOGIC_OP>(v[8]);
++        rt.RenderTargetWriteMask = static_cast<UINT8>(v[9]);
++      }
++      IMTLD3D11BlendState *blend = nullptr;
++      if (FAILED(blend_states.CreateStateObject(&blend_desc, &blend)) || !blend) {
++        WARN("Shader warm-up: skipped record whose blend state failed to create");
++        continue;
++      }
++      warm_blend_refs_.push_back(blend); // QueryInterface reference, released in the destructor
++
++      std::vector<unsigned long long> fmt;
++      const unsigned long long nrt = number("nrt");
++      if (!ParseNumbers(field("fmt", ""), &fmt) || nrt > 8 || fmt.size() != nrt) {
++        WARN("Shader warm-up: skipped record with inconsistent render targets");
++        continue;
++      }
++
++      MTL_GRAPHICS_PIPELINE_DESC desc = {};
++      desc.VertexShader = vs;
++      desc.PixelShader = ps;
++      desc.InputLayout = layout;
++      desc.BlendState = blend;
++      desc.NumColorAttachments = static_cast<UINT>(nrt);
++      for (unsigned i = 0; i < nrt; ++i)
++        desc.ColorAttachmentFormats[i] = static_cast<WMTPixelFormat>(fmt[i]);
++      desc.DepthStencilFormat = static_cast<WMTPixelFormat>(number("dsf"));
++      desc.TopologyClass = static_cast<WMTPrimitiveTopologyClass>(number("topo"));
++      desc.RasterizationEnabled = number("rast") != 0;
++      desc.SampleCount = static_cast<uint8_t>(number("samples"));
++      desc.IndexBufferFormat = static_cast<SM50_INDEX_BUFFER_FORMAT>(number("ib"));
++      desc.GSStripTopology = number("gss") != 0;
++      desc.SampleMask = static_cast<uint32_t>(number("smask"));
++      desc.GSPassthrough = static_cast<uint32_t>(number("gspt"));
++      desc.StereoAmplified = number("sa") != 0;
++
++      std::lock_guard<dxmt::mutex> lock(mutex_);
++      if (!pipelines_.contains(desc)) {
++        auto result = pipelines_.insert({desc, CreateGraphicsPipeline(device, &desc)});
++        scheduler_.submit_low(result.first->second.get());
++        pending.push_back(result.first->second.get());
++      }
++    }
++
++    const size_t total = pending.size();
++    auto count_done = [&]() {
++      size_t done = 0;
++      for (auto *work : pending)
++        if (work->GetIsDone())
++          ++done;
++      return done;
++    };
++    auto last_write = std::chrono::steady_clock::now() - std::chrono::milliseconds(100);
++    size_t last_done = static_cast<size_t>(-1);
++    while (!warmup_cancel_.load()) {
++      const size_t done = count_done();
++      const auto now = std::chrono::steady_clock::now();
++      if (done != last_done && now - last_write >= std::chrono::milliseconds(100)) {
++        store.WriteProgress(done, total, false);
++        last_done = done;
++        last_write = now;
++      }
++      if (done == total)
++        break;
++      Sleep(20);
++    }
++    if (!warmup_cancel_.load())
++      store.WriteProgress(total, total, true);
++  }
++
+ public:
+   PipelineCache(MTLD3D11Device *pDevice) :
+       scache_(ShaderCache::getInstance(pDevice->GetDXMTDevice().metalVersion())),
+       device(pDevice),
+       blend_states(pDevice),
+-      so_layouts(pDevice) {};
++      so_layouts(pDevice) {
++    if (WarmupStore::Instance().ReplayEnabled() && WarmupStore::Instance().Enabled())
++      warmup_thread_ = dxmt::thread([this]() { RunWarmup(); });
++  };
++
++  ~PipelineCache() {
++    warmup_cancel_.store(true);
++    if (warmup_thread_.joinable())
++      warmup_thread_.join();
++    for (auto *blend : warm_blend_refs_)
++      blend->Release();
++  }
+ };
+ 
+ std::unique_ptr<MTLD3D11PipelineCacheBase>
+diff --git a/src/d3d11/d3d11_shader.hpp b/src/d3d11/d3d11_shader.hpp
+index f7a619e..b0f4a44 100644
+--- a/src/d3d11/d3d11_shader.hpp
++++ b/src/d3d11/d3d11_shader.hpp
+@@ -8,6 +8,7 @@
+ #include "sha1/sha1_util.hpp"
+ #include "log/log.hpp"
+ #include <variant>
++#include <vector>
+ 
+ struct MTL_COMPILED_SHADER {
+   /**
+@@ -218,6 +219,8 @@ public:
+   virtual CompiledShader *get_shader(ShaderVariant variant) = 0;
+   virtual const Sha1Digest& sha1() = 0;
+   virtual void dump() = 0;
++  /* DXBC blob the shader was created from; used by the shader warm-up store */
++  virtual const std::vector<uint8_t> &bytecode_blob() = 0;
+ 
+   virtual WMT::Reference<WMT::DispatchData> find_cached_variant(Sha1Digest &key) = 0;
+   virtual void update_cached_variant(Sha1Digest &key, WMT::DispatchData data) = 0;
+diff --git a/src/dxmt/dxmt_tasks.hpp b/src/dxmt/dxmt_tasks.hpp
+index 6762d47..814bc98 100644
+--- a/src/dxmt/dxmt_tasks.hpp
++++ b/src/dxmt/dxmt_tasks.hpp
+@@ -3,6 +3,7 @@
+ #include "thread.hpp"
+ #include "util_win32_compat.h"
+ #include <atomic>
++#include <deque>
+ #include <queue>
+ #include <unordered_map>
+ 
+@@ -17,6 +18,8 @@ template <typename Task> struct task_trait {
+ template <typename Task> class task_scheduler {
+ public:
+   void submit(Task task);
++  void submit_low(Task task);
++  void promote(Task task);
+ 
+   task_scheduler();
+   ~task_scheduler();
+@@ -33,6 +36,7 @@ private:
+   dxmt::condition_variable worker_cond_;
+   std::queue<Task> task_queue_;
+   std::queue<Task> task_continuation_queue_;
++  std::deque<Task> task_low_queue_;
+ 
+   dxmt::mutex deps_mutex_;
+   std::unordered_multimap<Task, Task> task_continuation_;
+@@ -78,9 +82,10 @@ task_scheduler<Task>::worker_func() {
+     {
+       std::unique_lock<dxmt::mutex> lock(worker_mutex_);
+ 
+-      if (task_queue_.empty() && task_continuation_queue_.empty()) {
++      if (task_queue_.empty() && task_continuation_queue_.empty() && task_low_queue_.empty()) {
+         worker_cond_.wait(lock, [this]() {
+-          return task_queue_.size() || task_continuation_queue_.size() || destroyed.load();
++          return task_queue_.size() || task_continuation_queue_.size() || task_low_queue_.size() ||
++                 destroyed.load();
+         });
+       }
+ 
+@@ -90,6 +95,9 @@ task_scheduler<Task>::worker_func() {
+       } else if (!task_queue_.empty()) {
+         task = task_queue_.front();
+         task_queue_.pop();
++      } else if (!task_low_queue_.empty()) {
++        task = task_low_queue_.front();
++        task_low_queue_.pop_front();
+       } else {
+         break;
+       }
+@@ -143,4 +151,27 @@ task_scheduler<Task>::submit(Task task) {
+   worker_cond_.notify_one();
+ }
+ 
++template <typename Task>
++void
++task_scheduler<Task>::submit_low(Task task) {
++  std::unique_lock<dxmt::mutex> lock(worker_mutex_);
++  task_low_queue_.push_back(task);
++  worker_cond_.notify_one();
++}
++
++// Moves a queued low-priority task to the normal queue; no-op if it already runs or finished.
++template <typename Task>
++void
++task_scheduler<Task>::promote(Task task) {
++  std::unique_lock<dxmt::mutex> lock(worker_mutex_);
++  for (auto it = task_low_queue_.begin(); it != task_low_queue_.end(); ++it) {
++    if (*it == task) {
++      task_low_queue_.erase(it);
++      task_queue_.push(task);
++      worker_cond_.notify_one();
++      break;
++    }
++  }
++}
++
+ }; // namespace dxmt

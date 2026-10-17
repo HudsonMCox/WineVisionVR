@@ -1,0 +1,26 @@
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 127ee14..e3f59fe 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -1044,13 +1044,17 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+       foveation.status = -1;
+       foveation.operation = 1;
+       const auto &color = render_pass_info.colors[0];
++      // Depth-only passes (no colour target) are eligible with a stored depth attachment.
++      const bool depthOnlyPass = !color.texture && !data->render_target_count && render_pass_info.depth.texture;
+       bool eligible = data->foveation_safe && data->foveation_draw_calls && data->last_pso && !data->use_visibility_result &&
+           !data->use_geometry && !data->use_tessellation && !data->use_emulated_so &&
+-          data->render_target_count >= 1 && data->render_target_count <= 8 &&
++          data->render_target_count <= 8 &&
+           render_pass_info.default_raster_sample_count == 1 &&
+-          render_pass_info.render_target_array_length == 1 && color.texture &&
+-          color.store_action == WMTStoreActionStore && !color.resolve_texture &&
+-          !color.level && !color.depth_plane &&
++          render_pass_info.render_target_array_length == 1 &&
++          (color.texture
++              ? data->render_target_count >= 1 && color.store_action == WMTStoreActionStore &&
++                  !color.resolve_texture && !color.level && !color.depth_plane
++              : depthOnlyPass && render_pass_info.depth.store_action == WMTStoreActionStore) &&
+           !render_pass_info.depth.level && !render_pass_info.depth.depth_plane &&
+           !render_pass_info.stencil.level && !render_pass_info.stencil.depth_plane;
+       for (unsigned i=1; i<data->render_target_count; ++i) {

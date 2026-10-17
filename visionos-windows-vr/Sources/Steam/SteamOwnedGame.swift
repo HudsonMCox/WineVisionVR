@@ -17,6 +17,8 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
     var headerImage: String?
     var parentID: Int?
     var launches: [SteamLaunchOption]?
+    var downloadBytes: UInt64?
+    var installedBytes: UInt64?
 
     init(_ info: SteamAppInfo) {
         id = Int(info.appID)
@@ -28,6 +30,9 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
         headerImage = info.headerImage
         parentID = info.parentID.map(Int.init)
         launches = info.launches
+        let sizes = info.installSizeEstimates()
+        downloadBytes = sizes.download
+        installedBytes = sizes.installed
     }
 
     var folderName: String {

@@ -26,7 +26,35 @@ REQUIRED_BUILTINS = {
 ARM64EC_REQUIRED_BUILTINS = {
     # Required by Madeira's freshly built ARM64EC FEX translator.
     "xtajit64.dll", "libc++.dll", "libunwind.dll",
+    # CryptoAPI's RSA/AES provider is needed to verify the Valve client before
+    # Steam starts. ARM64 files cannot satisfy ARM64EC/x64 imports.
+    "crypt32.dll", "cryptbase.dll", "rsaenh.dll", "psapi.dll",
+    # Direct/delay imports of the packaged core Wine DLLs.
+    "cabinet.dll", "comctl32.dll", "comdlg32.dll", "cryptnet.dll", "cryptui.dll",
+    "d3dcompiler_47.dll", "dhcpcsvc.dll", "dinput8.dll", "gdiplus.dll", "imm32.dll",
+    "jsproxy.dll", "mfplat.dll", "mfreadwrite.dll", "mlang.dll", "netapi32.dll",
+    "nsi.dll", "oleaut32.dll", "propsys.dll", "shdocvw.dll", "urlmon.dll",
+    "windowscodecs.dll", "winspool.drv", "wintrust.dll",
+    # Game imports (Fantastic Contraption and Google Earth VR). The ARM64
+    # service farm's versions cannot satisfy an ARM64EC/x64 guest import.
+    "dwmapi.dll", "wsock32.dll", "avrt.dll", "vcruntime140.dll", "msvcp140.dll",
+    # The audio endpoint client uses Madeira's already linked native driver.
+    "mmdevapi.dll",
 }
+# Prefix initialization and services run through the 64-bit WoW64 host farm.
+# The translated i386 farm supplies their client DLLs, not duplicate service EXEs.
+I386_REQUIRED_BUILTINS = (REQUIRED_BUILTINS - {"winedevice.exe", "wineboot.exe", "services.exe", "rpcss.exe"}) | {
+    "user32.dll", "gdi32.dll", "win32u.dll", "d3d11.dll", "dxgi.dll", "d3d10core.dll", "winemetal.dll",
+}
+I386_PE_SUFFIXES = {".dll", ".drv", ".exe", ".cpl", ".acm", ".ax", ".ocx", ".com"}
+
+
+def packaged_builtin(path, farm):
+    return (path.suffix.casefold() in (".dll", ".drv") or path.name.casefold() in WINE_TOOLS
+            or (farm == "i386-windows" and path.suffix.casefold() in I386_PE_SUFFIXES | {".tlb"}))
+
+
+WOW64_REQUIRED_BUILTINS = {"wow64.dll", "wow64win.dll", "xtajit.dll", "libc++.dll", "libunwind.dll"}
 FORBIDDEN = ("steamclient", "codex", "test", "probe", "canary", "hello", "triangle", "cube", "thumper")
 MAX_ARCHIVE_MEMBERS = 250_000
 MAX_ARCHIVE_UNPACKED = 20 * 1024**3
@@ -273,7 +301,7 @@ def tree_hashes(runtime_root, guest_root):
 
 
 def validate_existing_stage(output, guest_output, template, prefix_provenance,
-                            native_receipt_path, source, license_files, d3d12_inputs):
+                            native_receipt_path, source, license_files, d3d12_inputs, enable_x86=False):
     manifest_path = output / "AVPPLAY_RESOURCE_STAGE.json"
     if (output.is_symlink() or guest_output.is_symlink() or not output.is_dir()
             or not guest_output.is_dir() or manifest_path.is_symlink() or not manifest_path.is_file()):
@@ -290,11 +318,13 @@ def validate_existing_stage(output, guest_output, template, prefix_provenance,
         "licensesSha256": {name: sha256_file(path) for name, path in sorted(license_files.items())},
         "d3d12Inputs": d3d12_inputs,
     }
+    if enable_x86:
+        expected_inputs["enableX86"] = True
     if manifest.get("inputs") != expected_inputs or manifest.get("filesSha256") != tree_hashes(output, guest_output):
         fail("Existing staged resource trees do not match current prefix, license, or build inputs; refusing reuse.")
 
 
-def validate_guest_tree(guest_root):
+def validate_guest_tree(guest_root, enable_x86=False):
     regular_tree(guest_root, "WindowsVR guest stage")
     required = (
         guest_root / "Guest/x64/OpenComposite/bin/vrclient_x64.dll",
@@ -304,6 +334,14 @@ def validate_guest_tree(guest_root):
         regular_file(path, "Required x64 guest runtime DLL")
         if not _is_x64_pe(path):
             fail(f"Guest DLL is not a valid x64 PE image: {path}")
+    x86_root = guest_root / "Guest/x86"
+    if enable_x86:
+        for path in (x86_root / "OpenComposite/bin/vrclient.dll", x86_root / "wvr_openxr.dll"):
+            regular_file(path, "Required x86 guest runtime DLL")
+            if pe_machine(path) != 0x14C:
+                fail(f"Guest DLL is not an i386 PE image: {path}")
+    elif x86_root.exists():
+        fail("An x86 guest package requires --enable-x86 or AVPPLAY_ENABLE_X86=1.")
     arm64ec_root = guest_root / "Guest/arm64ec"
     if arm64ec_root.exists():
         pair = [arm64ec_root / "OpenComposite/bin/vrclient_x64.dll", arm64ec_root / "wvr_openxr.dll"]
@@ -430,7 +468,7 @@ def validate_d3d12_stage(stage_root, native_archive):
     }
 
 
-def validate_wine_resources(source):
+def validate_wine_resources(source, enable_x86=False):
     regular_tree(source, "Madeira Wine resource source")
     for relative in ("arm64ec-windows", "aarch64-windows", "nls", "legal"):
         if not (source / relative).is_dir():
@@ -439,8 +477,11 @@ def validate_wine_resources(source):
         fail("Wine NLS resource directory is empty.")
     if not any(path.is_file() for path in (source / "legal").rglob("*")):
         fail("Wine legal resource directory is empty.")
-    for farm in ("arm64ec-windows", "aarch64-windows"):
+    farms = ("arm64ec-windows", "aarch64-windows") + (("i386-windows",) if enable_x86 else ())
+    for farm in farms:
         farm_root = source / farm
+        if not farm_root.is_dir():
+            fail(f"Required Wine resource directory is missing: {farm_root}")
         names = {}
         for path in farm_root.iterdir():
             if path.is_symlink() or not path.is_file():
@@ -449,7 +490,8 @@ def validate_wine_resources(source):
             if key in names:
                 fail(f"Wine builtin farm contains case-colliding files: {path.name}")
             names[key] = path
-        missing = sorted(REQUIRED_BUILTINS - set(names))
+        required = I386_REQUIRED_BUILTINS if farm == "i386-windows" else REQUIRED_BUILTINS
+        missing = sorted(required - set(names))
         if missing:
             fail(f"Wine builtin farm {farm} is missing required files: {', '.join(missing)}")
         if farm == "arm64ec-windows":
@@ -459,7 +501,7 @@ def validate_wine_resources(source):
         graphics_required = {"d3d11.dll", "winemetal.dll"} if farm == "arm64ec-windows" else set()
         if not graphics_required.issubset(names):
             fail("ARM64EC resource farm must include the matching-overlay DXMT d3d11.dll and winemetal.dll.")
-        for name in REQUIRED_BUILTINS | graphics_required:
+        for name in required | graphics_required:
             if names[name].stat().st_size == 0:
                 fail(f"Required Wine builtin is empty: {names[name]}")
         if farm == "arm64ec-windows":
@@ -467,21 +509,31 @@ def validate_wine_resources(source):
                 path = names[name]
                 if not is_arm64ec_pe(path):
                     fail(f"ARM64EC runtime farm requires ARM64EC PE files: {path}")
+        if enable_x86 and farm == "aarch64-windows":
+            missing = sorted(WOW64_REQUIRED_BUILTINS - set(names))
+            if missing:
+                fail(f"WOW64 ARM64 farm is missing required files: {', '.join(missing)}")
+            for name in WOW64_REQUIRED_BUILTINS:
+                if pe_machine(names[name]) != 0xAA64:
+                    fail(f"WOW64 runtime requires ARM64 PE files: {names[name]}")
         for name, path in names.items():
-            if (path.suffix.casefold() == ".dll" or name in WINE_TOOLS) and any(term in name for term in FORBIDDEN):
+            if farm == "i386-windows" and packaged_builtin(path, farm) and path.suffix.casefold() != ".tlb" and pe_machine(path) != 0x14C:
+                fail(f"i386 runtime farm requires i386 PE files: {path}")
+            if (path.suffix.casefold() in (".dll", ".drv") or name in WINE_TOOLS) and any(term in name for term in FORBIDDEN):
                 fail(f"Wine builtin farm contains an excluded test/game resource: {path}")
 
 
-def copy_builtins(source, destination):
-    for farm in ("arm64ec-windows", "aarch64-windows"):
+def copy_builtins(source, destination, enable_x86=False):
+    for farm in ("arm64ec-windows", "aarch64-windows") + (("i386-windows",) if enable_x86 else ()):
         farm_output = destination / farm
         farm_output.mkdir()
         for path in (source / farm).iterdir():
             name = path.name.casefold()
-            if path.suffix.casefold() == ".dll" or name in WINE_TOOLS:
+            if packaged_builtin(path, farm):
                 shutil.copy2(path, farm_output / path.name)
         names = {path.name.casefold() for path in farm_output.iterdir()}
-        missing = sorted(REQUIRED_BUILTINS - names)
+        required = I386_REQUIRED_BUILTINS if farm == "i386-windows" else REQUIRED_BUILTINS
+        missing = sorted(required - names)
         if missing:
             fail(f"Staged Wine builtin farm {farm} is incomplete: {', '.join(missing)}")
         if farm == "arm64ec-windows":
@@ -493,7 +545,7 @@ def copy_builtins(source, destination):
 
 
 def transactional_stage(source, template, prefix_provenance, guest_root, output,
-                       license_files, native_receipt_path, d3d12_stage=None, d3d12_inputs=None):
+                       license_files, native_receipt_path, d3d12_stage=None, d3d12_inputs=None, enable_x86=False):
     guest_output = output.parent / "WindowsVR"
     if output.exists() or guest_output.exists():
         fail("Resource output already exists; use --reuse-existing only for a receipt-matched prior stage.")
@@ -514,7 +566,7 @@ def transactional_stage(source, template, prefix_provenance, guest_root, output,
             if ca_bundle.stat().st_size == 0:
                 fail("Madeira CA bundle is empty.")
             shutil.copy2(ca_bundle, staged_runtime / "cacert.pem")
-        copy_builtins(source, staged_runtime)
+        copy_builtins(source, staged_runtime, enable_x86)
         shutil.copytree(guest_root, staged_guest, dirs_exist_ok=True)
         if d3d12_stage is not None:
             shutil.copytree(d3d12_stage / "Runtime/arm64ec-windows",
@@ -541,6 +593,8 @@ def transactional_stage(source, template, prefix_provenance, guest_root, output,
             },
             "filesSha256": tree_hashes(staged_runtime, staged_guest),
         }
+        if enable_x86:
+            manifest["inputs"]["enableX86"] = True
         (staged_runtime / "AVPPLAY_RESOURCE_STAGE.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         # Commit both sibling trees only after all input validation and copies succeed.
@@ -572,6 +626,8 @@ def main():
                         help="Optional receipt-backed modern DXMT/ARM64EC closure created by stage_d3d12_experimental.sh")
     parser.add_argument("--d3d12-native-archive", type=Path,
                         help="The exact libdxmt_d3d12_combined.a selected by the app linker; required with --d3d12-stage")
+    parser.add_argument("--enable-x86", action="store_true", default=os.environ.get("AVPPLAY_ENABLE_X86") == "1",
+                        help="Require and validate the matching i386 Wine/OpenVR/OpenXR and WOW64 FEX closure")
     parser.add_argument("--reuse-existing", action="store_true",
                         help="Reuse existing output only when its stage manifest matches these exact inputs")
     parser.add_argument("--madeira-license", type=Path, required=True,
@@ -582,6 +638,8 @@ def main():
                         help="Khronos OpenXR-SDK license file to include in WindowsVR/Legal")
     args = parser.parse_args()
 
+    if args.enable_x86 and args.d3d12_stage is not None:
+        fail("x86 support requires matching legacy DXMT native/guest binaries; the experimental D3D12 profile is not WOW64-compatible.")
     source = args.source.resolve()
     runtime_source = args.runtime_source.resolve()
     output = args.output.absolute()
@@ -599,10 +657,10 @@ def main():
                         ("OpenXR-SDK", licenses["WindowsVR/Legal/OpenXR-SDK/LICENSE"])):
         require_license(path, label)
     validate_prefix_archive(template)
-    native_receipt, _ = validate_receipts(source, runtime_source, native_receipt_path)
+    native_receipt, _ = validate_receipts(source, runtime_source, native_receipt_path, args.enable_x86)
     validate_prefix_provenance(prefix_provenance, template, native_receipt["source"]["sourceRevision"])
-    validate_wine_resources(source)
-    validate_guest_tree(guest_root)
+    validate_wine_resources(source, args.enable_x86)
+    validate_guest_tree(guest_root, args.enable_x86)
     if (args.d3d12_stage is None) != (args.d3d12_native_archive is None):
         fail("--d3d12-stage and --d3d12-native-archive must be supplied together.")
     d3d12_stage = args.d3d12_stage.resolve() if args.d3d12_stage else None
@@ -612,11 +670,11 @@ def main():
         if not args.reuse_existing:
             fail("Resource output already exists; pass --reuse-existing to verify and resume a matching stage.")
         validate_existing_stage(output, guest_output, template, prefix_provenance,
-                                native_receipt_path, source, licenses, d3d12_inputs)
+                                native_receipt_path, source, licenses, d3d12_inputs, args.enable_x86)
         print(f"Verified existing staged resources at {output.parent}; no code was executed.")
         return
     transactional_stage(source, template, prefix_provenance, guest_root, output,
-                        licenses, native_receipt_path, d3d12_stage, d3d12_inputs)
+                        licenses, native_receipt_path, d3d12_stage, d3d12_inputs, args.enable_x86)
     print(f"Staged validated Wine and Windows VR resources at {output.parent}; no code was executed.")
 
 

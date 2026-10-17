@@ -39,7 +39,8 @@ struct SteamDownloadProgress: Equatable, Sendable {
 /// - Files are sized to their manifest length, so an update that shrinks a
 ///   file cannot leave stale trailing bytes.
 /// - Chunk writes happen on the download tasks with pwrite, never on the
-///   main actor; a dedicated URLSession keeps chunks out of the URL cache.
+///   main actor. System-managed background URLSession transfers can finish while
+///   visionOS suspends the app; encrypted results wait for verification on wake.
 /// - Manifest paths are validated to stay inside the install folder, and
 ///   directory names are folded case-insensitively (Windows semantics on a
 ///   case-sensitive iOS volume).
@@ -395,7 +396,13 @@ final class DepotDownloader {
             let host = order[attempt % order.count]
             let url = "\(host)/depot/\(plan.depotID)/chunk/\(chunk.shaHex)\(plan.auth[host] ?? "")"
             do {
-                let encrypted = try await download(url)
+                guard let requestURL = URL(string: url) else {
+                    throw SteamError.chunkDownloadFailed("Invalid content URL.")
+                }
+                let encrypted = try await SteamBackgroundTransfers.shared.data(for: requestURL)
+                // Background results are retained on disk until verification and
+                // writing have run. Never reuse corrupt data on the next host retry.
+                defer { SteamBackgroundTransfers.shared.removeCachedData(for: requestURL) }
                 let data = try ContentDecryptor.processChunk(encryptedData: encrypted, depotKey: plan.key,
                                                              expectedCRC: chunk.crc,
                                                              expectedSize: Int(chunk.uncompressedSize))

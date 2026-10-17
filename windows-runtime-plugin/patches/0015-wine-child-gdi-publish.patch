@@ -1,0 +1,37 @@
+# Publish the GDI shared handle table into every pseudo-process, not only the
+# session's first one. A game launched through WindowsVRCacheLauncher.exe is a
+# later 64-bit process whose PEB never received it (gdi32 null-table fault).
+diff --git a/build/win32u-unix/class_ios.c b/build/win32u-unix/class_ios.c
+index 1242762..abccfa5 100644
+--- a/build/win32u-unix/class_ios.c
++++ b/build/win32u-unix/class_ios.c
+@@ -429,6 +429,12 @@ NTSTATUS WINAPI NtUserInitializeClientPfnArrays( const ntuser_client_func_ptr *c
+     pthread_mutex_unlock( &winproc_lock );
+ 
+     pthread_once( &init_once, init_user );
++    /* madeira-gdi: init_user (gdi_init) runs once per iOS process, so a later
++     * pseudo-process (e.g. a game started through WindowsVRCacheLauncher.exe)
++     * would otherwise keep a NULL Peb->GdiSharedHandleTable and fault in
++     * gdi32 get_gdi_client_ptr/SelectObject. Publish it for this process now,
++     * before any gdi32 call. No-op once published. */
++    win32u_gdi_check_publish();
+     return STATUS_SUCCESS;
+ }
+ 
+diff --git a/wine/dlls/win32u/win32u_private.h b/wine/dlls/win32u/win32u_private.h
+index da02424..69f8ebb 100644
+--- a/wine/dlls/win32u/win32u_private.h
++++ b/wine/dlls/win32u/win32u_private.h
+@@ -387,7 +387,11 @@ extern __thread void *win32u_gdi_published_peb;
+ extern void win32u_gdi_publish_shared(void);
+ static inline void win32u_gdi_check_publish(void)
+ {
+-    if (win32u_wow_session && NtCurrentTeb()->WowTebOffset &&
++    /* 64-bit pseudo-processes need it too: gdi_init() only publishes into the
++     * PEB of the session's first process, so every later one (a child started
++     * through a launcher stub) had a NULL GdiSharedHandleTable. The WoW64
++     * section gate still applies to 32-bit callers. */
++    if ((win32u_wow_session || !NtCurrentTeb()->WowTebOffset) &&
+         win32u_gdi_published_peb != NtCurrentTeb()->Peb)
+         win32u_gdi_publish_shared();
+ }

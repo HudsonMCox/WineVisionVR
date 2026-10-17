@@ -10,6 +10,7 @@ public struct WindowsVRRequestedProfile: Codable, Sendable, Equatable {
     public let executableRelativePath: String
     public let launchArguments: [String]
     public let spatialRenderScale: Float
+    public let presentation: WindowsPresentationMode?
     /// Values are intentionally omitted; environment values can contain secrets.
     public let environmentVariableNames: [String]
 
@@ -23,7 +24,8 @@ public struct WindowsVRRequestedProfile: Codable, Sendable, Equatable {
         executableRelativePath: String,
         launchArguments: [String],
         environment: [String: String],
-        spatialRenderScale: Float = 1
+        spatialRenderScale: Float = 1,
+        presentation: WindowsPresentationMode = .immersiveVR
     ) {
         self.gameID = gameID
         self.gameTitle = gameTitle
@@ -34,6 +36,7 @@ public struct WindowsVRRequestedProfile: Codable, Sendable, Equatable {
         self.executableRelativePath = executableRelativePath
         self.launchArguments = launchArguments
         self.spatialRenderScale = spatialRenderScale
+        self.presentation = presentation
         self.environmentVariableNames = environment.keys.sorted()
     }
 }

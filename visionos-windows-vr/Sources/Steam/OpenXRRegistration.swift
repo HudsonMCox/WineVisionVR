@@ -11,17 +11,30 @@ import os
 /// registry" from the OpenXR loader, so the variable does not reach it and the game never starts VR.
 /// The loader also reads HKLM\Software\Khronos\OpenXR\1\ActiveRuntime, which is not affected by how a
 /// process environment is built. The registry value must outlive the plugin's per-launch runtime folder,
-/// so it names a stable `windows-vr-runtime\active\x64` folder that this type refreshes on every launch.
+/// so it names a stable `windows-vr-runtime\active\<architecture>` folder refreshed on every launch.
+/// The 32-bit loader reads the Wow6432Node registry view; 64-bit registration is preserved separately.
 enum OpenXRRegistration {
     private static let log = Logger(subsystem: "org.avpplay.windows-vr", category: "openxr-registry")
-    private static func guestFolder(architecture: String) -> String {
-        #"C:\windows-vr-runtime\active"# + "\\" + architecture
+    enum Architecture: String {
+        case x86, x64, arm64ec
+
+        var sectionName: String {
+            self == .x86 ? #"Software\\Wow6432Node\\Khronos\\OpenXR\\1"# : #"Software\\Khronos\\OpenXR\\1"#
+        }
+        var guestFolder: String { "C:\\windows-vr-runtime\\active\\" + rawValue }
+        var clientName: String { self == .x86 ? "vrclient.dll" : "vrclient_x64.dll" }
     }
-    private static let sectionName = #"Software\\Khronos\\OpenXR\\1"#
+
+    /// Select the plugin's native 64-bit guest package without accepting arbitrary paths.
+    static func install(prefix: URL, architecture: String) throws {
+        guard let architecture = Architecture(rawValue: architecture) else {
+            throw RegistrationFailure.runtimeMissing
+        }
+        try install(prefix: prefix, architecture: architecture)
+    }
 
     /// Call before the runtime starts: the registry file is only read when the Wine server starts.
-    static func install(prefix: URL, architecture: String = "x64") throws {
-        guard architecture == "x64" || architecture == "arm64ec" else { throw RegistrationFailure.runtimeMissing }
+    static func install(prefix: URL, architecture: Architecture = .x64) throws {
         guard wineserver_is_running() == 0, wine_process_is_running() == 0 else {
             throw RegistrationFailure.runtimeActive
         }
@@ -54,21 +67,21 @@ enum OpenXRRegistration {
         if removed > 0 { log.notice("Removed \(removed) stale guest runtime folders") }
     }
 
-    private static func refreshActiveFolder(prefix: URL, architecture: String) throws {
+    private static func refreshActiveFolder(prefix: URL, architecture: Architecture) throws {
         let fm = FileManager.default
         guard let resources = Bundle.main.resourceURL else { throw RegistrationFailure.runtimeMissing }
-        let runtimeDLL = resources.appendingPathComponent("WindowsVR/Guest/\(architecture)/wvr_openxr.dll")
+        let runtimeDLL = resources.appendingPathComponent("WindowsVR/Guest/\(architecture.rawValue)/wvr_openxr.dll")
         guard fm.fileExists(atPath: runtimeDLL.path) else {
             throw RegistrationFailure.runtimeMissing
         }
-        let folder = prefix.appendingPathComponent("drive_c/windows-vr-runtime/active/\(architecture)", isDirectory: true)
+        let folder = prefix.appendingPathComponent("drive_c/windows-vr-runtime/active/\(architecture.rawValue)", isDirectory: true)
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
         let link = folder.appendingPathComponent("wvr_openxr.dll")
         // The app container path changes on reinstall, so always point the link at this bundle.
         try? fm.removeItem(at: link)
         try fm.createSymbolicLink(at: link, withDestinationURL: runtimeDLL)
-        let composite = resources.appendingPathComponent("WindowsVR/Guest/\(architecture)/OpenComposite", isDirectory: true)
-        guard fm.fileExists(atPath: composite.appendingPathComponent("bin/vrclient_x64.dll").path) else {
+        let composite = resources.appendingPathComponent("WindowsVR/Guest/\(architecture.rawValue)/OpenComposite", isDirectory: true)
+        guard fm.fileExists(atPath: composite.appendingPathComponent("bin/" + architecture.clientName).path) else {
             throw RegistrationFailure.runtimeMissing
         }
         let compositeLink = folder.appendingPathComponent("OpenComposite")
@@ -78,7 +91,7 @@ enum OpenXRRegistration {
             "file_format_version": "1.0.0",
             "runtime": [
                 "name": "WineVision VR Runtime",
-                "library_path": guestFolder(architecture: architecture) + #"\wvr_openxr.dll"#,
+                "library_path": architecture.guestFolder + "\\wvr_openxr.dll",
                 "functions": ["xrNegotiateLoaderRuntimeInterface": "xrNegotiateLoaderRuntimeInterface"],
             ] as [String: Any],
         ]
@@ -86,21 +99,23 @@ enum OpenXRRegistration {
         try data.write(to: folder.appendingPathComponent("runtime.json"), options: .atomic)
     }
 
-    private static func registerActiveRuntime(prefix: URL, architecture: String) throws {
+    private static func registerActiveRuntime(prefix: URL, architecture: Architecture) throws {
+        let sectionName = architecture.sectionName
+        let manifestGuestPath = architecture.guestFolder + "\\runtime.json"
         let registry = prefix.appendingPathComponent("system.reg")
         guard var text = try? String(contentsOf: registry, encoding: .utf8) else {
             throw RegistrationFailure.registryMissing
         }
-        let value = "\"ActiveRuntime\"=\"" + (guestFolder(architecture: architecture) + #"\runtime.json"#).replacingOccurrences(of: "\\", with: "\\\\") + "\""
-        if text.contains("[\(sectionName)]"), text.contains(value) { return }
+        let value = "\"ActiveRuntime\"=\"" + manifestGuestPath.replacingOccurrences(of: "\\", with: "\\\\") + "\""
         let backup = prefix.appendingPathComponent("system.reg.before-openxr")
         if !FileManager.default.fileExists(atPath: backup.path) { try? text.write(to: backup, atomically: true, encoding: .utf8) }
 
-        // Drop any older OpenXR\1 section, then insert ours.
+        // Update only this architecture's registry view.
         var lines = text.components(separatedBy: "\n")
         if let start = lines.firstIndex(where: { $0.hasPrefix("[\(sectionName)]") }) {
             var end = start + 1
             while end < lines.count, !lines[end].hasPrefix("[") { end += 1 }
+            if lines[start..<end].contains(value) { return }
             lines.removeSubrange(start..<end)
         }
         let now = Int(Date().timeIntervalSince1970)
@@ -115,7 +130,7 @@ enum OpenXRRegistration {
 
     /// Unity's OpenVR loader reads the user's path registry even when Steam
     /// does not inherit VR_OVERRIDE. Register the same stable bundled bridge.
-    private static func registerOpenVRRuntime(prefix: URL, architecture: String) throws {
+    private static func registerOpenVRRuntime(prefix: URL, architecture: Architecture) throws {
         let fm = FileManager.default
         let users = prefix.appendingPathComponent("drive_c/users", isDirectory: true)
         let profiles = try fm.contentsOfDirectory(at: users, includingPropertiesForKeys: [.isDirectoryKey])
@@ -132,7 +147,7 @@ enum OpenXRRegistration {
             let windowsFolder = "C:\\users\\"+profile.lastPathComponent+"\\AppData\\Local\\openvr"
             contents["jsonid"] = "vrpathreg"
             contents["version"] = 1
-            contents["runtime"] = [guestFolder(architecture: architecture) + #"\OpenComposite"#]
+            contents["runtime"] = [architecture.guestFolder + "\\OpenComposite"]
             // Keep configured driver/config/log paths; supply valid defaults for a fresh prefix.
             if (contents["config"] as? [String])?.isEmpty != false { contents["config"] = [windowsFolder+"\\config"] }
             if (contents["log"] as? [String])?.isEmpty != false { contents["log"] = [windowsFolder+"\\logs"] }

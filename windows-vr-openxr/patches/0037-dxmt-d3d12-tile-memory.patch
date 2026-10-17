@@ -1,0 +1,163 @@
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 1d54278..feeb006 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -149,6 +149,13 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
+   FLOAT blend_factor_[4];
+   UINT8 stencil_ref_;
+ 
++  // discards issued since the last encoder boundary, consumed only by the render pass opened right after them
++  struct PendingDiscard {
++    Rc<Texture> texture;
++    EncoderData *after;
++  };
++  std::vector<PendingDiscard> pending_discards_;
++
+ public:
+   MTLD3D12GraphicsCommandListImpl(MTLD3D12Device *pDevice) : MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList>(pDevice) {}
+ 
+@@ -196,6 +203,8 @@ public:
+     index_type = {};
+     index_offset = 0;
+ 
++    pending_discards_.clear();
++
+     dirty_state_.clrAll();
+   }
+ 
+@@ -289,6 +298,61 @@ public:
+     return {offset, stride};
+   }
+ 
++  bool
++  IsPendingDiscard(Texture *texture) {
++    for (auto &discard : pending_discards_) {
++      if (discard.texture.ptr() == texture && discard.after == allocator_->encoder_last)
++        return true;
++    }
++    return false;
++  }
++
++  // folds a full-extent clear that immediately precedes this pass into the pass load actions
++  void
++  FoldPrecedingClear(RenderEncoderData *render) {
++    auto encoder = allocator_->encoder_last;
++    if (!encoder || encoder->type != EncoderType::Clear)
++      return;
++    auto clear = static_cast<ClearEncoderData *>(encoder);
++    if (clear->clear_dsv) {
++      unsigned folded = 0;
++      if ((clear->clear_dsv & 1) && render->depth.attachment && render->depth.attachment.ptr() == clear->attachment.ptr())
++        folded |= 1;
++      if ((clear->clear_dsv & 2) && render->stencil.attachment && render->stencil.attachment.ptr() == clear->attachment.ptr())
++        folded |= 2;
++      if (folded != clear->clear_dsv)
++        return;
++      if (folded & 1) {
++        render->depth.load_action = WMTLoadActionClear;
++        render->depth.clear_depth = clear->depth_stencil.first;
++      }
++      if (folded & 2) {
++        render->stencil.load_action = WMTLoadActionClear;
++        render->stencil.clear_stencil = clear->depth_stencil.second;
++      }
++    } else {
++      auto same_color = [clear](const RenderEncoderColorAttachmentData &color) {
++        return color.attachment && color.attachment.ptr() == clear->attachment.ptr() &&
++               color.depth_plane == clear->depth_plane;
++      };
++      bool matched = false;
++      for (auto &color : render->colors)
++        matched |= same_color(color);
++      if (!matched)
++        return;
++      for (auto &color : render->colors) {
++        if (!same_color(color))
++          continue;
++        color.load_action = WMTLoadActionClear;
++        color.clear_color = clear->color;
++      }
++    }
++    // the pass now owns the clear, so drop the clear's view reference and neutralize its encoder
++    // (allocator Reset skips Null encoders and does not run their destructors)
++    clear->attachment = nullptr;
++    clear->type = EncoderType::Null;
++  }
++
+   DrawCallStatus
+   PreDraw(bool SkipResourceBinding = false) {
+     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Render) {
+@@ -317,7 +381,7 @@ public:
+         auto &rt = render->colors[i];
+         rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
+         rt.depth_plane = AttachmentDesc.DepthPlane;
+-        rt.load_action = WMTLoadActionLoad;
++        rt.load_action = IsPendingDiscard(AttachmentDesc.Texture) ? WMTLoadActionDontCare : WMTLoadActionLoad;
+         rt.store_action = WMTStoreActionStore;
+         render_target_width = std::min(render_target_width, AttachmentDesc.Width);
+         render_target_height = std::min(render_target_height, AttachmentDesc.Height);
+@@ -334,14 +398,14 @@ public:
+           auto &rt = render->depth;
+           rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
+           rt.depth_plane = 0; // DSV cannot be 3D
+-          rt.load_action = WMTLoadActionLoad;
++          rt.load_action = IsPendingDiscard(AttachmentDesc.Texture) ? WMTLoadActionDontCare : WMTLoadActionLoad;
+           rt.store_action = WMTStoreActionStore;
+         }
+         if (dsv_planar_flags & 2) {
+           auto &rt = render->stencil;
+           rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
+           rt.depth_plane = 0; // DSV cannot be 3D
+-          rt.load_action = WMTLoadActionLoad;
++          rt.load_action = IsPendingDiscard(AttachmentDesc.Texture) ? WMTLoadActionDontCare : WMTLoadActionLoad;
+           rt.store_action = WMTStoreActionStore;
+         }
+         render->dsv_planar_flags = dsv_planar_flags;
+@@ -357,6 +421,10 @@ public:
+         render->default_raster_sample_count = std::max(1u, pso_graphics_->forced_sample_count);
+       }
+ 
++      // discards only ever apply to the pass that opens directly after them
++      pending_discards_.clear();
++      FoldPrecedingClear(render);
++
+       dirty_state_.set(DirtyState::VertexBuffer, DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
+       dirty_state_.set(DirtyState::Viewport, DirtyState::ScissorRect);
+       dirty_state_.set(DirtyState::BlendFactor, DirtyState::StencilRef);
+@@ -1419,7 +1487,35 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE DiscardResource(ID3D12Resource *pResource, const D3D12_DISCARD_REGION *pRegion) {
+-    // do nothing for now
++    // only whole-resource discards are tracked, partial regions keep their contents
++    if (!pResource || pRegion)
++      return;
++    auto resource = static_cast<MTLD3D12Resource *>(pResource);
++    if (!resource->texture)
++      return;
++    auto texture = resource->texture.ptr();
++
++    // the open pass can no longer keep the contents of this texture, so close it storing nothing
++    if (allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Render) {
++      auto render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
++      for (unsigned i = 0; i < num_rtvs; i++) {
++        if (!rtvs[i].ptr)
++          continue;
++        auto [Heap, Index] = GetRenderTargetHeap(device_, rtvs[i]);
++        if (Heap->GetRenderTarget(Index).Texture == texture)
++          render->colors[i].store_action = WMTStoreActionDontCare;
++      }
++      if (dsv.ptr) {
++        auto [Heap, Index] = GetRenderTargetHeap(device_, dsv);
++        if (Heap->GetRenderTarget(Index).Texture == texture) {
++          render->depth.store_action = WMTStoreActionDontCare;
++          render->stencil.store_action = WMTStoreActionDontCare;
++        }
++      }
++      allocator_->InvalidateCurrentPass();
++    }
++
++    pending_discards_.push_back({resource->texture, allocator_->encoder_last});
+   };
+ 
+   void STDMETHODCALLTYPE

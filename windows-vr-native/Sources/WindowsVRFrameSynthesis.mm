@@ -20,7 +20,7 @@ using namespace metal;
 constexpr sampler linearSample(coord::normalized,address::clamp_to_edge,filter::linear);
 struct P {float4x4 inverseProjection, otherClipFromView, otherViewFromView, stereoClipFromView;
  float4x4 displayInverseProjection,sourceViewFromDisplayView,sourceProjection;
- uint2 size,origin,region,depthOrigin,depthSize;float2 range;float horizon;uint stableCamera;uint displayWarp;float motionRatio;};
+ uint2 size,origin,region,depthOrigin,depthSize;float2 range;float horizon;uint stableCamera;uint displayWarp;float motionRatio;float4x4 historyClipFromSource;float2 jitterUV;uint temporal;uint historyValid;float4x4 displayProjection,displayFromSource,historyProjection,currentFromHistory;};
 float luminance(float3 c){return dot(c,float3(.2126,.7152,.0722));}
 float3 ray(float2 uv,constant P&p){float4 a=p.inverseProjection*float4(uv*float2(2,-2)+float2(-1,1),.5,1);return a.xyz/max(1e-8,-a.z);}
 bool projected(float2 uv,float distance,constant P&p,thread float2&at,thread float&z){
@@ -129,6 +129,36 @@ bool display_to_source(float2 uv,texture2d<float> depth,constant P&p,thread floa
 kernel void display_map(texture2d<float> depth[[texture(0)]],texture2d<float,access::write> output[[texture(1)]],constant P&p[[buffer(0)]],uint2 at[[thread_position_in_grid]]){
  if(any(at>=p.size))return;float2 uv=0;bool valid=display_to_source((float2(at)+.5)/float2(p.size),depth,p,uv);output.write(valid?float4(uv,1,0):float4(0),at);
 }
+// Depth of the synthesized output in drawable convention. Uses the same confidence gate as reconstruct;
+// pixels without a valid source mapping are 0 (invalid).
+kernel void synth_depth(texture2d<float> depth[[texture(0)]],texture2d<float> backward[[texture(1)]],texture2d<float,access::write> out[[texture(2)]],constant P&p[[buffer(0)]],uint2 at[[thread_position_in_grid]]){
+ if(any(at>=p.size))return;float2 uv=(float2(at)+.5)/float2(p.size),mapped=0;float z=0;
+ if(display_to_source(uv,depth,p,mapped)){
+  float4 f=backward.sample(linearSample,mapped);float2 d=depth.sample(linearSample,mapped).rg;
+  if(f.z>.5&&f.w>.2&&d.y>.2&&isfinite(d.x)&&d.x>0){
+   float4 point=p.displayFromSource*float4(ray(mapped,p)*d.x,1);float4 clip=p.displayProjection*point;
+   z=clip.w>0?clip.z/clip.w:0;if(!(isfinite(z)&&z>0&&z<=1))z=0;
+  }
+ }
+ out.write(float4(z,0,0,1),at);
+}
+// Disoccluded pixels (depth 0): move the previous synthesized surface at this pixel into the current pose and
+// sample the previous output where it lands. Accepted only for a small, consistent shift; otherwise keep current.
+kernel void disocclusion_fill(texture2d<float> current[[texture(0)]],texture2d<float> depth[[texture(1)]],texture2d<float> history[[texture(2)]],texture2d<float> historyDepth[[texture(3)]],texture2d<float,access::write> out[[texture(4)]],constant P&p[[buffer(0)]],uint2 at[[thread_position_in_grid]]){
+ if(any(at>=p.size))return;float2 uv=(float2(at)+.5)/float2(p.size);float3 c=current.read(at).rgb;
+ if(depth.read(at).x>0){out.write(float4(c,1),at);return;}
+ float hd=historyDepth.read(at).x;float denom=hd+p.historyProjection[2][2];
+ float dist=abs(denom)>1e-8?p.historyProjection[3][2]/denom:0;
+ if(!(hd>0&&hd<=1&&dist>.02&&dist<1000)){out.write(float4(c,1),at);return;}
+ float4 r=p.displayInverseProjection*float4(uv*float2(2,-2)+float2(-1,1),.5,1);
+ float4 moved=p.currentFromHistory*float4(r.xyz/max(1e-8,-r.z)*dist,1);float4 clip=p.displayProjection*moved;
+ if(clip.w<=0){out.write(float4(c,1),at);return;}
+ float2 landed=clip.xy/clip.w*float2(.5,-.5)+.5,shift=landed-uv,src=uv-shift;
+ if(length(shift)>.05||any(src<0)||any(src>1)){out.write(float4(c,1),at);return;}
+ uint2 texel=min(uint2(src*float2(p.size)),p.size-1);
+ if(!(historyDepth.read(texel).x>0)){out.write(float4(c,1),at);return;}
+ out.write(float4(history.sample(linearSample,src).rgb,1),at);
+}
 kernel void reconstruct(texture2d<float> current[[texture(0)]],texture2d<float> previous[[texture(1)]],texture2d<float> backward[[texture(2)]],texture2d<float> forward[[texture(3)]],texture2d<float> depth[[texture(4)]],texture2d<float,access::write> out[[texture(5)]],texture2d<float> otherFlow[[texture(6)]],texture2d<float> previousMotion[[texture(7)]],texture2d<float> displayMap[[texture(8)]],texture2d<float>cameraBasis[[texture(9)]],texture2d<float>stereoBasis[[texture(10)]],constant P&p[[buffer(0)]],uint2 at[[thread_position_in_grid]]){
  if(any(at>=p.size))return;float2 uv;
  if(p.displayWarp==2){float4 mapped=displayMap.sample(linearSample,(float2(at)+.5)/float2(p.size));uv=mapped.rg;if(mapped.b<.999||any(uv<0)||any(uv>1)){out.write(float4(0,0,0,1),at);return;}}
@@ -147,14 +177,46 @@ kernel void reconstruct(texture2d<float> current[[texture(0)]],texture2d<float> 
   if(prior.z>.5){float change=length((f.xy-inverse*prior.xy*p.motionRatio)*float2(backward.get_width(),backward.get_height()));localHorizon/=1+change*.25;}}
  if(valid&&p.horizon>0){sampleUV=uv+f.xy*localHorizon;valid=all(sampleUV>=0)&&all(sampleUV<=1);}
  if(!valid)sampleUV=uv;
- float3 c=current.sample(linearSample,sampleUV).rgb;float2 step=1/float2(current.get_width(),current.get_height());
- float3 l=current.sample(linearSample,sampleUV-float2(step.x,0)).rgb,r=current.sample(linearSample,sampleUV+float2(step.x,0)).rgb;
- float3 t=current.sample(linearSample,sampleUV-float2(0,step.y)).rgb,b=current.sample(linearSample,sampleUV+float2(0,step.y)).rgb;
+ float2 srcUV=sampleUV+p.jitterUV;float3 c=current.sample(linearSample,srcUV).rgb;float2 step=1/float2(current.get_width(),current.get_height());
+ float3 l=current.sample(linearSample,srcUV-float2(step.x,0)).rgb,r=current.sample(linearSample,srcUV+float2(step.x,0)).rgb;
+ float3 t=current.sample(linearSample,srcUV-float2(0,step.y)).rgb,b=current.sample(linearSample,srcUV+float2(0,step.y)).rgb;
  // Bounded edge enhancement preserves local extrema rather than ringing around UI.
  float3 lo=min(c,min(min(l,r),min(t,b))),hi=max(c,max(max(l,r),max(t,b)));
  float3 spatial=clamp(c+(c-(l+r+t+b)*.25)*.15,lo,hi);
  if(valid&&p.horizon==0){float3 history=previous.sample(linearSample,base+previousOffset).rgb;spatial=mix(spatial,clamp(history,lo,hi),.15*f.z);}
  out.write(float4(spatial,1),at);
+}
+float3 to_ycocg(float3 c){return float3(.25*c.r+.5*c.g+.25*c.b,.5*c.r-.5*c.b,-.25*c.r+.5*c.g-.25*c.b);}
+float3 from_ycocg(float3 y){float t=y.x-y.z;return float3(t+y.y,y.x+y.z,t-y.y);}
+// Blends the new jittered sample with reprojected history inside the fovea only.
+// Neighbourhood clamping in YCoCg rejects stale history; weight 1 on disocclusion or no history.
+kernel void temporal_resolve(texture2d<float> spatial[[texture(0)]],texture2d<float> history[[texture(1)]],texture2d<float,access::read> historyDepth[[texture(2)]],texture2d<float> depth[[texture(3)]],texture2d<float,access::write> out[[texture(4)]],texture2d<float,access::write> depthOut[[texture(5)]],constant P&p[[buffer(0)]],uint2 at[[thread_position_in_grid]]){
+ if(any(at>=p.size))return;
+ float2 pixel=float2(at)+.5,uv=pixel/float2(p.size),step=1/float2(p.size);
+ float3 c=spatial.sample(linearSample,uv).rgb;float3 cc=to_ycocg(c),lo=cc,hi=cc;
+ for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){if(x||y){float3 s=to_ycocg(spatial.sample(linearSample,uv+float2(x,y)*step).rgb);lo=min(lo,s);hi=max(hi,s);}}
+ float2 src=uv;float3 result=c;float dist=0;
+ bool fovea=length(pixel-float2(p.size)*.5)<=.175*float(p.size.x);
+ if(p.temporal&&fovea&&display_to_source(uv,depth,p,src)){
+  float2 dd=depth.sample(linearSample,src).rg;
+  if(dd.y>.2&&isfinite(dd.x)&&dd.x>0){
+   dist=dd.x;
+   float4 clip=p.historyClipFromSource*float4(ray(src,p)*dd.x,1);
+   if(p.historyValid&&clip.w>0){
+    float2 hu=clip.xy/clip.w*float2(.5,-.5)+.5;
+    if(all(hu>0)&&all(hu<1)){
+     uint2 hp=min(uint2(hu*float2(p.size)),p.size-1);
+     float hd=historyDepth.read(hp).r;
+     if(hd>0&&abs(clip.w-hd)<=.05*clip.w){
+      float3 h=clamp(to_ycocg(history.sample(linearSample,hu).rgb),lo,hi);
+      result=mix(from_ycocg(h),c,.1);
+     }
+    }
+   }
+  }
+ }
+ out.write(float4(result,1),at);
+ depthOut.write(float4(dist,0,0,0),at);
 }
 kernel void coverage_stats(texture2d<float,access::read> depth[[texture(0)]],texture2d<float> motion[[texture(1)]],device float2* result[[buffer(1)]],constant P&p[[buffer(0)]],uint2 at[[thread_position_in_grid]],uint tid[[thread_index_in_threadgroup]],uint2 tile[[threadgroup_position_in_grid]]){
  threadgroup uint depths[64],motions[64];bool inside=all(at<p.size);float2 uv=(float2(at)+.5)/float2(p.size);
@@ -173,8 +235,13 @@ struct P {
   float horizon = 0;
   uint32_t stableCamera = 0, displayWarp = 0;
   float motionRatio = 0;
+  simd_float4x4 historyClipFromSource{};
+  simd_float2 jitterUV{};
+  uint32_t temporal = 0, historyValid = 0;
+  simd_float4x4 displayProjection{}, displayFromSource{}, historyProjection{},
+      currentFromHistory{};
 };
-static_assert(sizeof(P) == 512);
+static_assert(sizeof(P) == 848);
 struct Eye {
   __strong id<MTLTexture> color = nil, pyramid[3]{}, rawDepth = nil,
                           depth = nil, flow[2][3]{}, basis[3]{};
@@ -183,9 +250,12 @@ struct Eye {
 struct Frame {
   Eye eyes[2];
   uint64_t id = 0, time = 0, generation = 0, interval = 0;
+  // Projection jitter (NDC per eye) and whether explicit game depth backs this frame.
+  bool jitterValid = false, depthValid = false;
+  float jitterNdc[2][2]{};
 };
 struct Slot {
-  __strong id<MTLTexture> eyes[2]{}, mapping[2]{};
+  __strong id<MTLTexture> eyes[2]{}, mapping[2]{}, resolved[2]{}, depthScratch[2]{};
   std::shared_ptr<std::atomic<bool>> busy =
       std::make_shared<std::atomic<bool>>(false);
 };
@@ -193,16 +263,26 @@ struct Stats {
   std::atomic<uint64_t> epoch{0}, coverageFrameID{0}, trackedPoseJobs{0};
   std::atomic<double> depthCoverage[2]{}, motionCoverage[2]{};
   std::atomic<uint64_t> frames{0}, gameDepth{0}, estimatedDepth{0},
-      generated{0}, spatial{0}, resets{0}, busy{0}, failed{0};
+      generated{0}, spatial{0}, resets{0}, busy{0}, failed{0}, temporal{0};
   std::atomic<double> gpuMs{0};
+};
+// Owned per-eye history at output size, in display pose. Valid only for the
+// generation and sizes it was written with.
+struct History {
+  __strong id<MTLTexture> color[2]{}, depth[2]{};
+  simd_float4x4 origin[2]{}, projection[2]{};
+  uint64_t generation = 0;
+  unsigned width[2]{}, height[2]{};
+  bool valid = false;
 };
 struct Context {
   __strong id<MTLDevice> device;
   __strong id<MTLCommandQueue> queue = nil;
-  __strong id<MTLComputePipelineState> pipelines[9]{};
+  __strong id<MTLComputePipelineState> pipelines[12]{};
+  History history;
   Frame frames[2];
   Slot slots[3];
-  __strong id<MTLTexture> outputs[2]{}, dummy = nil;
+  __strong id<MTLTexture> outputs[2]{}, displayDepth[2]{}, dummy = nil;
   unsigned latest = 0;
   bool ready = false;
   uint32_t mode;
@@ -285,6 +365,7 @@ void reset(Context &c) {
     c.stats->motionCoverage[i] = 0;
   }
   c.ready = false;
+  c.history.valid = false;
   c.frames[0] = Frame{};
   c.frames[1] = Frame{};
   c.outputs[0] = c.outputs[1] = nil;
@@ -293,7 +374,7 @@ void reset(Context &c) {
 } // namespace
 extern "C" void *wvr_synthesis_create_v1(void *device, uint32_t mode) {
   @autoreleasepool {
-    if (!device || mode < 1 || mode > 2)
+    if (!device || mode < 1 || mode > 3)
       return nullptr;
     auto c = std::make_unique<Context>((__bridge id<MTLDevice>)device, mode);
     NSError *error = nil;
@@ -304,8 +385,9 @@ extern "C" void *wvr_synthesis_create_v1(void *device, uint32_t mode) {
     }
     const char *names[] = {"reduce",         "game_depth",  "stereo_depth",
                            "check_depth",    "flow",        "reconstruct",
-                           "coverage_stats", "display_map", "motion_basis"};
-    for (unsigned i = 0; i < 9; i++) {
+                           "coverage_stats", "display_map", "motion_basis",
+                           "temporal_resolve", "synth_depth", "disocclusion_fill"};
+    for (unsigned i = 0; i < 12; i++) {
       auto f =
           [lib newFunctionWithName:[NSString stringWithUTF8String:names[i]]];
       c->pipelines[i] = [c->device newComputePipelineStateWithFunction:f
@@ -408,6 +490,12 @@ wvr_synthesis_ingest_v1(void *ctx, const WVRAcquiredStereoFrameV2 *input,
         memcpy(e.geometry.originFromEye, &pose, sizeof(pose));
         memcpy(e.geometry.projection, tracking->projection[i], 64);
       }
+      // The game's explicit projection carries the Halton offset: remove it so
+      // reconstruction rays are unjittered. The tracking projection is never jittered.
+      if (explicitDepth && (input->jitterFlags & WVR_SUBMIT_JITTER_VALID)) {
+        e.geometry.projection[8] -= input->jitterNdc[i][0];
+        e.geometry.projection[9] -= input->jitterNdc[i][1];
+      }
       for (unsigned k = 0; k < 16; k++)
         if (!std::isfinite(e.geometry.projection[k]) ||
             !std::isfinite(e.geometry.originFromEye[k])) {
@@ -457,6 +545,13 @@ wvr_synthesis_ingest_v1(void *ctx, const WVRAcquiredStereoFrameV2 *input,
         }
       }
     }
+    if (c.mode == 3)
+      for (unsigned i = 0; i < 2; i++)
+        if (!ensure(c.device, frame.eyes[i].depth, MTLPixelFormatRG32Float,
+                    widths[i], heights[i])) {
+          reset(c);
+          return -1;
+        }
     [commands encodeWaitForEvent:(__bridge id<MTLSharedEvent>)
                                      input->producerReadyEvent
                            value:input->producerReadyValue];
@@ -478,6 +573,31 @@ wvr_synthesis_ingest_v1(void *ctx, const WVRAcquiredStereoFrameV2 *input,
           destinationOrigin:MTLOriginMake(0, 0, 0)];
     }
     [blit endEncoding];
+    if (c.mode == 3 && explicitDepth) {
+      auto enc = [commands computeCommandEncoder];
+      if (!enc) {
+        reset(c);
+        return -1;
+      }
+      for (unsigned i = 0; i < 2; i++) {
+        auto &e = frame.eyes[i];
+        auto &g = e.geometry;
+        auto depth = view((__bridge id<MTLTexture>)(void *)g.depthTexture,
+                          g.depthSlice);
+        if (!depth) {
+          [enc endEncoding];
+          reset(c);
+          return -1;
+        }
+        P p = params(e.geometry, frame.eyes[1 - i].geometry);
+        p.size = {(uint32_t)e.depth.width, (uint32_t)e.depth.height};
+        p.depthOrigin = {g.depthX, g.depthY};
+        p.depthSize = {g.depthWidth, g.depthHeight};
+        p.range = {g.minDepth, g.maxDepth};
+        dispatch(c, enc, 1, p, {depth, e.depth});
+      }
+      [enc endEncoding];
+    }
     if (c.mode == 2) {
       auto enc = [commands computeCommandEncoder];
       if (!enc) {
@@ -607,6 +727,12 @@ wvr_synthesis_ingest_v1(void *ctx, const WVRAcquiredStereoFrameV2 *input,
     frame.id = input->producerFrameID;
     frame.time = input->producerTimestampNanoseconds;
     frame.generation = generation;
+    frame.jitterValid = (input->jitterFlags & WVR_SUBMIT_JITTER_VALID) != 0;
+    frame.depthValid = explicitDepth && c.mode == 3;
+    for (unsigned eye = 0; eye < 2; eye++) {
+      frame.jitterNdc[eye][0] = input->jitterNdc[eye][0];
+      frame.jitterNdc[eye][1] = input->jitterNdc[eye][1];
+    }
     c.latest = next;
     c.ready = true;
     c.stats->frames++;
@@ -667,6 +793,36 @@ static int32_t encode(void *ctx, uint64_t timestamp, uint32_t lw, uint32_t lh,
         return -1;
       }
     bool history = c.mode == 2 && previous.id && previous.time < now.time;
+    // Temporal resolve needs display-pose output, explicit depth, valid jitter, and
+    // source eyes smaller than the output. History is per eye at output size.
+    bool temporal = c.mode == 3 && views && now.depthValid && now.jitterValid;
+    for (unsigned i = 0; temporal && i < 2; i++)
+      temporal = now.eyes[i].color.width < widths[i] ||
+                 now.eyes[i].color.height < heights[i];
+    const bool temporalHistory =
+        temporal && c.history.valid && c.history.generation == now.generation &&
+        c.history.width[0] == widths[0] && c.history.height[0] == heights[0] &&
+        c.history.width[1] == widths[1] && c.history.height[1] == heights[1];
+    const bool displayHistory = views && c.mode == 2;
+    const bool displayHistoryValid =
+        displayHistory && c.history.valid && c.history.generation == now.generation &&
+        c.history.width[0] == widths[0] && c.history.height[0] == heights[0] &&
+        c.history.width[1] == widths[1] && c.history.height[1] == heights[1];
+    if (!displayHistory)
+      c.history.valid = false;
+    if (temporal || displayHistory)
+      for (unsigned i = 0; i < 2; i++)
+        if (!ensure(c.device, c.history.color[i], MTLPixelFormatRGBA16Float,
+                    widths[i], heights[i]) ||
+            !ensure(c.device, c.history.depth[i], MTLPixelFormatR32Float,
+                    widths[i], heights[i]) ||
+            !ensure(c.device, slot->resolved[i], MTLPixelFormatRGBA16Float,
+                    widths[i], heights[i]) ||
+            !ensure(c.device, slot->depthScratch[i], MTLPixelFormatR32Float,
+                    widths[i], heights[i])) {
+          *slot->busy = false;
+          return -1;
+        }
     float horizon = history && extrapolate
                         ? std::min(1.f, float(timestamp - now.time) /
                                             float(now.time - previous.time))
@@ -682,6 +838,9 @@ static int32_t encode(void *ctx, uint64_t timestamp, uint32_t lw, uint32_t lh,
           params(e.geometry, history ? previous.eyes[i].geometry : e.geometry);
       p.size = {widths[i], heights[i]};
       p.horizon = horizon;
+      if (now.jitterValid)
+        p.jitterUV = simd_float2{-now.jitterNdc[i][0] * .5f,
+                                 now.jitterNdc[i][1] * .5f};
       p.motionRatio = history && previous.interval
                           ? float(now.interval) / float(previous.interval)
                           : 0;
@@ -721,14 +880,79 @@ static int32_t encode(void *ctx, uint64_t timestamp, uint32_t lw, uint32_t lh,
           c, enc, 5, p,
           {e.color, history ? previous.eyes[i].color : e.color,
            history ? e.flow[0][0] : c.dummy, history ? e.flow[1][0] : c.dummy,
-           c.mode == 2 ? e.depth : c.dummy, slot->eyes[i],
+           (c.mode == 2 || (c.mode == 3 && now.depthValid)) && e.depth ? e.depth : c.dummy, slot->eyes[i],
            history ? now.eyes[1 - i].flow[0][0] : c.dummy,
            history && previous.interval ? previous.eyes[i].flow[0][0] : c.dummy,
            views && c.mode == 2 ? slot->mapping[i] : c.dummy,
            history ? e.basis[0] : c.dummy, history ? e.basis[2] : c.dummy});
       c.outputs[i] = slot->eyes[i];
+      if (displayHistory) {
+        // Display-pose depth for generated frames, then disocclusion fill from the previous synthesized output.
+        P d = p;
+        d.displayWarp = 1;
+        d.displayProjection = matrix(views[i].projection);
+        d.displayFromSource = simd_inverse(p.sourceViewFromDisplayView);
+        dispatch(c, enc, 10, d,
+                 {e.depth ? e.depth : c.dummy, history ? e.flow[0][0] : c.dummy,
+                  slot->depthScratch[i]});
+        if (displayHistoryValid) {
+          d.historyProjection = c.history.projection[i];
+          d.currentFromHistory =
+              simd_mul(simd_inverse(matrix(views[i].originFromEye)), c.history.origin[i]);
+          dispatch(c, enc, 11, d,
+                   {slot->eyes[i], slot->depthScratch[i], c.history.color[i],
+                    c.history.depth[i], slot->resolved[i]});
+          c.outputs[i] = slot->resolved[i];
+        }
+        c.displayDepth[i] = slot->depthScratch[i];
+      }
+      if (temporal) {
+        P t = p;
+        t.size = {widths[i], heights[i]};
+        t.temporal = 1;
+        t.historyValid = temporalHistory;
+        if (temporalHistory)
+          t.historyClipFromSource = simd_mul(
+              c.history.projection[i],
+              simd_mul(simd_inverse(c.history.origin[i]),
+                       matrix(e.geometry.originFromEye)));
+        dispatch(c, enc, 9, t,
+                 {slot->eyes[i], c.history.color[i], c.history.depth[i], e.depth,
+                  slot->resolved[i], slot->depthScratch[i]});
+        c.outputs[i] = slot->resolved[i];
+      }
     }
     [enc endEncoding];
+    if (displayHistory) {
+      auto blit = [commands blitCommandEncoder];
+      for (unsigned i = 0; i < 2; i++) {
+        [blit copyFromTexture:c.outputs[i] toTexture:c.history.color[i]];
+        [blit copyFromTexture:slot->depthScratch[i] toTexture:c.history.depth[i]];
+        c.history.origin[i] = matrix(views[i].originFromEye);
+        c.history.projection[i] = matrix(views[i].projection);
+        c.history.width[i] = widths[i];
+        c.history.height[i] = heights[i];
+      }
+      [blit endEncoding];
+      c.history.generation = now.generation;
+      c.history.valid = true;
+    }
+    if (temporal) {
+      // Snapshot this output as the next frame's history, in the same command
+      // buffer so the next frame's reads are ordered after it.
+      auto blit = [commands blitCommandEncoder];
+      for (unsigned i = 0; i < 2; i++) {
+        [blit copyFromTexture:slot->resolved[i] toTexture:c.history.color[i]];
+        [blit copyFromTexture:slot->depthScratch[i] toTexture:c.history.depth[i]];
+        c.history.origin[i] = matrix(views[i].originFromEye);
+        c.history.projection[i] = matrix(views[i].projection);
+        c.history.width[i] = widths[i];
+        c.history.height[i] = heights[i];
+      }
+      [blit endEncoding];
+      c.history.generation = now.generation;
+      c.history.valid = true;
+    }
     auto busy = slot->busy;
     auto stats = c.stats;
     [commands addCompletedHandler:^(id<MTLCommandBuffer> b) {
@@ -740,6 +964,8 @@ static int32_t encode(void *ctx, uint64_t timestamp, uint32_t lw, uint32_t lh,
     }];
     if (views)
       c.stats->trackedPoseJobs++;
+    if (temporal)
+      c.stats->temporal++;
     if (horizon > 0)
       c.stats->generated++;
     else
@@ -794,6 +1020,32 @@ extern "C" void *wvr_synthesis_copy_depth_v1(void *ctx, uint32_t eye) {
   auto t = c.frames[c.latest].eyes[eye].depth;
   return c.ready && t ? (__bridge_retained void *)t : nullptr;
 }
+extern "C" void *wvr_synthesis_copy_display_depth_v1(void *ctx, uint32_t eye) {
+  if (!ctx || eye > 1)
+    return nullptr;
+  auto &c = *static_cast<Context *>(ctx);
+  std::lock_guard lock(c.mutex);
+  auto t = c.displayDepth[eye];
+  return c.ready && t ? (__bridge_retained void *)t : nullptr;
+}
+extern "C" void wvr_synthesis_reset_history_v1(void *ctx) {
+  if (!ctx)
+    return;
+  auto &c = *static_cast<Context *>(ctx);
+  std::lock_guard lock(c.mutex);
+  c.history.valid = false;
+}
+extern "C" int32_t wvr_synthesis_forecast_reliable_v1(void *ctx) {
+  if (!ctx)
+    return 0;
+  auto &c = *static_cast<Context *>(ctx);
+  std::lock_guard lock(c.mutex);
+  // Coverage is sampled asynchronously every 60 frames, so this reads the last
+  // completed sample. Until the first sample lands both values are zero.
+  const double left = c.stats->motionCoverage[0].load(),
+               right = c.stats->motionCoverage[1].load();
+  return c.ready && c.mode >= 2 && left >= 0.25 && right >= 0.25 ? 1 : 0;
+}
 extern "C" int32_t wvr_synthesis_copy_stats_v1(void *ctx, char *buffer,
                                                uint32_t size) {
   if (!ctx || !buffer || !size)
@@ -807,7 +1059,8 @@ extern "C" int32_t wvr_synthesis_copy_stats_v1(void *ctx, char *buffer,
       "spatialJobs=%llu resets=%llu busyFallbacks=%llu gpuFailed=%llu "
       "commandBufferGPUms=%.3f motion=estimated-optical-flow "
       "coverageFrameID=%llu depthCoverageL=%.4f depthCoverageR=%.4f "
-      "motionCoverageL=%.4f motionCoverageR=%.4f trackedPoseDisplayJobs=%llu",
+      "motionCoverageL=%.4f motionCoverageR=%.4f trackedPoseDisplayJobs=%llu "
+      "temporalJobs=%llu",
       c.mode, (unsigned long long)s.frames.load(),
       (unsigned long long)s.gameDepth.load(),
       (unsigned long long)s.estimatedDepth.load(),
@@ -817,6 +1070,7 @@ extern "C" int32_t wvr_synthesis_copy_stats_v1(void *ctx, char *buffer,
       s.gpuMs.load(), (unsigned long long)s.coverageFrameID.load(),
       s.depthCoverage[0].load(), s.depthCoverage[1].load(),
       s.motionCoverage[0].load(), s.motionCoverage[1].load(),
-      (unsigned long long)s.trackedPoseJobs.load());
+      (unsigned long long)s.trackedPoseJobs.load(),
+      (unsigned long long)s.temporal.load());
   return 1;
 }

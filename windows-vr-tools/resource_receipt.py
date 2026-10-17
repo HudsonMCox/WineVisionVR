@@ -64,7 +64,7 @@ def pe_machine(path):
     try:
         size = path.stat().st_size
         with path.open("rb") as stream:
-            if size < 0x40:
+            if size < 0x40 or stream.read(2) != b"MZ":
                 return None
             stream.seek(0x3C)
             raw_offset = stream.read(4)
@@ -102,6 +102,26 @@ def fex_translator_build(runtime_root, resource_source):
         "guestResource": guest_relative,
         "sha256": build_hash,
     }
+
+
+def fex_wow64_build(runtime_root, resource_source):
+    if (runtime_root / "AVPPLAY_D3D12_SOURCE_PROVENANCE.json").exists():
+        fail("WOW64 requires a matching legacy Madeira native runtime; modern DXMT does not support its pointer transport.")
+    native_source = runtime_root / "build/ntdll-unix/virtual_ios.c"
+    if native_source.is_file() and "#define WVR_DXMT_D3D12_PROFILE 1" in native_source.read_text():
+        fail("WOW64 requires a matching legacy Madeira native runtime; modern DXMT does not support its pointer transport.")
+    build_relative = "FEX/build-wow64/Bin/libwow64fex.dll"
+    guest_relative = "aarch64-windows/xtajit.dll"
+    build_artifact = runtime_root / build_relative
+    guest_artifact = resource_source / guest_relative
+    ensure_regular_nonempty(build_artifact, "Fresh WOW64 FEX translator build output")
+    ensure_regular_nonempty(guest_artifact, "WOW64 FEX translator guest resource")
+    if pe_machine(build_artifact) != 0xAA64 or pe_machine(guest_artifact) != 0xAA64:
+        fail("WOW64 FEX build and xtajit.dll must both be ARM64 PE files.")
+    build_hash = sha256_file(build_artifact)
+    if sha256_file(guest_artifact) != build_hash:
+        fail("Packaged xtajit.dll differs from this overlay's fresh WOW64 FEX build output.")
+    return {"buildArtifact": build_relative, "guestResource": guest_relative, "sha256": build_hash}
 
 
 def aarch64_winedevice_build(runtime_root, resource_source):
@@ -198,16 +218,19 @@ def write_native(args):
     print(f"Recorded native Madeira build provenance at {output}")
 
 
-def guest_resource_files(source):
+def guest_resource_files(source, enable_x86=False):
+    from stage_resources import packaged_builtin
     files = {}
-    for farm in ("arm64ec-windows", "aarch64-windows"):
+    for farm in ("arm64ec-windows", "aarch64-windows") + (("i386-windows",) if enable_x86 else ()):
         farm_root = source / farm
         if farm_root.is_symlink() or not farm_root.is_dir():
             fail(f"Required Wine builtin farm is missing: {farm_root}")
         for path in farm_root.iterdir():
-            if path.is_file() and (path.suffix.casefold() == ".dll" or path.name.casefold() in WINE_TOOLS):
+            if path.is_file() and packaged_builtin(path, farm):
                 if path.is_symlink():
                     fail(f"Guest resource must not be a symlink: {path}")
+                if farm == "i386-windows" and path.suffix.casefold() != ".tlb" and pe_machine(path) != 0x14C:
+                    fail(f"i386 guest resource must be an i386 PE file: {path}")
                 files[path.relative_to(source).as_posix()] = sha256_file(path)
     for relative in ("nls", "legal"):
         directory = source / relative
@@ -229,6 +252,7 @@ def write_guest(args):
     from stage_resources import is_arm64ec_pe
     runtime_root = args.runtime_source.resolve()
     source = args.resource_source.resolve()
+    enable_x86 = getattr(args, "enable_x86", False)
     pinned, provenance, provenance_hash = overlay_provenance(runtime_root)
     native_receipt_path = args.native_receipt.resolve() if args.native_receipt else runtime_root / NATIVE_RECEIPT_NAME
     native_receipt = read_json(native_receipt_path, "Native Madeira build receipt")
@@ -256,7 +280,7 @@ def write_guest(args):
             "overlayProvenanceSha256": provenance_hash,
         },
         "nativeReceiptSha256": sha256_file(native_receipt_path),
-        "resourcesSha256": guest_resource_files(source),
+        "resourcesSha256": guest_resource_files(source, enable_x86),
     }
     receipt = {"schemaVersion": 1, "source": guest["source"],
                "nativeReceiptSha256": guest["nativeReceiptSha256"],
@@ -266,12 +290,16 @@ def write_guest(args):
                    "wineAarch64Device": aarch64_device,
                    "llvmMingw": LLVM_MINGW_PIN,
                }}
+    if enable_x86:
+        from stage_resources import validate_wine_resources
+        validate_wine_resources(source, True)
+        receipt["guest"]["x86"] = {"enabled": True, "fexWow64Translator": fex_wow64_build(runtime_root, source)}
     output = args.output.absolute() if args.output else source / GUEST_RECEIPT_NAME
     write_json_atomic(output, receipt)
     print(f"Recorded Windows guest resource provenance at {output}")
 
 
-def validate_receipts(source, runtime_root, native_receipt_path):
+def validate_receipts(source, runtime_root, native_receipt_path, enable_x86=False):
     pinned, _, provenance_hash = overlay_provenance(runtime_root)
     native_receipt_path = native_receipt_path.resolve()
     native = read_json(native_receipt_path, "Native Madeira build receipt")
@@ -300,9 +328,15 @@ def validate_receipts(source, runtime_root, native_receipt_path):
             or guest.get("nativeReceiptSha256") != sha256_file(native_receipt_path)):
         fail("Windows guest receipt is stale or does not match the current native build receipt.")
     expected_files = guest.get("guest", {}).get("resourcesSha256")
-    actual_files = guest_resource_files(source)
+    actual_files = guest_resource_files(source, enable_x86)
     if not isinstance(expected_files, dict) or expected_files != actual_files:
         fail("Windows guest resource files do not match their recorded build receipt.")
+    if enable_x86:
+        expected_x86 = {"enabled": True, "fexWow64Translator": fex_wow64_build(runtime_root, source)}
+        if guest.get("guest", {}).get("x86") != expected_x86:
+            fail("Windows guest receipt does not bind the enabled WOW64 FEX translator to its fresh build output.")
+    elif "x86" in guest.get("guest", {}):
+        fail("An x86 guest build receipt requires --enable-x86 or AVPPLAY_ENABLE_X86=1.")
     expected_translator = fex_translator_build(runtime_root, source)
     if guest.get("guest", {}).get("fexTranslator") != expected_translator:
         fail("Windows guest receipt does not bind xtajit64.dll to the fresh FEX build output.")
@@ -347,6 +381,7 @@ def main():
     guest.add_argument("--resource-source", type=Path, required=True)
     guest.add_argument("--native-receipt", type=Path)
     guest.add_argument("--output", type=Path)
+    guest.add_argument("--enable-x86", action="store_true", default=os.environ.get("AVPPLAY_ENABLE_X86") == "1")
     guest.set_defaults(function=write_guest)
     args = parser.parse_args()
     args.function(args)

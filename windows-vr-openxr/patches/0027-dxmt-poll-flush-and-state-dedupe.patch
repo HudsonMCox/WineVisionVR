@@ -1,0 +1,121 @@
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 1fcb486..749969e 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -508,8 +508,17 @@ public:
+     }
+     if (hr == S_FALSE && (GetDataFlags & D3D11_ASYNC_GETDATA_DONOTFLUSH) == 0) {
+       cmd_queue.CurrentFrameStatistics().event_stall++;
+-      if (!eventQuery || eventQuery->RequestFlush())
+-        Flush();
++      if (!eventQuery || eventQuery->RequestFlush()) {
++        // Flush1 only submits work recorded since the last commit or a pending
++        // query end (both tracked by these flags). Checking them here avoids
++        // re-entering the flush path on every poll of an idle context. Chunk
++        // ids alone are not used: End() on an occlusion or timestamp query
++        // records without advancing the chunk, so a chunk-id check could skip
++        // the flush that submits that query's end and spin forever.
++        std::lock_guard<d3d11_device_mutex> lock(mutex);
++        if (ctx_state.has_dirty_op_since_last_event || promote_flush)
++          Flush();
++      }
+     }
+     return hr;
+   }
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index 017d79e..d6dac93 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -4923,14 +4923,24 @@ public:
+     }
+     UpdateVertexBuffer();
+     UpdateSOTargets();
+-    if (dirty_state.any(DirtyState::DepthStencilState)) {
++    // The DSSO command below already carries the stencil reference, so the
++    // blend command only needs to carry the blend factor in that case.
++    const bool depth_stencil_state_emitted = dirty_state.any(DirtyState::DepthStencilState);
++    if (depth_stencil_state_emitted) {
+       IMTLD3D11DepthStencilState *state =
+           state_.OutputMerger.DepthStencilState ? state_.OutputMerger.DepthStencilState : default_depth_stencil_state;
+       EmitST([state, stencil_ref = state_.OutputMerger.StencilRef](ArgumentEncodingContext& enc) {
+         auto encoder = enc.currentRenderEncoder();
++        auto dsso = state->GetDepthStencilState(encoder->dsv_planar_flags);
++        // Encoder state is per render encoder, so the comparison is only
++        // against commands already encoded into this pass.
++        if (encoder->last_depth_stencil_state == dsso && encoder->last_stencil_ref == stencil_ref)
++          return;
++        encoder->last_depth_stencil_state = dsso;
++        encoder->last_stencil_ref = stencil_ref;
+         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
+         cmd.type = WMTRenderCommandSetDSSO;
+-        cmd.dsso = state->GetDepthStencilState(encoder->dsv_planar_flags);
++        cmd.dsso = dsso;
+         cmd.stencil_ref = stencil_ref;
+       });
+     }
+@@ -4938,23 +4948,40 @@ public:
+       IMTLD3D11RasterizerState *state =
+           state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState : default_rasterizer_state;
+       EmitST([state](ArgumentEncodingContext& enc) {
++        auto encoder = enc.currentRenderEncoder();
++        if (encoder->last_rasterizer_state == state)
++          return;
++        encoder->last_rasterizer_state = state;
+         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
+         cmd.type = WMTRenderCommandSetRasterizerState;
+         state->SetupRasterizerState(cmd);
+       });
+     }
+     if (dirty_state.any(DirtyState::BlendFactorAndStencilRef)) {
+-      EmitST([r = state_.OutputMerger.BlendFactor[0], g = state_.OutputMerger.BlendFactor[1],
+-            b = state_.OutputMerger.BlendFactor[2], a = state_.OutputMerger.BlendFactor[3],
+-            stencil_ref = state_.OutputMerger.StencilRef](ArgumentEncodingContext &enc) {
+-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setblendcolor>();
+-        cmd.type = WMTRenderCommandSetBlendFactorAndStencilRef;
+-        cmd.red = r;
+-        cmd.green = g;
+-        cmd.blue = b;
+-        cmd.alpha = a;
+-        cmd.stencil_ref = stencil_ref;
+-      });
++      if (depth_stencil_state_emitted) {
++        EmitST([r = state_.OutputMerger.BlendFactor[0], g = state_.OutputMerger.BlendFactor[1],
++              b = state_.OutputMerger.BlendFactor[2], a = state_.OutputMerger.BlendFactor[3]](ArgumentEncodingContext &enc) {
++          auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setblendcolor>();
++          cmd.type = WMTRenderCommandSetBlendFactor;
++          cmd.red = r;
++          cmd.green = g;
++          cmd.blue = b;
++          cmd.alpha = a;
++        });
++      } else {
++        EmitST([r = state_.OutputMerger.BlendFactor[0], g = state_.OutputMerger.BlendFactor[1],
++              b = state_.OutputMerger.BlendFactor[2], a = state_.OutputMerger.BlendFactor[3],
++              stencil_ref = state_.OutputMerger.StencilRef](ArgumentEncodingContext &enc) {
++          enc.currentRenderEncoder()->last_stencil_ref = stencil_ref;
++          auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setblendcolor>();
++          cmd.type = WMTRenderCommandSetBlendFactorAndStencilRef;
++          cmd.red = r;
++          cmd.green = g;
++          cmd.blue = b;
++          cmd.alpha = a;
++          cmd.stencil_ref = stencil_ref;
++        });
++      }
+     }
+     IMTLD3D11RasterizerState *current_rs =
+         state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState : default_rasterizer_state;
+diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
+index a306032..ea8dd68 100644
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -231,6 +231,9 @@ struct RenderEncoderData : EncoderData {
+   bool use_emulated_so = 0;
+   TileBarrierPSOKey tile_barrier_pso_key = {};
+   WMT::RenderPipelineState last_pso = {};
++  WMT::DepthStencilState last_depth_stencil_state = {};
++  const void *last_rasterizer_state = nullptr;
++  uint32_t last_stencil_ref = 0;
+ };
+ 
+ struct ComputeEncoderData : EncoderData {

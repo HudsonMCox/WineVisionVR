@@ -1,0 +1,44 @@
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -4423,6 +4423,31 @@
+ }
+ 
+ #ifndef DXMT_NATIVE
++
++/* The outer args block has already been translated by Wine. Its embedded
++ * request pointer still names the 32-bit guest window. Payload texture/event
++ * IDs are native 64-bit objects and must never be relocated or narrowed. */
++static NTSTATUS
++_WMTWindowsVRBridgeCallV1_wow64(void *obj) {
++  if (!obj) return STATUS_INVALID_ADDRESS;
++  const struct unixcall_windows_vr_bridge_v1 *params = obj;
++  const uintptr_t guest = (uintptr_t)params->request.ptr;
++  if (guest > UINT32_MAX) return STATUS_INVALID_ADDRESS;
++  struct unixcall_windows_vr_bridge_v1 translated = *params;
++  translated.request.ptr = UInt32ToPtr((uint32_t)guest);
++  return _WMTWindowsVRBridgeCallV1(&translated);
++}
++
++static NTSTATUS
++_WMTWindowsVRBridgeCallV2_wow64(void *obj) {
++  if (!obj) return STATUS_INVALID_ADDRESS;
++  const struct unixcall_windows_vr_bridge_v1 *params = obj;
++  const uintptr_t guest = (uintptr_t)params->request.ptr;
++  if (guest > UINT32_MAX) return STATUS_INVALID_ADDRESS;
++  struct unixcall_windows_vr_bridge_v1 translated = *params;
++  translated.request.ptr = UInt32ToPtr((uint32_t)guest);
++  return _WMTWindowsVRBridgeCallV2(&translated);
++}
+ 
+ static NTSTATUS
+ thunk32_SM50Initialize(void *args) {
+@@ -7355,7 +7380,7 @@
+      * sharing the 64-bit handler is correct, not a gap (section 7.11 says the
+      * same about slots 47, 66, 67 and 72). */
+     &_d3d9_nop,                         /* 150 */
+-    &_WMTWindowsVRBridgeCallV1,         /* 151: fixed-width request, identical for WOW64 */
+-    &_WMTWindowsVRBridgeCallV2,         /* 152: fixed-width V2 submission for WOW64 */
++    &_WMTWindowsVRBridgeCallV1_wow64,   /* 151: relocate the embedded guest request pointer */
++    &_WMTWindowsVRBridgeCallV2_wow64,   /* 152: relocate the embedded guest request pointer */
+ };
+ #endif

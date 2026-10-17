@@ -9,6 +9,7 @@ public enum WindowsRuntimeError: Error, LocalizedError, Sendable, Equatable {
     case pluginRejectedRequest(Int32)
     case stopPending
     case graphicsPackageMissing(WindowsGraphicsAPI)
+    case presentationUnavailable(WindowsPresentationMode)
 
     public var errorDescription: String? {
         switch self {
@@ -25,6 +26,8 @@ public enum WindowsRuntimeError: Error, LocalizedError, Sendable, Equatable {
                 "The signed runtime does not contain the required \(graphics.rawValue) graphics package. No fallback was selected.",
                 "Die signierte Laufzeit enthält nicht das erforderliche Grafikpaket \(graphics.rawValue). Es wurde kein Ersatz ausgewählt."
             )
+        case .presentationUnavailable(let presentation):
+            return L("The signed runtime does not support \(presentation.rawValue) presentation.", "Die signierte Laufzeit unterstützt die Darstellung \(presentation.rawValue) nicht.")
         case .stopPending:
             return L("Cooperative exit has been requested; the Wine process has not yet confirmed a stop.", "Das geordnete Beenden wurde angefordert; der Wine-Prozess hat das Ende noch nicht bestätigt.")
         case .pluginRejectedRequest(let status):

@@ -11,7 +11,14 @@ BUILD="$BUILD_ROOT/build"
 LLVM_ROOT="${AVPPLAY_LLVM_MINGW_ROOT:-/private/tmp/avp-play-build-sources/llvm-mingw-20260421-ucrt-macos-universal}"
 JOBS="${AVPPLAY_BUILD_JOBS:-4}"
 HOST_ARCH="${AVPPLAY_PREFIX_HOST_ARCH:-arm64}"
+TOOLS_ONLY="${AVPPLAY_PREFIX_TOOLS_ONLY:-0}"
 PATCH_FILE="$ROOT/windows-vr-tools/patches/0001-prefix-host-optional-ios-hooks.patch"
+
+case "$TOOLS_ONLY:$HOST_ARCH" in
+    0:*) ;;
+    1:arm64) ;;
+    *) echo "AVPPLAY_PREFIX_TOOLS_ONLY must be 0, or 1 with the arm64 host." >&2; exit 2 ;;
+esac
 
 case "$HOST_ARCH" in
     arm64)
@@ -19,6 +26,11 @@ case "$HOST_ARCH" in
         PE_TRIPLE="aarch64-windows"
         PE_COMPILER="aarch64-w64-mingw32-clang"
         CONFIGURE_ARGS=(--without-x --disable-tests)
+        if [[ "$TOOLS_ONLY" == 1 ]]; then
+            # sfnt2fon is unnecessary because the x86_64 prefix host also
+            # disables FreeType; do not require font libraries for generators.
+            CONFIGURE_ARGS+=(--without-freetype)
+        fi
         ;;
     x86_64)
         # Configure this as a cross build from the Apple Silicon build tools.
@@ -112,6 +124,21 @@ if [[ ! -f "$BUILD/config.status" || ! -f "$BUILD/Makefile" ]]; then
             "$SOURCE_ROOT/configure" "${CONFIGURE_ARGS[@]}"
         fi
     ) 2>&1 | tee "$BUILD_ROOT/configure.log"
+fi
+
+if [[ "$TOOLS_ONLY" == 1 ]]; then
+    # The x86_64 cross build needs executable native code generators, not a
+    # complete second Wine installation. makedep was built by configure.
+    make -C "$BUILD" -j"$JOBS" __tooldeps__ \
+        2>&1 | tee "$BUILD_ROOT/build-tools.log"
+    for tool in install makedep make_xftmpl sfnt2fon/sfnt2fon wine/wine \
+                winebuild/winebuild winegcc/winegcc widl/widl wrc/wrc wmc/wmc; do
+        [[ -x "$BUILD/tools/$tool" ]] || {
+            echo "Native Wine code generator was not produced: $tool" >&2; exit 1;
+        }
+    done
+    echo "Pinned arm64 Wine code generators are ready at $BUILD; no host loader or prefix was built."
+    exit 0
 fi
 
 make -C "$BUILD" -j"$JOBS" 2>&1 | tee "$BUILD_ROOT/build.log"

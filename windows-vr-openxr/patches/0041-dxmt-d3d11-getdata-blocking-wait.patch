@@ -1,0 +1,126 @@
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 749969e..b8dd85e 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -1,4 +1,6 @@
++#include <chrono>
+ #include <thread>
++#include "util_env.hpp"
+ #include "config/config.hpp"
+ #include "d3d11_fence.hpp"
+ #include "d3d11_private.h"
+@@ -489,12 +491,6 @@ public:
+     }
+     if (hr == S_FALSE) {
+       ++diagnostic_polls;
+-      // A game may spin on GetData for an entire GPU frame. Cooperatively
+-      // give the encoder, finisher and compositor a chance to run. Yield does
+-      // not wait for completion or fabricate a ready result; the exact event
+-      // is re-read on the next call, including DONOTFLUSH probes.
+-      if (diagnostic_polls >= 64 && (diagnostic_polls & 31u) == 0)
+-        std::this_thread::yield();
+       if (diagnostic_polls == 1024 ||
+           (diagnostic_polls >= 1048576 && (diagnostic_polls & (diagnostic_polls - 1)) == 0))
+         WARN("wvr-query pending type=", desc.Query, " query=", pAsync,
+@@ -520,6 +516,55 @@ public:
+           Flush();
+       }
+     }
++    if (hr == S_FALSE) {
++      // A game may spin on GetData for an entire GPU frame, and every poll
++      // pays a guest-to-host transition, starving the encoder, finisher and
++      // compositor threads. Once a query has been polled repeatedly and its
++      // work is known to be submitted (the flush above ran, or an earlier
++      // poll already requested it), sleep for a short bounded slice instead
++      // of returning immediately. This never fabricates a ready result: the
++      // exact event is re-read afterwards and S_FALSE is still returned when
++      // the GPU has not finished. DONOTFLUSH polls only wait when the flush
++      // was already requested, so nothing can be waiting on unsubmitted work.
++      // The device mutex is not held here. DXMT_GETDATA_BLOCKING_WAIT=0
++      // restores the previous yield-only behavior.
++      static const bool blocking_wait_enabled = env::getEnvVar("DXMT_GETDATA_BLOCKING_WAIT") != "0";
++      constexpr uint64_t kBlockingWaitMinPolls = 16;
++      constexpr auto kBlockingWaitBound = std::chrono::microseconds(250);
++      constexpr auto kBlockingWaitSlice = std::chrono::microseconds(50);
++      const bool flush_allowed = (GetDataFlags & D3D11_ASYNC_GETDATA_DONOTFLUSH) == 0;
++      const bool submitted = eventQuery ? (flush_allowed || eventQuery->FlushRequested()) : flush_allowed;
++      if (blocking_wait_enabled && submitted && diagnostic_polls >= kBlockingWaitMinPolls) {
++        thread_local uint64_t wait_count = 0;
++        thread_local uint64_t wait_total_us = 0;
++        const auto t0 = clock::now();
++        if (eventQuery) {
++          const uint64_t target = eventQuery->SignalSeqId();
++          const auto deadline = t0 + kBlockingWaitBound;
++          while (cmd_queue.SignaledEventSeqId() < target && clock::now() < deadline)
++            std::this_thread::sleep_for(kBlockingWaitSlice);
++          if (eventQuery->CheckEventState(cmd_queue.SignaledEventSeqId()) == EventState::Signaled) {
++            hr = S_OK;
++            diagnostic_polls = 0;
++            if (desc.Query == D3D11_QUERY_EVENT && pData)
++              *static_cast<BOOL *>(pData) = TRUE;
++          }
++        } else {
++          std::this_thread::sleep_for(kBlockingWaitSlice * 2);
++        }
++        const auto waited = clock::now() - t0;
++        auto &stats = cmd_queue.CurrentFrameStatistics();
++        stats.getdata_wait_count++;
++        stats.getdata_wait_interval += waited;
++        ++wait_count;
++        wait_total_us += std::chrono::duration_cast<std::chrono::microseconds>(waited).count();
++        if (wait_count >= 1024 && (wait_count & (wait_count - 1)) == 0)
++          WARN("wvr-query blocking-wait type=", desc.Query, " waits=", wait_count,
++               " total_us=", wait_total_us, " result=", hr);
++      } else if (diagnostic_polls >= 64 && (diagnostic_polls & 31u) == 0) {
++        std::this_thread::yield();
++      }
++    }
+     return hr;
+   }
+ 
+diff --git a/src/d3d11/d3d11_query.hpp b/src/d3d11/d3d11_query.hpp
+index 758f19a..cc3f3b7 100644
+--- a/src/d3d11/d3d11_query.hpp
++++ b/src/d3d11/d3d11_query.hpp
+@@ -122,6 +122,8 @@ struct MTLD3D11EventQuery : public ID3D11Query1 {
+   virtual EventState CheckEventState(uint64_t coherent_seq_id) = 0;
+   virtual bool RequestFlush() = 0;
+   virtual bool IsSignaled() const = 0;
++  virtual bool FlushRequested() const = 0;
++  virtual uint64_t SignalSeqId() const = 0;
+ };
+ 
+ template <typename DataType>
+@@ -159,6 +161,10 @@ public:
+ 
+   bool IsSignaled() const override { return state == QueryState::Signaled; }
+ 
++  bool FlushRequested() const override { return flush_requested; }
++
++  uint64_t SignalSeqId() const override { return should_be_signaled_at; }
++
+   bool RequestFlush() override {
+     // Once Flush submits this query's preceding commands and event, later
+     // context work cannot make that same event complete sooner. Reissue
+diff --git a/src/dxmt/dxmt_statistics.hpp b/src/dxmt/dxmt_statistics.hpp
+index 94c98de..71be088 100644
+--- a/src/dxmt/dxmt_statistics.hpp
++++ b/src/dxmt/dxmt_statistics.hpp
+@@ -50,6 +50,8 @@ struct FrameStatistics {
+   uint32_t compute_pass_count = 0;
+   uint32_t blit_pass_count = 0;
+   uint32_t event_stall = 0;
++  uint32_t getdata_wait_count = 0;
++  clock::duration getdata_wait_interval{};
+   uint32_t latency = 0;
+   clock::duration encode_prepare_interval{};
+   clock::duration encode_flush_interval{};
+@@ -73,6 +75,8 @@ struct FrameStatistics {
+     compute_pass_count = 0;
+     blit_pass_count = 0;
+     event_stall = 0;
++    getdata_wait_count = 0;
++    getdata_wait_interval = {};
+     latency = 0;
+     encode_prepare_interval = {};
+     encode_flush_interval = {};

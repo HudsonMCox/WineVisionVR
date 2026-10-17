@@ -1,0 +1,277 @@
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index f66376a..9f939e6 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -5689,8 +5689,7 @@ public:
+         reconstruction.eyes[0].depthTexture=nativeDepthLeft.handle;
+         reconstruction.eyes[1].depthTexture=nativeDepthRight.handle;
+       }
+-      enc.recordStereoEyeTargets(leftTexture->current()->texture(), rightTexture->current()->texture(),
+-                                 frameCopy.leftSlice, frameCopy.rightSlice);
++      enc.recordStereoEyeTargets(leftTexture->current()->texture(), rightTexture->current()->texture(), frameCopy);
+       enc.queueWindowsVRSubmission(leftTexture->current()->texture(), rightTexture->current()->texture(),
+                                      frameCopy, result, reconstruction, nativeDepthLeft, nativeDepthRight);
+     }, true);
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 9c04e95..84b5313 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -1723,6 +1723,10 @@ stereoPairCommandSize(uint16_t type) {
+     return sizeof(wmtcmd_render_setviewport);
+   case WMTRenderCommandSetScissorRect:
+     return sizeof(wmtcmd_render_setscissorrect);
++  case WMTRenderCommandSetViewports:
++    return sizeof(wmtcmd_render_setviewports);
++  case WMTRenderCommandSetScissorRects:
++    return sizeof(wmtcmd_render_setscissorrects);
+   case WMTRenderCommandSetRasterizerState:
+     return sizeof(wmtcmd_render_setrasterizerstate);
+   case WMTRenderCommandSetDepthStencilState:
+@@ -1752,11 +1756,26 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+   if (next != r1)
+     return false;
+ 
+-  // the two eyes must be consecutive layers of the same eye target texture
++  // the two eyes are either consecutive layers of the same eye target texture (layered), or the two
++  // disjoint halves of one slice of it (atlas); both cases need one eye target texture
+   const StereoEyeTargets &eye = r0->eye_targets;
+-  if (!eye.valid || eye.left == nullptr || eye.right == nullptr || !(eye.left == eye.right) ||
+-      eye.rightSlice != eye.leftSlice + 1)
++  if (!eye.valid || eye.left == nullptr || eye.right == nullptr || !(eye.left == eye.right))
+     return false;
++  const bool atlas = eye.rightSlice == eye.leftSlice;
++  if (!atlas && eye.rightSlice != eye.leftSlice + 1)
++    return false;
++  // atlas: eye1 is eye0 moved by a constant offset, the rects have equal size and do not overlap
++  int64_t dx = 0, dy = 0;
++  if (atlas) {
++    const int64_t x0 = eye.leftX, y0 = eye.leftY, x1 = eye.rightX, y1 = eye.rightY;
++    const int64_t w = eye.leftWidth, h = eye.leftHeight;
++    if (!w || !h || eye.rightWidth != eye.leftWidth || eye.rightHeight != eye.leftHeight)
++      return false;
++    if (x0 < x1 + w && x1 < x0 + w && y0 < y1 + h && y1 < y0 + h)
++      return false;
++    dx = x1 - x0;
++    dy = y1 - y0;
++  }
+ 
+   if (r0->stereo_pass || r1->stereo_pass)
+     return false;
+@@ -1784,7 +1803,7 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+   if (r1->fence_wait_vertex.intersectedWith(r0->fence_update) || hasDataDependency(r1, r0))
+     return false;
+ 
+-  // colour attachments: same eye texture, slices eye0/eye1, identical load/clear, stored, no resolve
++  // colour attachments: same eye texture, slices eye0/eye1 (or one slice in atlas), load/clear rules per mode, stored, no resolve
+   for (unsigned i = 0; i < r0->render_target_count; i++) {
+     auto &a0 = r0->colors[i];
+     auto &a1 = r1->colors[i];
+@@ -1797,16 +1816,24 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+       return false;
+     if (a0.level || a1.level || a0.depth_plane || a1.depth_plane)
+       return false;
+-    if (a0.slice != eye.leftSlice || a1.slice != eye.rightSlice)
++    if (a0.slice != eye.leftSlice || a1.slice != (atlas ? eye.leftSlice : eye.rightSlice))
+       return false;
+     if (a0.resolve_attachment || a1.resolve_attachment)
+       return false;
+     if (a0.store_action != WMTStoreActionStore || a1.store_action != WMTStoreActionStore)
+       return false;
+-    if (a0.load_action != a1.load_action)
+-      return false;
+-    if (a0.load_action == WMTLoadActionClear && std::memcmp(&a0.clear_color, &a1.clear_color, sizeof(a0.clear_color)))
+-      return false;
++    if (atlas) {
++      // eye1 shares the attachment with eye0: r1 must not clear it, r0 may clear the whole attachment
++      if (a1.load_action != WMTLoadActionLoad)
++        return false;
++      if (a0.load_action != WMTLoadActionLoad && a0.load_action != WMTLoadActionClear)
++        return false;
++    } else {
++      if (a0.load_action != a1.load_action)
++        return false;
++      if (a0.load_action == WMTLoadActionClear && std::memcmp(&a0.clear_color, &a1.clear_color, sizeof(a0.clear_color)))
++        return false;
++    }
+   }
+ 
+   // depth: either absent in both, or consecutive slices of one depth texture
+@@ -1817,12 +1844,24 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+       return false;
+     if (r0->depth.level || r1->depth.level || r0->depth.depth_plane || r1->depth.depth_plane)
+       return false;
+-    if (r0->depth.slice + 1 != r1->depth.slice)
+-      return false;
+-    if (r0->depth.load_action != r1->depth.load_action || r0->depth.store_action != r1->depth.store_action)
+-      return false;
+-    if (r0->depth.load_action == WMTLoadActionClear && r0->depth.clear_depth != r1->depth.clear_depth)
+-      return false;
++    if (atlas) {
++      // eye1 shares the depth attachment with eye0: r1 must not clear it, r0 may clear the whole attachment
++      if (r0->depth.slice != r1->depth.slice)
++        return false;
++      if (r1->depth.load_action != WMTLoadActionLoad)
++        return false;
++      if (r0->depth.load_action != WMTLoadActionLoad && r0->depth.load_action != WMTLoadActionClear)
++        return false;
++      if (r0->depth.store_action != r1->depth.store_action)
++        return false;
++    } else {
++      if (r0->depth.slice + 1 != r1->depth.slice)
++        return false;
++      if (r0->depth.load_action != r1->depth.load_action || r0->depth.store_action != r1->depth.store_action)
++        return false;
++      if (r0->depth.load_action == WMTLoadActionClear && r0->depth.clear_depth != r1->depth.clear_depth)
++        return false;
++    }
+     if (!(r0->dsv_readonly_flags & 1) && r0->depth.store_action != WMTStoreActionStore)
+       return false;
+   }
+@@ -1881,11 +1920,15 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+     amplify->type = WMTRenderCommandSetVertexAmplification;
+     amplify->count = 2;
+     amplify->mappings[0] = {0, 0};
+-    amplify->mappings[1] = {0, 1};
++    // layered: eye1 is the next slice; atlas: eye1 is the next viewport of the same slice
++    if (atlas)
++      amplify->mappings[1] = {1, 0};
++    else
++      amplify->mappings[1] = {0, 1};
+     append((wmtcmd_base *)amplify);
+   }
+ 
+-  bool sawPipeline = false, sawDraw = false;
++  bool sawPipeline = false, sawDraw = false, sawViewport = false, sawScissor = false;
+   bool eyeTableKnown = false, eyeConstantsKnown = false;
+   uint64_t eyeTableOffset = 0, eyeConstantsOffset = 0;
+   while (a && b) {
+@@ -1894,6 +1937,10 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+     const size_t size = stereoPairCommandSize(a->type);
+     if (!size)
+       return false;
++    // layered pairs keep one viewport per pass; atlas pairs rewrite the plural forms only
++    if (atlas ? (a->type == WMTRenderCommandSetViewport || a->type == WMTRenderCommandSetScissorRect)
++              : (a->type == WMTRenderCommandSetViewports || a->type == WMTRenderCommandSetScissorRects))
++      return false;
+     wmtcmd_base *out = nullptr;
+     if (a->type == WMTRenderCommandSetPSO) {
+       auto pa = (wmtcmd_render_setpso *)a;
+@@ -1908,6 +1955,9 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+                a->type == WMTRenderCommandDrawIndirect || a->type == WMTRenderCommandDrawIndexedIndirect) {
+       if (!sawPipeline || !eyeTableKnown || !eyeConstantsKnown)
+         return false;
++      // atlas: eye1 viewport/scissor is only defined once both arrays were rewritten
++      if (atlas && (!sawViewport || !sawScissor))
++        return false;
+       if (std::memcmp((char *)a + sizeof(wmtcmd_base), (char *)b + sizeof(wmtcmd_base),
+                       size - sizeof(wmtcmd_base)) != 0)
+         return false;
+@@ -1915,6 +1965,60 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+       appendEyeOffset(SM50_BINDING_INDEX_CONSTANT_BUFFER_EYE1, eyeConstantsOffset);
+       out = cloneCommand(a, size);
+       sawDraw = true;
++    } else if (a->type == WMTRenderCommandSetViewports) {
++      // atlas: eye0 viewport stays in the eye0 rect, eye1 viewport is the same viewport moved by the eye offset
++      auto pa = (wmtcmd_render_setviewports *)a;
++      auto pb = (wmtcmd_render_setviewports *)b;
++      if (pa->viewport_count != 1 || pb->viewport_count != 1 || !pa->viewports.get() || !pb->viewports.get())
++        return false;
++      auto va = (WMTViewport *)pa->viewports.get();
++      auto vb = (WMTViewport *)pb->viewports.get();
++      const double l0 = eye.leftX, t0 = eye.leftY, w0 = eye.leftWidth, h0 = eye.leftHeight;
++      if (va->originX < l0 || va->originY < t0 || va->originX + va->width > l0 + w0 || va->originY + va->height > t0 + h0)
++        return false;
++      const double ox = (double)dx, oy = (double)dy;
++      if (vb->originX != va->originX + ox || vb->originY != va->originY + oy || vb->width != va->width ||
++          vb->height != va->height || vb->znear != va->znear || vb->zfar != va->zfar)
++        return false;
++      auto pair = (WMTViewport *)allocate_cpu_heap(sizeof(WMTViewport) * 2, 16);
++      pair[0] = *va;
++      pair[1] = *vb;
++      auto viewports = (wmtcmd_render_setviewports *)cloneCommand(a, size);
++      viewports->viewports.set(pair);
++      viewports->viewport_count = 2;
++      out = (wmtcmd_base *)viewports;
++      sawViewport = true;
++    } else if (a->type == WMTRenderCommandSetScissorRects) {
++      // atlas: eye0 scissor stays in the eye0 rect, eye1 scissor is the same rect moved by the eye offset
++      auto pa = (wmtcmd_render_setscissorrects *)a;
++      auto pb = (wmtcmd_render_setscissorrects *)b;
++      if (pa->rect_count != 1 || pb->rect_count != 1 || !pa->scissor_rects.get() || !pb->scissor_rects.get())
++        return false;
++      auto sa = (WMTScissorRect *)pa->scissor_rects.get();
++      auto sb = (WMTScissorRect *)pb->scissor_rects.get();
++      // full render target scissor (also what a disabled scissor state produces): each original pass covered
++      // the whole target and its viewport limited it, so two identical full-target rects reproduce that exactly
++      const bool fullTarget = sa->x == 0 && sa->y == 0 && sa->width == r0->render_target_width &&
++                              sa->height == r0->render_target_height;
++      if (fullTarget) {
++        if (sb->x != 0 || sb->y != 0 || sb->width != sa->width || sb->height != sa->height)
++          return false;
++      } else {
++        const int64_t l0 = eye.leftX, t0 = eye.leftY, w0 = eye.leftWidth, h0 = eye.leftHeight;
++        const int64_t x = sa->x, y = sa->y, w = sa->width, h = sa->height;
++        if (!w || !h || x < l0 || y < t0 || x + w > l0 + w0 || y + h > t0 + h0)
++          return false;
++        if ((int64_t)sb->x != x + dx || (int64_t)sb->y != y + dy || sb->width != sa->width || sb->height != sa->height)
++          return false;
++      }
++      auto pair = (WMTScissorRect *)allocate_cpu_heap(sizeof(WMTScissorRect) * 2, 16);
++      pair[0] = *sa;
++      pair[1] = *sb;
++      auto scissors = (wmtcmd_render_setscissorrects *)cloneCommand(a, size);
++      scissors->scissor_rects.set(pair);
++      scissors->rect_count = 2;
++      out = (wmtcmd_base *)scissors;
++      sawScissor = true;
+     } else if (a->type == WMTRenderCommandSetVertexBufferOffset ||
+                a->type == WMTRenderCommandSetFragmentBufferOffset) {
+       auto pa = (wmtcmd_render_setbufferoffset *)a;
+@@ -1961,7 +2065,9 @@ ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncode
+   // commit: r0 now renders both eyes, r1 is absorbed (its attachment state equals r0's, verified above)
+   r0->cmd_head.next.set(head.next.get());
+   r0->cmd_tail = tail;
+-  r0->render_target_array_length = 2;
++  // atlas keeps one slice, so the merged pass stays non-layered and foveation eligible
++  if (!atlas)
++    r0->render_target_array_length = 2;
+   r0->stereo_pass = true;
+   r0->foveation_draw_calls += r1->foveation_draw_calls;
+   r0->fence_update.merge(r1->fence_update);
+diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
+index acbf55e..664c172 100644
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -209,6 +209,9 @@ struct StereoEyeTargets {
+   WMT::Reference<WMT::Texture> right;
+   uint32_t leftSlice = 0;
+   uint32_t rightSlice = 0;
++  /* eye rects inside their slices, used to pair eyes that share one slice (atlas) */
++  uint32_t leftX = 0, leftY = 0, leftWidth = 0, leftHeight = 0;
++  uint32_t rightX = 0, rightY = 0, rightWidth = 0, rightHeight = 0;
+   bool valid = false;
+ };
+ 
+@@ -729,11 +732,19 @@ public:
+   }
+ 
+ 
+-  void recordStereoEyeTargets(WMT::Texture left, WMT::Texture right, uint32_t leftSlice, uint32_t rightSlice) {
++  void recordStereoEyeTargets(WMT::Texture left, WMT::Texture right, const WMTWindowsVRRequestV2 &frame) {
+     eye_targets_.left = left;
+     eye_targets_.right = right;
+-    eye_targets_.leftSlice = leftSlice;
+-    eye_targets_.rightSlice = rightSlice;
++    eye_targets_.leftSlice = frame.leftSlice;
++    eye_targets_.rightSlice = frame.rightSlice;
++    eye_targets_.leftX = frame.leftX;
++    eye_targets_.leftY = frame.leftY;
++    eye_targets_.leftWidth = frame.leftWidth;
++    eye_targets_.leftHeight = frame.leftHeight;
++    eye_targets_.rightX = frame.rightX;
++    eye_targets_.rightY = frame.rightY;
++    eye_targets_.rightWidth = frame.rightWidth;
++    eye_targets_.rightHeight = frame.rightHeight;
+     eye_targets_.valid = true;
+   }
+ 

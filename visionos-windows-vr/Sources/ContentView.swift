@@ -1,6 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import WindowsVRCore
+import Darwin
 
 struct ContentView: View {
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
@@ -8,16 +9,39 @@ struct ContentView: View {
     @Bindable var model: LauncherModel
     @AppStorage("WVRFrameSynthesisMode") private var frameSynthesisMode = 0
     @AppStorage("WVRReconstructionValidation") private var reconstructionValidation = false
+    @AppStorage("WVRRenderQuality") private var renderQuality: Double = 0
+    @AppStorage("WVRInternalRenderScale") private var internalRenderScale = 1.0
+    @AppStorage("WVRLossyRenderTargets") private var lossyRenderTargets = false
     @State private var importingManifest = false
     @State private var importingGameFolder = false
     @State private var exportingReport = false
+    @State private var exportFilename = "winevision-test-sessions.json"
     @State private var showingSteamLibrary = false
+    @State private var didStartDesktopSmokeTest = false
     @State private var reportDocument = CompatibilityReportDocument(data: Data())
 
     var body: some View {
-        NavigationStack {
-            launcherHome
-                .navigationTitle("WineVision VR")
+        Group {
+            if model.desktopPresentationVisible {
+                WindowsDesktopView(model: model)
+            } else {
+                NavigationStack {
+                    launcherHome
+                        .navigationTitle("WineVision VR")
+                        .toolbar {
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button(L("Export test sessions", "Testsitzungen exportieren"), systemImage: "square.and.arrow.up") {
+                                    exportTestSessions()
+                                }
+                            }
+                        }
+                }
+            }
+        }
+        .ornament(visibility: model.shaderWarmup == nil ? .hidden : .visible, attachmentAnchor: .scene(.bottom)) {
+            if let warmup = model.shaderWarmup {
+                ShaderWarmupBanner(progress: warmup)
+            }
         }
         .sheet(isPresented: $showingSteamLibrary) {
             SteamLibraryView(model: .shared)
@@ -32,7 +56,45 @@ struct ContentView: View {
         .onChange(of: model.canChangeSelection) { _, allowed in
             SteamLibraryModel.shared.runtimeBusy = !allowed
         }
-        .task { model.refreshTransferredGames() }
+        .task {
+            model.refreshTransferredGames()
+            // Explicit developer launch argument for repeatable device testing.
+            // The normal app/library launch remains user driven.
+            if LaunchDiagnostics.enabled,
+               ProcessInfo.processInfo.arguments.contains("--vr-smoke-test"),
+               !didStartDesktopSmokeTest {
+                didStartDesktopSmokeTest = true
+                do {
+                    try model.selectVRSmoke(architecture: ProcessInfo.processInfo.arguments.contains("--x86-guest") ? .x86 : nil,
+                        fixtureExecutable: ProcessInfo.processInfo.arguments.contains("--x86-abi-test") ? "abi-test.exe" : nil)
+                    if ProcessInfo.processInfo.arguments.contains("--cpu-self-test") {
+                        model.presentationModeDraft = .desktop
+                        model.launchArgumentsText = "[\"--cpu-self-test\"]"
+                    } else if ProcessInfo.processInfo.arguments.contains("--inverted-bounds") {
+                        model.launchArgumentsText = "[\"--inverted-bounds\"]"
+                    }
+                    await startLaunch()
+                } catch { model.presentLibraryError(error) }
+            } else if LaunchDiagnostics.enabled,
+               ProcessInfo.processInfo.arguments.contains("--desktop-smoke-test"),
+               !didStartDesktopSmokeTest {
+                didStartDesktopSmokeTest = true
+                do {
+                    setenv("MADEIRA_DUMP_SURFACES", "1", 1)
+                    try model.selectDesktopDemo()
+                    model.launchArgumentsText = "[\"--self-test\"]"
+                    await startLaunch()
+                } catch { model.presentLibraryError(error) }
+            } else if LaunchDiagnostics.enabled, !didStartDesktopSmokeTest,
+                      let argument = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("--steam-smoke-test=") }),
+                      let appID = Int(argument.dropFirst("--steam-smoke-test=".count)) {
+                didStartDesktopSmokeTest = true
+                do {
+                    try model.selectInstalledSteamGame(appID: appID)
+                    await startLaunch()
+                } catch { model.presentLibraryError(error) }
+            }
+        }
         .fileImporter(
             isPresented: $importingManifest,
             allowedContentTypes: [.json],
@@ -49,7 +111,7 @@ struct ContentView: View {
             isPresented: $exportingReport,
             document: reportDocument,
             contentType: .json,
-            defaultFilename: model.reportFilename
+            defaultFilename: exportFilename
         ) { result in
             if case .failure(let error) = result { model.presentLibraryError(error) }
         }
@@ -59,10 +121,19 @@ struct ContentView: View {
             Text(model.importError ?? L("The selected item could not be opened.", "Das ausgewählte Element konnte nicht geöffnet werden."))
         }
         .onChange(of: model.hasAcceptedLaunch) { _, accepted in
-            if !accepted && model.requiresRestart {
+            if model.presentationModeDraft == .immersiveVR && !accepted && model.requiresRestart {
+                model.recordLifecycleEvent("dismissImmersiveSpace: accepted=false and requiresRestart=true")
                 Task { await dismissImmersiveSpace() }
             }
         }
+    }
+
+    private func exportTestSessions() {
+        do {
+            reportDocument = CompatibilityReportDocument(data: try model.makeTestSessionsJSON())
+            exportFilename = "winevision-test-sessions.json"
+            exportingReport = true
+        } catch { model.presentLibraryError(error) }
     }
 
     private var launcherHome: some View {
@@ -105,6 +176,12 @@ struct ContentView: View {
                         }
                     }
                     if model.manifest != nil {
+                        Picker(L("Display", "Anzeige"), selection: $model.presentationModeDraft) {
+                            Text(L("Immersive VR", "Immersives VR")).tag(WindowsPresentationMode.immersiveVR)
+                            Text(L("Desktop window", "Desktop-Fenster")).tag(WindowsPresentationMode.desktop)
+                        }
+                        .pickerStyle(.segmented)
+                        .disabled(!model.canChangeSelection)
                         Button { Task { await startLaunch() } } label: {
                             HStack {
                                 Spacer()
@@ -126,6 +203,9 @@ struct ContentView: View {
                             }.disabled(model.isStopping || model.stopRequested)
                         }
                     }
+                    if model.stopRequested || model.requiresRestart {
+                        ForceQuitSessionButton()
+                    }
                     if let error = model.launchError {
                         Label(error, systemImage: "exclamationmark.circle")
                             .foregroundStyle(.red)
@@ -140,6 +220,24 @@ struct ContentView: View {
                 }
                 .padding(24)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 24))
+
+                Button {
+                    do { try model.selectVRSmoke() }
+                    catch { model.presentLibraryError(error) }
+                } label: {
+                    Label(L("Built-in VR test scene", "Integrierte VR-Testszene"), systemImage: "cube.transparent")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!model.canChangeSelection)
+
+                Button {
+                    do { try model.selectDesktopDemo() }
+                    catch { model.presentLibraryError(error) }
+                } label: {
+                    Label(L("Windows desktop test", "Windows-Desktop-Test"), systemImage: "desktopcomputer")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!model.canChangeSelection)
 
                 Button {
                     SteamLibraryModel.shared.resumeAfterLaunchFailure()
@@ -192,10 +290,19 @@ struct ContentView: View {
                         Text(L("Standard", "Standard")).tag(0)
                         Text(L("Metal spatial reconstruction", "Räumliche Metal-Rekonstruktion")).tag(1)
                         Text(L("Metal reconstruction + frame extrapolation", "Metal-Rekonstruktion + Frame-Extrapolation")).tag(2)
+                        Text(L("Metal temporal upscaling", "Metal-temporales Upscaling")).tag(3)
+                        Text(L("Metal frame generation (adaptive)", "Metal-Frame-Generierung (adaptiv)")).tag(4)
                     }
                     .disabled(!model.canChangeSelection)
                     Text(L("Experimental. Uses submitted scene depth when available, otherwise estimates depth from the stereo images. Frame extrapolation estimates object motion; it does not increase simulation FPS. Applies on the next launch. Render scale is unchanged.", "Experimentell. Nutzt übermittelte Szenentiefe oder schätzt Tiefe aus Stereobildern. Frame-Extrapolation schätzt Objektbewegung; die Simulationsrate steigt nicht. Gilt beim nächsten Start. Die Render-Skalierung bleibt unverändert."))
                         .font(.footnote).foregroundStyle(.secondary)
+
+                    if frameSynthesisMode == 4 {
+                        Text(L("Adaptive generation engages when the game sustains below 85 FPS for 1 s and disengages at 88 FPS or more for 2 s. Between real frames it presents synthesized frames that extrapolate at most one game frame interval, and falls back to plain reprojection when the game stalls or the forecast is unreliable. At a stable 40-50 FPS, generated frames alternate with real frames.", "Die adaptive Generierung startet, wenn das Spiel 1 s lang unter 85 FPS liegt, und endet bei 88 FPS oder mehr für 2 s. Zwischen echten Frames werden synthetisierte Frames gezeigt, die höchstens ein Spielbild-Intervall extrapolieren; bei Stillstand des Spiels oder unzuverlässiger Prognose wird einfach reprojiziert. Bei stabilen 40-50 FPS wechseln generierte und echte Frames einander ab.")).font(.footnote).foregroundStyle(.secondary)
+                    }
+                    if frameSynthesisMode == 3 {
+                        Text(L("Temporal upscaling sets sub-pixel projection jitter at launch and blends history only in the central fovea. Pair it with an internal render scale below 100%. Requires game depth.", "Temporales Upscaling setzt beim Start einen Subpixel-Projektionsjitter und mischt Verlauf nur im zentralen Fovea-Bereich. Kombinieren Sie es mit einer internen Render-Skalierung unter 100%. Benötigt Spieltiefe.")).font(.footnote).foregroundStyle(.secondary)
+                    }
 
                     Toggle(L("Validate depth reconstruction", "Tiefenrekonstruktion prüfen"), isOn: $reconstructionValidation)
                         .disabled(!model.canChangeSelection || frameSynthesisMode != 0)
@@ -203,6 +310,26 @@ struct ContentView: View {
                         Text(L("Shadow validation is paused while image reconstruction is active.", "Die Schattenvalidierung pausiert während der Bildrekonstruktion.")).font(.footnote).foregroundStyle(.secondary)
                     }
                     Text(L("Compares reconstructed views with the original game images when scene depth is available. Adds GPU work; keeps normal stereo output. Applies on the next launch.", "Vergleicht rekonstruierte Ansichten mit den Originalbildern, wenn Szenentiefe verfügbar ist. Zusätzliche GPU-Arbeit; normale Stereoausgabe bleibt erhalten. Gilt beim nächsten Start."))
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                Section(L("Advanced rendering", "Erweitertes Rendering")) {
+                    Slider(value: $internalRenderScale, in: 0.5...1, step: 0.05) {
+                        Text(L("Internal render scale", "Interne Render-Skalierung"))
+                    }
+                    .disabled(!model.canChangeSelection)
+                    LabeledContent(L("Internal render scale", "Interne Render-Skalierung"), value: String(format: "%.0f%%", internalRenderScale * 100))
+                    Text(L("Asks the game to render each eye below the full recommended size and applies sub-pixel projection jitter for temporal upscaling. Applies on the next launch.", "Lässt das Spiel jedes Auge unterhalb der vollen empfohlenen Größe rendern und wendet einen Subpixel-Projektionsjitter für temporales Upscaling an. Wirkt beim nächsten Start."))
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Picker(L("Render quality", "Renderqualität"), selection: $renderQuality) {
+                        Text(L("System default", "Systemstandard")).tag(0.0)
+                        Text(L("Sharper", "Schärfer")).tag(1.0)
+                    }
+                    .disabled(!model.canChangeSelection)
+                    Text(L("Raises the system render quality ceiling for eye-tracked foveated rendering only; has no effect when foveation is unavailable. Applies on the next launch.", "Erhöht die systemseitige Render-Qualitätsobergrenze nur für augenverfolgtes foveiertes Rendering; ohne verfügbare Foveation ohne Wirkung. Wirkt beim nächsten Start."))
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Toggle(L("Lossy render target compression", "Verlustbehaftete Render-Target-Kompression"), isOn: $lossyRenderTargets)
+                        .disabled(!model.canChangeSelection)
+                    Text(L("Stores plain color render targets with Metal lossy compression to save memory bandwidth. Lossy, so output can differ slightly from the default. Applies on the next launch.", "Speichert einfache Farb-Render-Targets mit der verlustbehafteten Metal-Kompression, um Speicherbandbreite zu sparen. Verlustbehaftet, daher kann die Ausgabe leicht vom Standard abweichen. Wirkt beim nächsten Start."))
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section {
@@ -310,7 +437,7 @@ struct ContentView: View {
                             .disabled(!model.canChangeSelection)
                         Slider(value: $model.renderScaleDraft, in: 0.5...1, step: 0.05) {
                             Text(L("Spatial render scale", "Räumliche Render-Skalierung"))
-                        }.disabled(!model.canChangeSelection)
+                        }.disabled(!model.canChangeSelection || model.presentationModeDraft == .desktop)
                         LabeledContent(L("Spatial render scale", "Räumliche Render-Skalierung"), value: String(format: "%.0f%%", model.renderScaleDraft * 100))
                         Text(L("Below 100%, the guest renders smaller eyes and an ordinary Metal bilinear pass scales each eye. This is not temporal SR or DLSS.", "Unter 100 % rendert das Gastsystem kleinere Augenbilder, die anschließend mit einem gewöhnlichen bilinearen Metal-Durchlauf skaliert werden. Das ist weder temporales Super-Resolution noch DLSS."))
                             .font(.footnote).foregroundStyle(.secondary)
@@ -363,6 +490,7 @@ struct ContentView: View {
                     Button(L("Export versioned JSON report", "Versionierten JSON-Bericht exportieren"), systemImage: "square.and.arrow.up") {
                         do {
                             reportDocument = CompatibilityReportDocument(data: try model.makeCompatibilityReportJSON())
+                            exportFilename = model.reportFilename
                             exportingReport = true
                         } catch {
                             model.presentLibraryError(error)
@@ -395,14 +523,26 @@ struct ContentView: View {
 
     @MainActor
     private func startLaunch() async {
+        let presentation = model.presentationModeDraft
         await model.launch {
-            guard case .opened = await openImmersiveSpace(id: WindowsVRCompositorScene.identifier) else {
-                throw LaunchPreparationFailure.immersiveSpaceUnavailable
+            if presentation == .desktop {
+                model.showDesktopPresentation()
+                try await model.waitForDesktopReady()
+            } else {
+                guard case .opened = await openImmersiveSpace(id: WindowsVRCompositorScene.identifier) else {
+                    throw LaunchPreparationFailure.immersiveSpaceUnavailable
+                }
+                model.immersiveSpaceDidOpen()
+                try await model.waitForCompositorReady()
             }
-            model.immersiveSpaceDidOpen()
-            try await model.waitForCompositorReady()
         }
-        if !model.hasAcceptedLaunch { await dismissImmersiveSpace() }
+        if !model.hasAcceptedLaunch {
+            if presentation == .desktop { model.hideDesktopPresentation() }
+            else {
+                model.recordLifecycleEvent("dismissImmersiveSpace: launch returned without accepted session")
+                await dismissImmersiveSpace()
+            }
+        }
     }
 }
 
@@ -421,9 +561,47 @@ private struct CompatibilityReportDocument: FileDocument {
     }
 }
 
+private struct ShaderWarmupBanner: View {
+    let progress: ShaderWarmupProgress
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ProgressView(value: Double(progress.done), total: Double(max(progress.total, 1)))
+                .frame(width: 160)
+            Text(L("Preparing shaders… \(progress.done) / \(progress.total)", "Shader werden vorbereitet … \(progress.done) / \(progress.total)"))
+                .monospacedDigit()
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .background(.thinMaterial, in: Capsule())
+        .accessibilityElement(children: .combine)
+    }
+}
+
 private enum LaunchPreparationFailure: LocalizedError {
     case immersiveSpaceUnavailable
     var errorDescription: String? {
         L("The immersive compositor window could not be opened, so no launch request was sent.", "Das immersive Compositor-Fenster konnte nicht geöffnet werden. Es wurde keine Startanfrage gesendet.")
+    }
+}
+
+// Wine/FEX owns one session per app process. A stuck guest cannot be safely
+// reset by killing its threads; explicit process exit releases the whole session.
+struct ForceQuitSessionButton: View {
+    @State private var confirming = false
+
+    var body: some View {
+        Button(role: .destructive) { confirming = true } label: {
+            Label(L("Force quit app", "App sofort beenden"), systemImage: "xmark.circle")
+        }
+        .confirmationDialog(L("Quit WineVision VR?", "WineVision VR beenden?"),
+                            isPresented: $confirming, titleVisibility: .visible) {
+            Button(L("Force quit app", "App sofort beenden"), role: .destructive) {
+                Darwin._exit(0)
+            }
+        } message: {
+            Text(L("This closes the app immediately. Unsaved Windows work will be lost. Reopen it to start another session.",
+                   "Die App wird sofort geschlossen. Ungespeicherte Windows-Arbeit geht verloren. Öffne sie erneut für eine neue Sitzung."))
+        }
     }
 }

@@ -1,0 +1,569 @@
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index d6dac93..f66376a 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -4885,7 +4885,11 @@ public:
+         ps->allowsFoveatedRaster() && !ps->reflection().UAVSlotMask &&
+         !vs->reflection().UAVSlotMask && !ps->reflection().PixelShader.HasCoverageOutput;
+     device->CreateGraphicsPipeline(&pipelineDesc, &pipeline);
+-    EmitST([pso = std::move(pipeline), foveationSafe](ArgumentEncodingContext& enc) {
++    // resolved at record time; the stereo variant is only requested once a stereo submission was seen
++    MTLCompiledGraphicsPipeline *stereoPipeline = nullptr;
++    if (stereo_armed_)
++      device->CreateStereoGraphicsPipeline(&pipelineDesc, &stereoPipeline);
++    EmitST([pso = std::move(pipeline), foveationSafe, stereoPipeline](ArgumentEncodingContext& enc) {
+       enc.currentRenderEncoder()->foveation_safe &= foveationSafe;
+       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
+       pso->GetPipeline(&GraphicsPipeline); // may block
+@@ -4894,6 +4898,11 @@ public:
+       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
+       cmd.type = WMTRenderCommandSetPSO;
+       cmd.pso = GraphicsPipeline.PipelineState;
++      if (stereoPipeline) {
++        MTL_COMPILED_GRAPHICS_PIPELINE StereoPipeline{};
++        stereoPipeline->GetPipeline(&StereoPipeline); // non-blocking once the stereo variant is returned
++        cmd.stereo_pso = StereoPipeline.PipelineState;
++      }
+       enc.currentRenderEncoder()->last_pso = GraphicsPipeline.PipelineState;
+     });
+ 
+@@ -5219,7 +5228,12 @@ public:
+     state_ = {};
+   }
+ 
++public:
++  /* set by a successful stereo submission; enables stereo variant lookup when pipelines are finalized */
++  void markStereoArmed() { stereo_armed_ = true; }
++
+ protected:
++  bool stereo_armed_ = false;
+   MTLD3D11Device *device;
+   CommandBufferState cmdbuf_state = CommandBufferState::Idle;
+   CommandBufferState previous_render_pipeline_state = CommandBufferState::Idle;
+@@ -5665,6 +5679,7 @@ public:
+       if(depthFrame)for(unsigned eye=0;eye<2;++eye)
+         windows_vr_leases_[depthFrame->depth[eye]]={RetainWindowsVRResource(depthFrame->depth[eye]),{},0,result};
+     }
++    ctx_->markStereoArmed();
+     ctx_->EmitWindowsVROperation([leftTexture = std::move(leftTexture), rightTexture = std::move(rightTexture),
+                   frameCopy = layout, result, reconstruction,
+                   depthLeft=std::move(depthTextures[0]), depthRight=std::move(depthTextures[1])](ArgumentEncodingContext &enc) mutable {
+@@ -5674,6 +5689,8 @@ public:
+         reconstruction.eyes[0].depthTexture=nativeDepthLeft.handle;
+         reconstruction.eyes[1].depthTexture=nativeDepthRight.handle;
+       }
++      enc.recordStereoEyeTargets(leftTexture->current()->texture(), rightTexture->current()->texture(),
++                                 frameCopy.leftSlice, frameCopy.rightSlice);
+       enc.queueWindowsVRSubmission(leftTexture->current()->texture(), rightTexture->current()->texture(),
+                                      frameCopy, result, reconstruction, nativeDepthLeft, nativeDepthRight);
+     }, true);
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 62efc67..8ff362b 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -1023,6 +1023,13 @@ public:
+     return S_OK;
+   };
+ 
++  HRESULT
++  CreateStereoGraphicsPipeline(MTL_GRAPHICS_PIPELINE_DESC *pDesc,
++                               MTLCompiledGraphicsPipeline **ppPipeline) override {
++    *ppPipeline = pipeline_cache_->GetStereoGraphicsPipeline(pDesc);
++    return S_OK;
++  };
++
+   HRESULT
+   CreateComputePipeline(MTL_COMPUTE_PIPELINE_DESC *pDesc,
+                         MTLCompiledComputePipeline **ppPipeline) override {
+diff --git a/src/d3d11/d3d11_device.hpp b/src/d3d11/d3d11_device.hpp
+index 1ef2faa..a89de9f 100644
+--- a/src/d3d11/d3d11_device.hpp
++++ b/src/d3d11/d3d11_device.hpp
+@@ -40,6 +40,10 @@ public:
+                                          MTLCompiledGraphicsPipeline *
+                                              *ppPipeline) = 0;
+ 
++  /* returns a null pipeline while the stereo variant is unavailable or still compiling */
++  virtual HRESULT CreateStereoGraphicsPipeline(MTL_GRAPHICS_PIPELINE_DESC * pDesc,
++                                               MTLCompiledGraphicsPipeline * *ppPipeline) = 0;
++
+   virtual HRESULT CreateComputePipeline(MTL_COMPUTE_PIPELINE_DESC * pDesc,
+                                         MTLCompiledComputePipeline *
+                                             *ppPipeline) = 0;
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index e3f59fe..9c04e95 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -114,6 +114,8 @@ ArgumentEncodingContext::encodeVertexBuffers(uint32_t slot_mask, uint64_t offset
+     auto &cmd = encodeRenderCommand<wmtcmd_render_setbufferoffset>();
+     cmd.offset = getFinalArgumentBufferOffset(offset);
+     cmd.index = SM50_BINDING_INDEX_VERTEX_BUFFER;
++    cmd.table_size = (uint32_t)(__builtin_popcount(slot_mask) * sizeof(VERTEX_BUFFER_ENTRY));
++    cmd.table_size_known = 1;
+     if constexpr (kind == PipelineKind::Geometry || kind == PipelineKind::Tessellation)
+       cmd.type = WMTRenderCommandSetObjectBufferOffset;
+     else
+@@ -210,9 +212,13 @@ template <PipelineStage stage, PipelineKind kind>
+ void
+ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT * constant_buffers, uint64_t offset) {
+   uint64_t *encoded_buffer = getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(offset);
++  // bytes of the table written by this emitter, compared across passes by stereo pairing
++  uint32_t table_bytes = 0;
+ 
+   for (unsigned i = 0; i < reflection->NumConstantBuffers; i++) {
+     auto &arg = constant_buffers[i];
++    if (arg.StructurePtrOffset * 8u + 8u > table_bytes)
++      table_bytes = arg.StructurePtrOffset * 8u + 8u;
+     auto slot = 14 * unsigned(stage) + arg.SM50BindingSlot;
+     switch (arg.Type) {
+     case SM50BindingType::ConstantBuffer: {
+@@ -243,6 +249,8 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
+     auto &cmd = encodeRenderCommand<wmtcmd_render_setbufferoffset>();
+     cmd.offset = getFinalArgumentBufferOffset(offset);
+     cmd.index = SM50_BINDING_INDEX_CONSTANT_BUFFER;
++    cmd.table_size = table_bytes;
++    cmd.table_size_known = 1;
+     if constexpr (stage == PipelineStage::Vertex) {
+       if constexpr (kind == PipelineKind::Geometry)
+         cmd.type = WMTRenderCommandSetObjectBufferOffset;
+@@ -308,6 +316,15 @@ ArgumentEncodingContext::encodeShaderResources(
+ ) {
+   auto BindingCount = reflection->NumArguments;
+   uint64_t *encoded_buffer = getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(offset);
++  // bytes of the table written by this emitter: 3 slots for samplers and UAV counters, 2 otherwise
++  uint32_t table_bytes = 0;
++  for (unsigned i = 0; i < BindingCount; i++) {
++    auto &arg = arguments[i];
++    const uint32_t fields =
++        (arg.Type == SM50BindingType::Sampler || (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER)) ? 3 : 2;
++    if (arg.StructurePtrOffset * 8u + fields * 8u > table_bytes)
++      table_bytes = arg.StructurePtrOffset * 8u + fields * 8u;
++  }
+ 
+   auto &UAVBindingSet = stage == PipelineStage::Compute ? cs_uav_ : om_uav_;
+ 
+@@ -431,6 +448,8 @@ ArgumentEncodingContext::encodeShaderResources(
+     auto &cmd = encodeRenderCommand<wmtcmd_render_setbufferoffset>();
+     cmd.offset = getFinalArgumentBufferOffset(offset);
+     cmd.index = SM50_BINDING_INDEX_ARGUMENT_TABLE;
++    cmd.table_size = table_bytes;
++    cmd.table_size_known = 1;
+     if constexpr (stage == PipelineStage::Vertex) {
+       if constexpr (kind == PipelineKind::Geometry)
+         cmd.type = WMTRenderCommandSetObjectBufferOffset;
+@@ -672,6 +691,7 @@ ArgumentEncodingContext::startRenderPass(
+   encoder_info->dsv_planar_flags = dsv_planar_flags;
+   encoder_info->dsv_readonly_flags = dsv_readonly_flags;
+   encoder_info->render_target_count = render_target_count;
++  encoder_info->eye_targets = eye_targets_;
+   auto [gpu_buffer_contents, gpu_buffer_, offset] = queue_.AllocateArgumentBuffer(seq_id_, encoder_argbuf_size);
+   encoder_info->allocated_argbuf = gpu_buffer_;
+   encoder_info->allocated_argbuf_offset = offset;
+@@ -1654,6 +1674,8 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
+ 
+       return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
+     }
++    if (tryPairStereoPasses(r0, r1))
++      return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
+   }
+ 
+   return hasDataDependency(latter, former) ? DXMT_ENCODER_LIST_OP_SYNCHRONIZE : DXMT_ENCODER_LIST_OP_SWAP;
+@@ -1683,6 +1705,276 @@ ArgumentEncodingContext::hasDataDependency(EncoderData *latter, EncoderData *for
+          latter->fence_update.intersectedWith(former->fence_wait);
+ }
+ 
++/* byte size of a render command that stereo pairing can copy, 0 if the command blocks pairing */
++static size_t
++stereoPairCommandSize(uint16_t type) {
++  switch (type) {
++  case WMTRenderCommandSetPSO:
++    return sizeof(wmtcmd_render_setpso);
++  case WMTRenderCommandDraw:
++    return sizeof(wmtcmd_render_draw);
++  case WMTRenderCommandDrawIndexed:
++    return sizeof(wmtcmd_render_draw_indexed);
++  case WMTRenderCommandDrawIndirect:
++    return sizeof(wmtcmd_render_draw_indirect);
++  case WMTRenderCommandDrawIndexedIndirect:
++    return sizeof(wmtcmd_render_draw_indexed_indirect);
++  case WMTRenderCommandSetViewport:
++    return sizeof(wmtcmd_render_setviewport);
++  case WMTRenderCommandSetScissorRect:
++    return sizeof(wmtcmd_render_setscissorrect);
++  case WMTRenderCommandSetRasterizerState:
++    return sizeof(wmtcmd_render_setrasterizerstate);
++  case WMTRenderCommandSetDepthStencilState:
++    return sizeof(wmtcmd_render_setdepthstencilstate);
++  case WMTRenderCommandSetBlendFactorAndStencilRef:
++    return sizeof(wmtcmd_render_setblendcolor);
++  case WMTRenderCommandSetStencilRef:
++    return sizeof(wmtcmd_render_setstencilref);
++  case WMTRenderCommandSetVertexBufferOffset:
++  case WMTRenderCommandSetFragmentBufferOffset:
++    return sizeof(wmtcmd_render_setbufferoffset);
++  default:
++    return 0;
++  }
++}
++
++/**
++Rewrites r0 (the former pass) to render both eyes with vertex amplification and absorbs r1 (the latter pass).
++Only pairs passes that are provably the same work for both eyes, see the checks below. On failure nothing is changed.
++*/
++bool
++ArgumentEncodingContext::tryPairStereoPasses(RenderEncoderData *r0, RenderEncoderData *r1) {
++  // r1 must be the next live encoder after r0
++  EncoderData *next = r0->next;
++  while (next && next->type == EncoderType::Null)
++    next = next->next;
++  if (next != r1)
++    return false;
++
++  // the two eyes must be consecutive layers of the same eye target texture
++  const StereoEyeTargets &eye = r0->eye_targets;
++  if (!eye.valid || eye.left == nullptr || eye.right == nullptr || !(eye.left == eye.right) ||
++      eye.rightSlice != eye.leftSlice + 1)
++    return false;
++
++  if (r0->stereo_pass || r1->stereo_pass)
++    return false;
++  if (r0->render_target_array_length != 1 || r1->render_target_array_length != 1)
++    return false;
++  if (r0->render_target_count == 0 || r0->render_target_count != r1->render_target_count)
++    return false;
++  if (r0->default_raster_sample_count != r1->default_raster_sample_count)
++    return false;
++  if (r0->render_target_width != r1->render_target_width || r0->render_target_height != r1->render_target_height)
++    return false;
++  if (r0->dsv_planar_flags != r1->dsv_planar_flags || r0->dsv_readonly_flags != r1->dsv_readonly_flags)
++    return false;
++  if (r0->allocated_argbuf != r1->allocated_argbuf || !r0->allocated_argbuf_mapping || !r1->allocated_argbuf_mapping)
++    return false;
++  // a layered pass is never foveated, so both passes must agree on foveation eligibility
++  if (r0->foveation_safe != r1->foveation_safe)
++    return false;
++  if (r0->use_visibility_result || r1->use_visibility_result || r0->use_tessellation || r1->use_tessellation ||
++      r0->use_geometry || r1->use_geometry || r0->use_emulated_so || r1->use_emulated_so)
++    return false;
++  if (!r0->gs_arg_marshal_tasks.empty() || !r0->ts_arg_marshal_tasks.empty() || !r1->gs_arg_marshal_tasks.empty() ||
++      !r1->ts_arg_marshal_tasks.empty())
++    return false;
++  if (r1->fence_wait_vertex.intersectedWith(r0->fence_update) || hasDataDependency(r1, r0))
++    return false;
++
++  // colour attachments: same eye texture, slices eye0/eye1, identical load/clear, stored, no resolve
++  for (unsigned i = 0; i < r0->render_target_count; i++) {
++    auto &a0 = r0->colors[i];
++    auto &a1 = r1->colors[i];
++    if (!a0.attachment || !a1.attachment) {
++      if (a0.attachment || a1.attachment)
++        return false;
++      continue;
++    }
++    if (!(a0.attachment.texture() == eye.left) || !(a1.attachment.texture() == eye.left))
++      return false;
++    if (a0.level || a1.level || a0.depth_plane || a1.depth_plane)
++      return false;
++    if (a0.slice != eye.leftSlice || a1.slice != eye.rightSlice)
++      return false;
++    if (a0.resolve_attachment || a1.resolve_attachment)
++      return false;
++    if (a0.store_action != WMTStoreActionStore || a1.store_action != WMTStoreActionStore)
++      return false;
++    if (a0.load_action != a1.load_action)
++      return false;
++    if (a0.load_action == WMTLoadActionClear && std::memcmp(&a0.clear_color, &a1.clear_color, sizeof(a0.clear_color)))
++      return false;
++  }
++
++  // depth: either absent in both, or consecutive slices of one depth texture
++  if (static_cast<bool>(r0->depth.attachment) != static_cast<bool>(r1->depth.attachment))
++    return false;
++  if (r0->depth.attachment) {
++    if (!(r0->depth.attachment.texture() == r1->depth.attachment.texture()))
++      return false;
++    if (r0->depth.level || r1->depth.level || r0->depth.depth_plane || r1->depth.depth_plane)
++      return false;
++    if (r0->depth.slice + 1 != r1->depth.slice)
++      return false;
++    if (r0->depth.load_action != r1->depth.load_action || r0->depth.store_action != r1->depth.store_action)
++      return false;
++    if (r0->depth.load_action == WMTLoadActionClear && r0->depth.clear_depth != r1->depth.clear_depth)
++      return false;
++    if (!(r0->dsv_readonly_flags & 1) && r0->depth.store_action != WMTStoreActionStore)
++      return false;
++  }
++  if (r0->stencil.attachment || r1->stencil.attachment)
++    return false;
++
++  // Walk both command lists in lockstep and build the replacement list for r0 in a fresh chain.
++  auto *a = static_cast<wmtcmd_base *>(r0->cmd_head.next.get());
++  auto *b = static_cast<wmtcmd_base *>(r1->cmd_head.next.get());
++
++  wmtcmd_render_nop head{};
++  head.type = WMTRenderCommandNop;
++  wmtcmd_base *tail = (wmtcmd_base *)&head;
++  auto append = [&tail](wmtcmd_base *cmd) {
++    tail->next.set(cmd);
++    tail = cmd;
++  };
++  auto cloneCommand = [this](wmtcmd_base *src, size_t size) {
++    auto dst = (wmtcmd_base *)allocate_cpu_heap(size, 16);
++    std::memcpy((void *)dst, (void *)src, size);
++    dst->next.set(nullptr);
++    return dst;
++  };
++  auto appendEyeOffset = [&append, this](uint8_t index, uint64_t offset) {
++    auto cmd = (wmtcmd_render_setbufferoffset *)allocate_cpu_heap(sizeof(wmtcmd_render_setbufferoffset), 16);
++    std::memset((void *)cmd, 0, sizeof(*cmd));
++    cmd->type = WMTRenderCommandSetVertexBufferOffset;
++    cmd->offset = offset;
++    cmd->index = index;
++    append((wmtcmd_base *)cmd);
++  };
++
++  // eye1 argument table and constant buffer live in the pass argument buffer, bound at the EYE1 indices
++  {
++    auto bind = (wmtcmd_render_setbuffer *)allocate_cpu_heap(sizeof(wmtcmd_render_setbuffer), 16);
++    std::memset((void *)bind, 0, sizeof(*bind));
++    bind->type = WMTRenderCommandSetVertexBuffer;
++    bind->buffer = r0->allocated_argbuf;
++    bind->offset = 0;
++    bind->index = SM50_BINDING_INDEX_ARGUMENT_TABLE_EYE1;
++    append((wmtcmd_base *)bind);
++  }
++  {
++    auto bind = (wmtcmd_render_setbuffer *)allocate_cpu_heap(sizeof(wmtcmd_render_setbuffer), 16);
++    std::memset((void *)bind, 0, sizeof(*bind));
++    bind->type = WMTRenderCommandSetVertexBuffer;
++    bind->buffer = r0->allocated_argbuf;
++    bind->offset = 0;
++    bind->index = SM50_BINDING_INDEX_CONSTANT_BUFFER_EYE1;
++    append((wmtcmd_base *)bind);
++  }
++  {
++    auto amplify = (wmtcmd_render_setvertexamplification *)allocate_cpu_heap(
++        sizeof(wmtcmd_render_setvertexamplification), 16);
++    std::memset((void *)amplify, 0, sizeof(*amplify));
++    amplify->type = WMTRenderCommandSetVertexAmplification;
++    amplify->count = 2;
++    amplify->mappings[0] = {0, 0};
++    amplify->mappings[1] = {0, 1};
++    append((wmtcmd_base *)amplify);
++  }
++
++  bool sawPipeline = false, sawDraw = false;
++  bool eyeTableKnown = false, eyeConstantsKnown = false;
++  uint64_t eyeTableOffset = 0, eyeConstantsOffset = 0;
++  while (a && b) {
++    if (a->type != b->type)
++      return false;
++    const size_t size = stereoPairCommandSize(a->type);
++    if (!size)
++      return false;
++    wmtcmd_base *out = nullptr;
++    if (a->type == WMTRenderCommandSetPSO) {
++      auto pa = (wmtcmd_render_setpso *)a;
++      auto pb = (wmtcmd_render_setpso *)b;
++      if (pa->pso != pb->pso || !pa->stereo_pso)
++        return false;
++      auto stereo = (wmtcmd_render_setpso *)cloneCommand(a, size);
++      stereo->pso = stereo->stereo_pso;
++      out = (wmtcmd_base *)stereo;
++      sawPipeline = true;
++    } else if (a->type == WMTRenderCommandDraw || a->type == WMTRenderCommandDrawIndexed ||
++               a->type == WMTRenderCommandDrawIndirect || a->type == WMTRenderCommandDrawIndexedIndirect) {
++      if (!sawPipeline || !eyeTableKnown || !eyeConstantsKnown)
++        return false;
++      if (std::memcmp((char *)a + sizeof(wmtcmd_base), (char *)b + sizeof(wmtcmd_base),
++                      size - sizeof(wmtcmd_base)) != 0)
++        return false;
++      appendEyeOffset(SM50_BINDING_INDEX_ARGUMENT_TABLE_EYE1, eyeTableOffset);
++      appendEyeOffset(SM50_BINDING_INDEX_CONSTANT_BUFFER_EYE1, eyeConstantsOffset);
++      out = cloneCommand(a, size);
++      sawDraw = true;
++    } else if (a->type == WMTRenderCommandSetVertexBufferOffset ||
++               a->type == WMTRenderCommandSetFragmentBufferOffset) {
++      auto pa = (wmtcmd_render_setbufferoffset *)a;
++      auto pb = (wmtcmd_render_setbufferoffset *)b;
++      if (pa->index != pb->index)
++        return false;
++      const bool vertex = a->type == WMTRenderCommandSetVertexBufferOffset;
++      if (vertex && pa->index == SM50_BINDING_INDEX_ARGUMENT_TABLE) {
++        // may differ per eye: eye0 keeps its own, eye1 is bound at the EYE1 index before each draw
++        eyeTableKnown = true;
++        eyeTableOffset = pb->offset;
++      } else if (vertex && pa->index == SM50_BINDING_INDEX_CONSTANT_BUFFER) {
++        eyeConstantsKnown = true;
++        eyeConstantsOffset = pb->offset;
++      } else if ((vertex && pa->index == SM50_BINDING_INDEX_VERTEX_BUFFER) ||
++                 (!vertex && (pa->index == SM50_BINDING_INDEX_CONSTANT_BUFFER ||
++                              pa->index == SM50_BINDING_INDEX_ARGUMENT_TABLE))) {
++        // must be byte-identical: compare table contents over the bytes the emitter wrote
++        if (!pa->table_size_known || !pb->table_size_known || pa->table_size != pb->table_size)
++          return false;
++        if (pa->offset < r0->allocated_argbuf_offset || pb->offset < r1->allocated_argbuf_offset)
++          return false;
++        auto bytesA = (const char *)r0->allocated_argbuf_mapping + (pa->offset - r0->allocated_argbuf_offset);
++        auto bytesB = (const char *)r1->allocated_argbuf_mapping + (pb->offset - r1->allocated_argbuf_offset);
++        if (std::memcmp(bytesA, bytesB, pa->table_size) != 0)
++          return false;
++      } else {
++        return false;
++      }
++      out = cloneCommand(a, size);
++    } else {
++      if (std::memcmp((char *)a + sizeof(wmtcmd_base), (char *)b + sizeof(wmtcmd_base),
++                      size - sizeof(wmtcmd_base)) != 0)
++        return false;
++      out = cloneCommand(a, size);
++    }
++    append(out);
++    a = static_cast<wmtcmd_base *>(a->next.get());
++    b = static_cast<wmtcmd_base *>(b->next.get());
++  }
++  if (a || b || !sawDraw)
++    return false;
++
++  // commit: r0 now renders both eyes, r1 is absorbed (its attachment state equals r0's, verified above)
++  r0->cmd_head.next.set(head.next.get());
++  r0->cmd_tail = tail;
++  r0->render_target_array_length = 2;
++  r0->stereo_pass = true;
++  r0->foveation_draw_calls += r1->foveation_draw_calls;
++  r0->fence_update.merge(r1->fence_update);
++  r0->fence_wait.merge(r1->fence_wait);
++  r0->fence_update_vertex.merge(r1->fence_update_vertex);
++  r0->fence_wait_vertex.merge(r1->fence_wait_vertex);
++  currentFrameStatistics().stereo_pass_merged++;
++  r1->~RenderEncoderData();
++  r1->next = nullptr;
++  r1->type = EncoderType::Null;
++  return true;
++}
++
+ bool
+ ArgumentEncodingContext::isEncoderSignatureMatched(RenderEncoderData *r0, RenderEncoderData *r1) {
+   // FIXME: it can be different?
+diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
+index ea8dd68..acbf55e 100644
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -40,6 +40,7 @@
+ #include "rc/util_rc_ptr.hpp"
+ #include "airconv_public.h"
+ #include <cassert>
++#include <cstring>
+ 
+ #define DXMT_IMPLEMENT_ME __builtin_unreachable();
+ #define DXMT_UNREACHABLE __builtin_unreachable();
+@@ -202,6 +203,15 @@ struct RenderEncoderStencilAttachmentData {
+   uint8_t clear_stencil;
+ };
+ 
++/* render targets of the most recent stereo submission, as seen by the encoder */
++struct StereoEyeTargets {
++  WMT::Reference<WMT::Texture> left;
++  WMT::Reference<WMT::Texture> right;
++  uint32_t leftSlice = 0;
++  uint32_t rightSlice = 0;
++  bool valid = false;
++};
++
+ struct RenderEncoderData : EncoderData {
+   std::array<RenderEncoderColorAttachmentData, 8> colors;
+   RenderEncoderDepthAttachmentData depth;
+@@ -234,6 +244,10 @@ struct RenderEncoderData : EncoderData {
+   WMT::DepthStencilState last_depth_stencil_state = {};
+   const void *last_rasterizer_state = nullptr;
+   uint32_t last_stencil_ref = 0;
++  /* eye targets known when this pass started; used to pair left/right passes */
++  StereoEyeTargets eye_targets;
++  /* set when this pass was rewritten to render both eyes with vertex amplification */
++  bool stereo_pass = false;
+ };
+ 
+ struct ComputeEncoderData : EncoderData {
+@@ -631,6 +645,8 @@ public:
+                   std::is_same_v<cmd_struct,wmtcmd_render_draw_indexed_indirect>)
+       ++encoder->foveation_draw_calls;
+     auto storage = (cmd_struct *)allocate_cpu_heap(sizeof(cmd_struct), 16);
++    // zero first so DXMT-side fields (stereo_pso, table_size*) are never read uninitialized
++    std::memset((void *)storage, 0, sizeof(cmd_struct));
+     encoder->cmd_tail->next.set(storage);
+     encoder->cmd_tail = (wmtcmd_base *)storage;
+     storage->next.set(nullptr);
+@@ -713,6 +729,14 @@ public:
+   }
+ 
+ 
++  void recordStereoEyeTargets(WMT::Texture left, WMT::Texture right, uint32_t leftSlice, uint32_t rightSlice) {
++    eye_targets_.left = left;
++    eye_targets_.right = right;
++    eye_targets_.leftSlice = leftSlice;
++    eye_targets_.rightSlice = rightSlice;
++    eye_targets_.valid = true;
++  }
++
+   uint64_t
+   nextEncoderId() {
+     return encoder_id_++;
+@@ -872,6 +896,7 @@ private:
+   // could die at start in newComputePipelineStateWithDescriptor on a garbage device.
+   struct PendingWindowsVRSubmission { WMT::Reference<WMT::Texture> left, right, depthLeft, depthRight; WMTWindowsVRRequestV2 frame{}; WVRReconstructionSubmitV1 geometry{}; std::shared_ptr<WindowsVRSubmissionResult> result; };
+   std::optional<PendingWindowsVRSubmission> windows_vr_submission_;
++  StereoEyeTargets eye_targets_;
+   WMT::Device device_;
+ 
+ public:
+@@ -887,6 +912,7 @@ private:
+   DXMT_ENCODER_LIST_OP checkEncoderRelation(EncoderData* former, EncoderData* latter);
+   bool hasDataDependency(EncoderData* from, EncoderData* to);
+   bool isEncoderSignatureMatched(RenderEncoderData* former, RenderEncoderData* latter);
++  bool tryPairStereoPasses(RenderEncoderData* former, RenderEncoderData* latter);
+   RenderEncoderColorAttachmentData *isClearColorSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);
+   RenderEncoderDepthAttachmentData *isClearDepthSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);
+   RenderEncoderStencilAttachmentData *isClearStencilSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);
+diff --git a/src/dxmt/dxmt_statistics.hpp b/src/dxmt/dxmt_statistics.hpp
+index 2d549c8..94c98de 100644
+--- a/src/dxmt/dxmt_statistics.hpp
++++ b/src/dxmt/dxmt_statistics.hpp
+@@ -43,6 +43,7 @@ struct FrameStatistics {
+   clock::duration commit_interval{};
+   uint32_t render_pass_count = 0;
+   uint32_t render_pass_optimized = 0;
++  uint32_t stereo_pass_merged = 0;
+   uint32_t clear_pass_count = 0;
+   uint32_t clear_pass_optimized = 0;
+   uint32_t resolve_pass_optimized = 0;
+@@ -65,6 +66,7 @@ struct FrameStatistics {
+     commit_interval = {};
+     render_pass_count = 0;
+     render_pass_optimized = 0;
++    stereo_pass_merged = 0;
+     clear_pass_count = 0;
+     clear_pass_optimized = 0;
+     resolve_pass_optimized = 0;
+diff --git a/src/winemetal/winemetal.h b/src/winemetal/winemetal.h
+index 7e834c0..0ee1ecd 100644
+--- a/src/winemetal/winemetal.h
++++ b/src/winemetal/winemetal.h
+@@ -1289,6 +1289,9 @@ struct wmtcmd_render_setbufferoffset {
+   struct WMTMemoryPointer next;
+   uint64_t offset;
+   uint8_t index;
++  /* DXMT-side only: byte size of the argument table written at offset, valid when table_size_known */
++  uint8_t table_size_known;
++  uint32_t table_size;
+ };
+ 
+ enum WMTTriangleFillMode : uint8_t {
+@@ -1325,6 +1328,8 @@ struct wmtcmd_render_setpso {
+   uint16_t reserved[3];
+   struct WMTMemoryPointer next;
+   obj_handle_t pso;
++  /* DXMT-side only: stereo (vertex amplification) variant of pso, 0 if unavailable */
++  obj_handle_t stereo_pso;
+ };
+ 
+ enum WMTVisibilityResultMode : uint8_t {

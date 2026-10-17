@@ -30,6 +30,16 @@
 @implementation WVRReconstructionResources
 @end
 
+// Projection-jitter metadata carried with a queued frame. ndc is per eye and is
+// derived from the published producer targets when the frame is submitted.
+struct WVRBridgeJitter {
+    uint32_t flags;
+    uint32_t renderFlags;
+    float pixelX;
+    float pixelY;
+    float ndc[2][2];
+};
+
 namespace {
 
 // Publishers never acquire this mutex while holding BridgeState::lock.
@@ -116,6 +126,7 @@ struct QueuedFrame {
     uint64_t readyValue = 0;
     WVRFrameTrackingV1 renderTracking{};
     __strong WVRReconstructionResources *reconstruction = nil;
+    WVRBridgeJitter jitter{};
     uint32_t leftSlice = 0, leftX = 0, leftY = 0, leftWidth = 0, leftHeight = 0;
     uint32_t rightSlice = 0, rightX = 0, rightY = 0, rightWidth = 0, rightHeight = 0;
 };
@@ -229,8 +240,14 @@ void dropHeadLocked(BridgeState &bridge) {
 
 uint32_t producerExtent(uint32_t drawableExtent, float scale) {
     if (drawableExtent == 0) return 0;
-    return std::max<uint32_t>(1, static_cast<uint32_t>(
+    const uint32_t scaled = std::max<uint32_t>(1, static_cast<uint32_t>(
         std::floor(static_cast<double>(drawableExtent) * static_cast<double>(scale))));
+    // Unity pads eye buffers to tile boundaries. Advertise that allocation size
+    // so its stereo texture fits the contract; presentation scales to the view.
+    // Tiny probe/preview textures retain their exact extent.
+    if (scaled < 64) return scaled;
+    const uint64_t aligned = (static_cast<uint64_t>(scaled) + 63u) & ~uint64_t(63u);
+    return static_cast<uint32_t>(std::min<uint64_t>(aligned, UINT32_MAX));
 }
 
 void invalidateTargetsLocked(BridgeState &bridge) {
@@ -381,6 +398,7 @@ int32_t submitStereoFrame(const WVRSubmitStereoFrameV1 *frame,
     slot.producerTimestampNanoseconds = frame->producerTimestampNanoseconds;
     slot.renderTracking = trackingForTimestampLocked(bridge, frame->producerTimestampNanoseconds);
     slot.reconstruction = nil;
+    slot.jitter = WVRBridgeJitter{};
     slot.left = left;
     slot.right = right;
     slot.readyEvent = readyEvent;
@@ -401,6 +419,7 @@ int32_t submitStereoFrame(const WVRSubmitStereoFrameV1 *frame,
 
 @interface WVRFrameLease : NSObject
 @property(nonatomic,strong) WVRReconstructionResources *reconstruction;
+@property(nonatomic) WVRBridgeJitter jitter;
 @property(nonatomic) uint64_t ticket;
 @property(nonatomic) uint64_t producerFrameID;
 @property(nonatomic) uint64_t producerTimestampNanoseconds;
@@ -589,16 +608,17 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_submit_stereo_frame_for_
     return submitStereoFrame(frame, targetGeneration, true, outCompositorTicket);
 }
 
-static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket, WVRReconstructionResources *reconstruction);
+static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket, WVRReconstructionResources *reconstruction, const WVRBridgeJitter *jitter);
 
 static int32_t submitStereoFrame(
-    const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket, WVRReconstructionResources *reconstruction) {
-    const int32_t status = submitStereoFrameV2Impl(frame, outCompositorTicket,reconstruction);
+    const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket, WVRReconstructionResources *reconstruction,
+    const WVRBridgeJitter *jitter = nullptr) {
+    const int32_t status = submitStereoFrameV2Impl(frame, outCompositorTicket,reconstruction,jitter);
     traceBridgeCallf(CallSubmitV2, "status=%d", status);
     return status;
 }
 
-static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket, WVRReconstructionResources *reconstruction) {
+static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket, WVRReconstructionResources *reconstruction, const WVRBridgeJitter *jitter) {
     if (!frame || !outCompositorTicket || frame->abiVersion != WVR_COMPOSITOR_ABI_VERSION_V2 ||
         frame->structSize < sizeof(WVRSubmitStereoFrameV2) || !frame->leftTexture ||
         !frame->rightTexture || !frame->producerReadyEvent || frame->targetGeneration == 0) {
@@ -671,6 +691,15 @@ static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint
     slot.producerTimestampNanoseconds = frame->producerTimestampNanoseconds;
     slot.renderTracking = trackingForTimestampLocked(bridge, frame->producerTimestampNanoseconds);
     slot.reconstruction = reconstruction;
+    slot.jitter = jitter ? *jitter : WVRBridgeJitter{};
+    if (slot.jitter.flags & WVR_SUBMIT_JITTER_VALID) {
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            slot.jitter.ndc[eye][0] = 2.0f * slot.jitter.pixelX / static_cast<float>(bridge.targets.width[eye]);
+            slot.jitter.ndc[eye][1] = 2.0f * slot.jitter.pixelY / static_cast<float>(bridge.targets.height[eye]);
+        }
+    } else {
+        slot.jitter = WVRBridgeJitter{};
+    }
     slot.left = left; slot.right = right; slot.readyEvent = readyEvent;
     slot.readyValue = frame->producerReadyValue;
     slot.leftSlice = frame->leftSlice; slot.leftX = frame->leftX; slot.leftY = frame->leftY;
@@ -686,7 +715,36 @@ static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint
 
 extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_submit_stereo_frame_v2(
     const WVRSubmitStereoFrameV2 *frame, uint64_t *ticket) {
-    return submitStereoFrame(frame,ticket,nil);
+    return submitStereoFrame(frame,ticket,nil,nullptr);
+}
+
+extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_submit_stereo_frame_v3(
+    const WVRSubmitStereoFrameV3 *frame, uint64_t *ticket) {
+    if (!frame || !ticket || frame->abiVersion != WVR_COMPOSITOR_ABI_VERSION_V3 ||
+        frame->structSize < sizeof(WVRSubmitStereoFrameV3))
+        return WVRCompositorStatusInvalidArgument;
+    WVRSubmitStereoFrameV2 v2{};
+    v2.abiVersion = WVR_COMPOSITOR_ABI_VERSION_V2;
+    v2.structSize = sizeof(v2);
+    v2.producerFrameID = frame->producerFrameID;
+    v2.producerTimestampNanoseconds = frame->producerTimestampNanoseconds;
+    v2.leftTexture = frame->leftTexture;
+    v2.rightTexture = frame->rightTexture;
+    v2.producerReadyEvent = frame->producerReadyEvent;
+    v2.producerReadyValue = frame->producerReadyValue;
+    v2.targetGeneration = frame->targetGeneration;
+    v2.leftSlice = frame->leftSlice; v2.leftX = frame->leftX; v2.leftY = frame->leftY;
+    v2.leftWidth = frame->leftWidth; v2.leftHeight = frame->leftHeight;
+    v2.rightSlice = frame->rightSlice; v2.rightX = frame->rightX; v2.rightY = frame->rightY;
+    v2.rightWidth = frame->rightWidth; v2.rightHeight = frame->rightHeight;
+    WVRBridgeJitter jitter{};
+    jitter.flags = frame->jitterFlags & WVR_SUBMIT_JITTER_VALID;
+    jitter.renderFlags = frame->renderFlags;
+    jitter.pixelX = frame->jitterPixelX;
+    jitter.pixelY = frame->jitterPixelY;
+    const int32_t status = submitStereoFrame(&v2, ticket, nil, &jitter);
+    traceBridgeCallf(CallSubmitV2, "v3 status=%d jitter=%u", status, jitter.flags);
+    return status;
 }
 
 static std::atomic<uint64_t> reconstructionRejections{0};
@@ -716,7 +774,7 @@ static int32_t submitReconstructionImpl(WVRReconstructionSubmitV1 *r) {
     frame.producerReadyEvent=(void*)r->producerEvent;frame.producerReadyValue=r->producerValue;
     frame.leftSlice=r->eyes[0].colorSlice;frame.leftX=r->eyes[0].colorX;frame.leftY=r->eyes[0].colorY;frame.leftWidth=r->eyes[0].width;frame.leftHeight=r->eyes[0].height;
     frame.rightSlice=r->eyes[1].colorSlice;frame.rightX=r->eyes[1].colorX;frame.rightY=r->eyes[1].colorY;frame.rightWidth=r->eyes[1].width;frame.rightHeight=r->eyes[1].height;
-    r->status=submitStereoFrame(&frame,&r->compositorTicket,resources);
+    r->status=submitStereoFrame(&frame,&r->compositorTicket,resources,nullptr);
     if(r->status==0)r->consumerEvent=(uint64_t)wvr_compositor_copy_consumer_event_v1();
     return r->status;
 }
@@ -767,6 +825,7 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_acquire_latest_stereo_fr
     lease.readyValue = slot.readyValue;
     lease.renderTracking = slot.renderTracking;
     lease.reconstruction = slot.reconstruction;
+    lease.jitter = slot.jitter;
     lease.leftSlice = slot.leftSlice; lease.leftX = slot.leftX; lease.leftY = slot.leftY;
     lease.leftWidth = slot.leftWidth; lease.leftHeight = slot.leftHeight;
     lease.rightSlice = slot.rightSlice; lease.rightX = slot.rightX; lease.rightY = slot.rightY;
@@ -817,6 +876,7 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_acquire_latest_stereo_fr
     lease.readyEvent = slot.readyEvent; lease.readyValue = slot.readyValue;
     lease.renderTracking = slot.renderTracking;
     lease.reconstruction = slot.reconstruction;
+    lease.jitter = slot.jitter;
     lease.leftSlice = slot.leftSlice; lease.leftX = slot.leftX; lease.leftY = slot.leftY;
     lease.leftWidth = slot.leftWidth; lease.leftHeight = slot.leftHeight;
     lease.rightSlice = slot.rightSlice; lease.rightX = slot.rightX; lease.rightY = slot.rightY;
@@ -835,6 +895,12 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_acquire_latest_stereo_fr
     outFrame->leftWidth = lease.leftWidth; outFrame->leftHeight = lease.leftHeight;
     outFrame->rightSlice = lease.rightSlice; outFrame->rightX = lease.rightX; outFrame->rightY = lease.rightY;
     outFrame->rightWidth = lease.rightWidth; outFrame->rightHeight = lease.rightHeight;
+    outFrame->jitterFlags = lease.jitter.flags;
+    outFrame->renderFlags = lease.jitter.renderFlags;
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        outFrame->jitterNdc[eye][0] = lease.jitter.ndc[eye][0];
+        outFrame->jitterNdc[eye][1] = lease.jitter.ndc[eye][1];
+    }
     clearSlot(slot);
     bridge.head = (bridge.head + 1) % kQueueCapacity;
     --bridge.count; ++bridge.outstandingLeases; ++bridge.stats.acquiredFrames;

@@ -54,7 +54,9 @@ if [[ ! -f "$BUILD/config.status" ]]; then
     mkdir -p "$BUILD"
     (
         cd "$BUILD"
-        "$WINE/configure" --without-x --disable-tests --enable-winegstreamer
+        # This tree supplies host code generators and headers only. The xros
+        # font libraries use the separately pinned FreeType build below.
+        "$WINE/configure" --without-x --without-freetype --disable-tests --enable-winegstreamer
     )
 fi
 

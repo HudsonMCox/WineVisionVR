@@ -1,0 +1,12 @@
+diff --git a/tools/build-prefix-snapshot.sh b/tools/build-prefix-snapshot.sh
+--- a/tools/build-prefix-snapshot.sh
++++ b/tools/build-prefix-snapshot.sh
+@@ -13,7 +13,7 @@
+ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ OUTPUT="$REPO_ROOT/app/Madeira/prefix-template.tar.gz"
+ 
+-WORK_DIR="$(mktemp -d /Users/"$USER"/madeira-prefix-build.XXXXXX)"
++WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/madeira-prefix-build.XXXXXX")"
+ trap 'rm -rf "$WORK_DIR"' EXIT
+ PREFIX="$WORK_DIR/prefix"
+ 

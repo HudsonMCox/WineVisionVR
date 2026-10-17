@@ -1,0 +1,10 @@
+{
+  "id": "winevision.vr-smoke",
+  "title": "Built-in VR test scene",
+  "executableRelativePath": "vr-smoke.exe",
+  "backend": "windowsWineFEX",
+  "graphics": "direct3D11",
+  "launchArguments": [],
+  "presentation": "immersiveVR",
+  "schemaVersion": 1
+}

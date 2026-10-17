@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct VisionOSWindowsVRApp: App {
+    @UIApplicationDelegateAdaptor(WineVisionApplicationDelegate.self) private var applicationDelegate
     @State private var launcherModel = LauncherModel()
     @Environment(\.scenePhase) private var scenePhase
 
@@ -17,6 +18,7 @@ struct VisionOSWindowsVRApp: App {
         WindowGroup {
             ContentView(model: launcherModel)
                 .onChange(of: scenePhase, initial: true) { _, phase in
+                    SteamLibraryModel.shared.applicationActivityChanged(phase == .active)
                     LaunchLogFile.append("lifecycle", "App scene phase=\(String(describing: phase)) uptime=\(ProcessInfo.processInfo.systemUptime) thermal=\(ProcessInfo.processInfo.thermalState.rawValue)")
                 }
         }

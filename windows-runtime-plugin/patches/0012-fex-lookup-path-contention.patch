@@ -1,0 +1,87 @@
+diff --git a/FEX/FEXCore/Source/Interface/Core/Core.cpp b/FEX/FEXCore/Source/Interface/Core/Core.cpp
+index 26a039f..bf690aa 100644
+--- a/FEX/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEX/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1928,14 +1928,14 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     static volatile uint64_t g_cb_hot_rip = 0;
+     static volatile uint64_t g_cb_hot_rip_count = 0;
+     if (GuestRIP == g_cb_hot_rip) {
+-      __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
++      __atomic_add_fetch(&g_cb_hot_rip_count, 1, __ATOMIC_RELAXED);
+     } else if (g_cb_hot_rip_count == 0) {
+       g_cb_hot_rip = GuestRIP;
+-      __sync_add_and_fetch(&g_cb_hot_rip_count, 1);
++      __atomic_add_fetch(&g_cb_hot_rip_count, 1, __ATOMIC_RELAXED);
+     } else {
+-      __sync_sub_and_fetch(&g_cb_hot_rip_count, 1);
++      __atomic_sub_fetch(&g_cb_hot_rip_count, 1, __ATOMIC_RELAXED);
+     }
+-    uint64_t total = __sync_add_and_fetch(&g_cb_total, 1);
++    uint64_t total = __atomic_add_fetch(&g_cb_total, 1, __ATOMIC_RELAXED);
+     if ((total - g_cb_last_summary_total) >= 16384) {
+       g_cb_last_summary_total = total;
+       uint64_t reals = g_cb_real_compiles;
+@@ -2114,6 +2114,11 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+ 
+   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
+ 
++  // Lock-free L1 hit: the invalidation lock is only needed for the L2/L3 lookup and for compiling.
++  if (auto HostCode = Thread->LookupCache->FindBlockL1(GuestRIP)) {
++    return HostCode;
++  }
++
+ #ifdef FEX_IOS_HOST
+   /* iOS-Madeira ml455 (#74 delivery-under-locks): if an interrupted frame on
+    * THIS thread already holds emission locks, this call can only be guest SEH
+diff --git a/FEX/FEXCore/Source/Interface/Core/LookupCache.h b/FEX/FEXCore/Source/Interface/Core/LookupCache.h
+index ffa2709..c72afce 100644
+--- a/FEX/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEX/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -197,6 +197,15 @@ public:
+     Shared = &NewMap;
+   }
+ 
++  // L1-only probe, lock-free. Returns 0 on a miss without touching L2/L3.
++  uintptr_t FindBlockL1(uint64_t Address) const {
++    const auto& L1Entry = reinterpret_cast<const LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
++    if (L1Entry.GuestCode == Address) {
++      return L1Entry.HostCode;
++    }
++    return 0;
++  }
++
+   uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
+     // Try L1, no lock needed
+     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+@@ -260,11 +269,16 @@ public:
+     {   /* ml1124: process-wide L1-miss rate (every 2^20 misses, with the time) */
+       static std::atomic<uint64_t> IosL1Misses {0};
+       static std::atomic<int64_t> IosL1LastNs {0};
+-      const uint64_t M = IosL1Misses.fetch_add(1, std::memory_order_relaxed) + 1;
+-      if ((M & 0xfffff) == 0) {
+-        const int64_t Now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+-        const int64_t Last = IosL1LastNs.exchange(Now, std::memory_order_relaxed);
+-        if (Last) LogMan::Msg::EFmt("[l1-miss] ml1124 {} L1 misses total, {:.0f}/s over the last 2^20", M, 1048576.0 * 1e9 / double(Now - Last));
++      /* Misses are counted per thread and folded into the process-wide total every
++       * 4096, so the hot path does not bounce a shared cache line. Folded totals are
++       * always multiples of 4096, so every 2^20 boundary is still reached exactly once. */
++      if ((++IosL1MissesLocal & 0xfff) == 0) {
++        const uint64_t M = IosL1Misses.fetch_add(4096, std::memory_order_relaxed) + 4096;
++        if ((M & 0xfffff) == 0) {
++          const int64_t Now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++          const int64_t Last = IosL1LastNs.exchange(Now, std::memory_order_relaxed);
++          if (Last) LogMan::Msg::EFmt("[l1-miss] ml1124 {} L1 misses total, {:.0f}/s over the last 2^20", M, 1048576.0 * 1e9 / double(Now - Last));
++        }
+       }
+     }
+ #endif
+@@ -564,6 +578,9 @@ private:
+ 
+   size_t CurrentL1Entries = MIN_L1_ENTRIES;
+   uint64_t L2L3CacheHits {};
++#ifdef FEX_IOS_HOST
++  uint64_t IosL1MissesLocal {};
++#endif
+   std::chrono::time_point<std::chrono::system_clock> LastPeriod {};
+   constexpr static std::chrono::seconds SamplePeriod {1};
+   FEX_CONFIG_OPT(DynamicL1CacheIncreaseCountHeuristic, DYNAMICL1CACHEINCREASECOUNTHEURISTIC);

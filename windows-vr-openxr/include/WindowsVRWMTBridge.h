@@ -88,6 +88,53 @@ typedef struct WMTWindowsVRRequestV2 {
 #pragma pack(pop)
 
 WVR_WMT_IMPORT int32_t WMTWindowsVRBridgeCallV2(WMTWindowsVRRequestV2 *request);
+
+// V3 = V2 followed by the projection-jitter and render-source fields. The submit
+// path sends it for every D3D11 frame; V2 remains for legacy callers.
+#define WMT_WINDOWSVR_REQUEST_ABI_V3 3u
+#define WMT_WINDOWSVR_JITTER_VALID (1u << 0)
+#define WMT_WINDOWSVR_RENDER_SOURCE_SCALED (1u << 0)
+#pragma pack(push, 4)
+typedef struct WMTWindowsVRRequestV3 {
+  uint32_t abiVersion;
+  uint32_t structSize;
+  int32_t status;
+  uint32_t reserved;
+  uint64_t commandBuffer;
+  uint64_t producerEvent;
+  uint64_t producerValue;
+  uint64_t frameID;
+  uint64_t timestampNanoseconds;
+  uint64_t targetGeneration;
+  uint64_t leftTexture;
+  uint64_t rightTexture;
+  uint32_t leftSlice;
+  uint32_t leftX;
+  uint32_t leftY;
+  uint32_t leftWidth;
+  uint32_t leftHeight;
+  uint32_t rightSlice;
+  uint32_t rightX;
+  uint32_t rightY;
+  uint32_t rightWidth;
+  uint32_t rightHeight;
+  uint64_t compositorTicket;
+  uint64_t consumerEvent;
+  uint32_t jitterFlags;   // WMT_WINDOWSVR_JITTER_VALID when the jitter fields apply.
+  uint32_t renderFlags;   // WMT_WINDOWSVR_RENDER_SOURCE_SCALED when the eye rects are below target size.
+  float jitterPixelX;     // Projection centre offset in pixels of the producer eye image.
+  float jitterPixelY;
+  float jitterNdcX;       // Same offset in NDC for eye 0; the bridge derives eye 1 from its targets.
+  float jitterNdcY;
+} WMTWindowsVRRequestV3;
+#pragma pack(pop)
+
+WVR_WMT_IMPORT int32_t WMTWindowsVRBridgeCallV3(WMTWindowsVRRequestV3 *request);
+#if defined(__cplusplus)
+static_assert(sizeof(WMTWindowsVRRequestV3) == 160, "WMT V3 fixed-width transport layout changed");
+#else
+_Static_assert(sizeof(WMTWindowsVRRequestV3) == 160, "WMT V3 fixed-width transport layout changed");
+#endif
 #if defined(__cplusplus)
 static_assert(sizeof(WMTWindowsVRRequestV2) == 136, "WMT V2 fixed-width transport layout changed");
 #else

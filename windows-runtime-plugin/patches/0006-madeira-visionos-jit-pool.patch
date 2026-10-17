@@ -1,0 +1,16 @@
+diff --git a/app/Madeira/FEXBridge.mm b/app/Madeira/FEXBridge.mm
+--- a/app/Madeira/FEXBridge.mm
++++ b/app/Madeira/FEXBridge.mm
+@@ -77,7 +77,11 @@
+ // JIT Memory Pool
+ // Dual-mapped: RX pages (from debugger) + RW pages (via vm_remap)
+ // ---------------------------------------------------------------------------
+-static constexpr size_t JIT_POOL_SIZE = 64 * 1024 * 1024; // 64MB
++// Match the 640 MiB arena used by the working visionOS runtime. The same
++// size flows into debugger allocation, the RW remap and the Wine/FEX exports;
++// patching only an allocation instruction would leave those contracts apart.
++// This remains a one-session, non-reclaiming pool; device memory limits apply.
++static constexpr size_t JIT_POOL_SIZE = 640ULL * 1024 * 1024;
+ static constexpr size_t JIT_PAGE_SIZE = 0x4000; // 16KB iOS pages
+ 
+ static void *g_jit_rx_base = nullptr;  // Executable view

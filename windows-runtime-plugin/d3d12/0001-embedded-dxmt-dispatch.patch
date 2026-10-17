@@ -33,7 +33,7 @@ diff --git a/build/ntdll-unix/virtual_ios.c b/build/ntdll-unix/virtual_ios.c
 +             * not implement Madeira's 32-bit FEX-window pointer relocation.
 +             * Reject that optional path rather than hand it a native table. */
 +            if (wow || wvr_dxmt_d3d12_transport_abi_v1() != 1 ||
-+                wvr_dxmt_d3d12_unix_call_count_v1() != 148)
++                wvr_dxmt_d3d12_unix_call_count_v1() != 149)
 +                return STATUS_NOT_SUPPORTED;
 +            funcs64 = (const void *)dxmt_winemetal_unix_call_funcs;
 +            funcs_wow64 = NULL;

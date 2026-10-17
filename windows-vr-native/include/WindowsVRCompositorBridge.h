@@ -15,6 +15,12 @@ extern "C" {
 
 #define WVR_COMPOSITOR_ABI_VERSION 1u
 #define WVR_COMPOSITOR_ABI_VERSION_V2 2u
+#define WVR_COMPOSITOR_ABI_VERSION_V3 3u
+/// Submit-side flags. JITTER_VALID means the producer projection was offset by
+/// a Halton sub-pixel jitter; RENDER_SOURCE_SCALED means the guest eye rects are
+/// smaller than the producer targets.
+#define WVR_SUBMIT_JITTER_VALID (1u << 0)
+#define WVR_SUBMIT_RENDER_SOURCE_SCALED (1u << 0)
 #define WVR_COMPOSITOR_VIEW_COUNT 2u
 
 typedef enum WVRCompositorStatusV1 {
@@ -177,6 +183,34 @@ typedef struct WVRSubmitStereoFrameV2 {
     uint32_t rightHeight;
 } WVRSubmitStereoFrameV2;
 
+/// V2 plus projection-jitter metadata. jitterPixelX/Y are in pixels of the
+/// producer eye image; the bridge derives per-eye NDC offsets from its targets.
+typedef struct WVRSubmitStereoFrameV3 {
+    uint32_t abiVersion;
+    uint32_t structSize;
+    uint64_t producerFrameID;
+    uint64_t producerTimestampNanoseconds;
+    void *leftTexture;
+    void *rightTexture;
+    void *producerReadyEvent;
+    uint64_t producerReadyValue;
+    uint64_t targetGeneration;
+    uint32_t leftSlice;
+    uint32_t leftX;
+    uint32_t leftY;
+    uint32_t leftWidth;
+    uint32_t leftHeight;
+    uint32_t rightSlice;
+    uint32_t rightX;
+    uint32_t rightY;
+    uint32_t rightWidth;
+    uint32_t rightHeight;
+    uint32_t jitterFlags;
+    uint32_t renderFlags;
+    float jitterPixelX;
+    float jitterPixelY;
+} WVRSubmitStereoFrameV3;
+
 typedef struct WVRAcquiredStereoFrameV2 {
     uint32_t abiVersion;
     uint32_t structSize;
@@ -198,6 +232,11 @@ typedef struct WVRAcquiredStereoFrameV2 {
     uint32_t rightY;
     uint32_t rightWidth;
     uint32_t rightHeight;
+    // Appended for V3 submissions. jitterNdc[eye][0/1] is the NDC offset that
+    // was added to that eye's projection centre; zero when jitterFlags is clear.
+    uint32_t jitterFlags;
+    uint32_t renderFlags;
+    float jitterNdc[2][2];
 } WVRAcquiredStereoFrameV2;
 
 /// Returns a retained id<MTLDevice> as an opaque pointer. Release it with
@@ -253,6 +292,10 @@ WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_submit_stereo_frame_for_generation_
     uint64_t *outCompositorTicket);
 WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_submit_stereo_frame_v2(
     const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket);
+/// Same as V2 and additionally carries projection-jitter metadata for the
+/// acquired lease. Jitter-free callers keep using V2.
+WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_submit_stereo_frame_v3(
+    const WVRSubmitStereoFrameV3 *frame, uint64_t *outCompositorTicket);
 
 /// Removes the newest queued frame and drops stale queued frames. Returns
 /// NoFrameAvailable when the queue is empty. Returned pointers are borrowed from

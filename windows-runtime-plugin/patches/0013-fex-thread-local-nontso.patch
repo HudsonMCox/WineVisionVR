@@ -1,0 +1,330 @@
+diff --git a/FEX/FEXCore/Source/Interface/Config/Config.json.in b/FEX/FEXCore/Source/Interface/Config/Config.json.in
+index 2f70e75..6e2aa5f 100644
+--- a/FEX/FEXCore/Source/Interface/Config/Config.json.in
++++ b/FEX/FEXCore/Source/Interface/Config/Config.json.in
+@@ -503,6 +503,14 @@
+           "Treat accesses through registers holding RSP plus a constant, derived within the current block, as non-TSO like RSP itself."
+         ]
+       },
++      "ThreadLocalNonTSO": {
++        "Type": "bool",
++        "Default": "false",
++        "Desc": [
++          "Treat FS and GS segment accesses, and accesses through pointers loaded from the TEB or its thread local storage array within the current block, as non-TSO.",
++          "The TEB, its thread local storage array and the thread local blocks it points to are private to the current thread."
++        ]
++      },
+       "StrictInProcessSplitLocks": {
+         "Type": "bool",
+         "Default": "false",
+diff --git a/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 83a4667..c99d4c1 100644
+--- a/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -143,9 +143,10 @@ void OpDispatchBuilder::LEAOp(OpcodeArgs) {
+   }
+ 
+   auto Src = LoadSourceGPR_WithOpSize(Op, Op->Src[0], SrcSize, Op->Flags, {.LoadData = false, .AllowUpperGarbage = SrcSize > DstSize});
+-  const bool StackDerived = DstSize == OpSize::i64Bit && IsStackDerivedAddress(Op, Op->Src[0]);
++  // Computed before the store, which may overwrite the base register.
++  const PrivatePtrs Derived = DstSize == OpSize::i64Bit ? GetAddressPrivateRegs(Op, Op->Src[0]) : PrivatePtrs {};
+   StoreResultGPR_WithOpSize(Op, Op->Dest, Src, DstSize);
+-  SetStackDerivedReg(Op->Dest, StackDerived);
++  SetPrivateRegs(Op->Dest, Derived);
+ }
+ 
+ void OpDispatchBuilder::NOPOp(OpcodeArgs) {}
+@@ -4349,6 +4350,8 @@ AddressMode OpDispatchBuilder::DecodeAddress(const X86Tables::DecodedOp& Op, con
+   A.Segment = GetSegment(Op->Flags);
+   A.AddrSize = (Op->Flags & X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) != 0 ? (GPRSize >> 1) : GPRSize;
+   A.NonTSO = AccessType == MemoryAccessType::NONTSO || AccessType == MemoryAccessType::STREAM;
++  // FS and GS are thread private in 64-bit mode, since Windows x64 keeps the TEB in GS.
++  A.NonTSO |= AccessType == MemoryAccessType::DEFAULT && ThreadLocalNonTSO() && HasThreadLocalSegment(Op->Flags);
+ 
+   if (Operand.IsLiteral()) {
+     A.Offset = Operand.Literal();
+@@ -4662,7 +4665,7 @@ void OpDispatchBuilder::ResetWorkingList() {
+   CurrentCodeBlock = nullptr;
+   RegCache.Written = 0;
+   RegCache.Cached = 0;
+-  StackDerivedRegs = 0;
++  ClearPrivateRegs();
+ }
+ 
+ void OpDispatchBuilder::UnhandledOp(OpcodeArgs) {
+@@ -4675,9 +4678,16 @@ void OpDispatchBuilder::MOVGPROp(OpcodeArgs, uint32_t SrcIndex) {
+   Ref Src = LoadSourceGPR(Op, Op->Src[SrcIndex], Op->Flags, {.Align = OpSize::i8Bit, .AllowUpperGarbage = true});
+ 
+   // The source must be checked before the store, which may overwrite it.
+-  const bool StackDerived = OpSizeFromDst(Op) == OpSize::i64Bit && Op->Src[SrcIndex].IsGPR() && IsStackDerivedReg(Op->Src[SrcIndex].Data.GPR.GPR);
++  PrivatePtrs Derived {};
++  if (OpSizeFromDst(Op) == OpSize::i64Bit) {
++    if (Op->Src[SrcIndex].IsGPR()) {
++      Derived = GetPrivateRegs(Op->Src[SrcIndex].Data.GPR.GPR);
++    } else {
++      Derived = GetLoadPrivateRegs(Op, Op->Src[SrcIndex]);
++    }
++  }
+   StoreResultGPR(Op, Src, OpSize::i8Bit);
+-  SetStackDerivedReg(Op->Dest, StackDerived);
++  SetPrivateRegs(Op->Dest, Derived);
+ }
+ 
+ void OpDispatchBuilder::MOVGPRNTOp(OpcodeArgs) {
+@@ -4714,10 +4724,6 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
+     RoundedSize = std::max(OpSize::i32Bit, RoundedSize);
+   }
+ 
+-  // Adding or subtracting a constant keeps an RSP-derived destination RSP-derived.
+-  const bool StackDerived = (ALUIROp == FEXCore::IR::IROps::OP_ADD || ALUIROp == FEXCore::IR::IROps::OP_SUB) && Size == OpSize::i64Bit &&
+-                            Op->Src[SrcIdx].IsLiteral() && Op->Dest.IsGPR() && IsStackDerivedReg(Op->Dest.Data.GPR.GPR);
+-
+   // X86 basic ALU ops just do the operation between the destination and a single source
+   Ref Src = LoadSourceGPR(Op, Op->Src[SrcIdx], Op->Flags, {.AllowUpperGarbage = true});
+ 
+@@ -4725,6 +4731,17 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
+   // promoting to a full size operation that preserves the upper bits.
+   uint64_t Const;
+   bool IsConst = IsValueConstant(WrapNode(Src), &Const);
++
++  // Adding or subtracting a constant, or masking with an alignment mask, keeps a thread private destination thread private.
++  PrivatePtrs Derived {};
++  if (Size == OpSize::i64Bit && Op->Dest.IsGPR()) {
++    const bool ConstantAdjust = (ALUIROp == FEXCore::IR::IROps::OP_ADD || ALUIROp == FEXCore::IR::IROps::OP_SUB) && Op->Src[SrcIdx].IsLiteral();
++    const bool AlignMask = (ALUIROp == FEXCore::IR::IROps::OP_AND || ALUIROp == FEXCore::IR::IROps::OP_ANDWITHFLAGS) && IsConst &&
++                           IsAlignmentMask(Const);
++    if (ConstantAdjust || AlignMask) {
++      Derived = GetPrivateRegs(Op->Dest.Data.GPR.GPR);
++    }
++  }
+   if (Size < OpSize::i32Bit && !DestIsLockedMem(Op) && Op->Dest.IsGPR() && !Op->Dest.Data.GPR.HighBits && IsConst &&
+       (ALUIROp == IR::IROps::OP_XOR || ALUIROp == IR::IROps::OP_OR || ALUIROp == IR::IROps::OP_ANDWITHFLAGS)) {
+ 
+@@ -4792,7 +4809,7 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
+     StoreResultGPR_WithOpSize(Op, Op->Dest, Result, ResultSize, OpSize::iInvalid, MemoryAccessType::DEFAULT);
+   }
+ 
+-  SetStackDerivedReg(Op->Dest, StackDerived);
++  SetPrivateRegs(Op->Dest, Derived);
+ }
+ 
+ void OpDispatchBuilder::LSLOp(OpcodeArgs) {
+diff --git a/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 934db42..9b13ee8 100644
+--- a/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEX/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -136,8 +136,8 @@ public:
+ 
+     it->second.HaveEmitted = true;
+ 
+-    // Control can arrive here from other predecessors, so RSP-derived state from the fallthrough is not valid.
+-    StackDerivedRegs = 0;
++    // Control can arrive here from other predecessors, so thread private state from the fallthrough is not valid.
++    ClearPrivateRegs();
+ 
+     if (CurrentCodeBlock->Wrapped(DualListData.ListBegin()).ID() == it->second.BlockEntry->Wrapped(DualListData.ListBegin()).ID()) {
+       return;
+@@ -155,7 +155,7 @@ public:
+     CFInverted = CFInvertedABI;
+ 
+     FlushRegisterCache();
+-    StackDerivedRegs = 0;
++    ClearPrivateRegs();
+ 
+     // Start block in X87 state.
+     // This is important to ensure that blocks always start with the same state independently of predecessors
+@@ -1309,6 +1309,7 @@ protected:
+ private:
+   FEX_CONFIG_OPT(ReducedPrecisionMode, X87REDUCEDPRECISION);
+   FEX_CONFIG_OPT(StackDerivedNonTSO, STACKDERIVEDNONTSO);
++  FEX_CONFIG_OPT(ThreadLocalNonTSO, THREADLOCALNONTSO);
+ 
+   struct JumpTargetInfo {
+     Ref BlockEntry;
+@@ -1529,43 +1530,154 @@ private:
+ 
+   // GPRs known to hold RSP plus a constant within the current block.
+   uint16_t StackDerivedRegs {};
++  // GPRs known to hold the TEB, its thread local storage array, or this thread's TLS block within the current block.
++  uint16_t TebRegs {};
++  uint16_t TlsArrayRegs {};
++  uint16_t ThreadLocalRegs {};
++
++  // Offsets within the x64 TEB of the self pointer and the thread local storage array pointer.
++  static constexpr int64_t TEBSelfPointerOffset = 0x30;
++  static constexpr int64_t TEBTLSArrayOffset = 0x58;
++
++  // Which thread private pointers a GPR is known to hold.
++  struct PrivatePtrs {
++    bool Stack {};
++    bool Teb {};
++    bool TlsArray {};
++    bool ThreadLocal {};
++  };
++
++  void ClearPrivateRegs() {
++    StackDerivedRegs = 0;
++    TebRegs = 0;
++    TlsArrayRegs = 0;
++    ThreadLocalRegs = 0;
++  }
++
++  [[nodiscard]]
++  PrivatePtrs GetPrivateRegs(uint8_t Reg) const {
++    PrivatePtrs Regs {};
++    if (Reg >= 16) {
++      return Regs;
++    }
++
++    const uint16_t Bit = static_cast<uint16_t>(1u << Reg);
++    Regs.Stack = Reg == X86State::REG_RSP || (StackDerivedRegs & Bit) != 0;
++    Regs.Teb = (TebRegs & Bit) != 0;
++    Regs.TlsArray = (TlsArrayRegs & Bit) != 0;
++    Regs.ThreadLocal = (ThreadLocalRegs & Bit) != 0;
++    return Regs;
++  }
++
++  // Only a 64-bit GPR destination keeps thread private properties. StoreRegister has already cleared the destination.
++  void SetPrivateRegs(const X86Tables::DecodedOperand& Dest, PrivatePtrs Derived) {
++    if (!Dest.IsGPR() || Dest.Data.GPR.GPR >= 16 || Dest.Data.GPR.GPR == X86State::REG_RSP) {
++      return;
++    }
++
++    const uint16_t Bit = static_cast<uint16_t>(1u << Dest.Data.GPR.GPR);
++    if (Derived.Stack) {
++      StackDerivedRegs = static_cast<uint16_t>(StackDerivedRegs | Bit);
++    }
++    if (Derived.Teb) {
++      TebRegs = static_cast<uint16_t>(TebRegs | Bit);
++    }
++    if (Derived.TlsArray) {
++      TlsArrayRegs = static_cast<uint16_t>(TlsArrayRegs | Bit);
++    }
++    if (Derived.ThreadLocal) {
++      ThreadLocalRegs = static_cast<uint16_t>(ThreadLocalRegs | Bit);
++    }
++  }
+ 
++  // Whether a 64-bit mask only clears low bits below a 4 KiB boundary, such as an alignment mask.
+   [[nodiscard]]
+-  bool IsStackDerivedReg(uint8_t Reg) const {
+-    return Reg == X86State::REG_RSP || (Reg < 16 && (StackDerivedRegs & (1u << Reg)) != 0);
++  static bool IsAlignmentMask(uint64_t Mask) {
++    const uint64_t Low = ~Mask;
++    return (Mask >> 63) != 0 && Low < 4096 && (Low & (Low + 1)) == 0;
+   }
+ 
+-  // Whether a memory operand is RSP plus a constant with no index register, as used by LEA.
++  // Windows x64 keeps the TEB at GS. FS has no defined per-thread meaning there, so it stays TSO.
+   [[nodiscard]]
+-  bool IsStackDerivedAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand) const {
++  bool HasThreadLocalSegment(uint32_t Flags) const {
++    const uint32_t Segment = Flags & X86Tables::DecodeFlags::FLAG_SEGMENTS;
++    return Is64BitMode && Segment == X86Tables::DecodeFlags::FLAG_GS_PREFIX;
++  }
++
++  // The thread private properties of the base of a memory operand with no index register, as used by LEA.
++  [[nodiscard]]
++  PrivatePtrs GetAddressPrivateRegs(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand) const {
+     if (Op->Flags & X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) {
+-      return false;
++      return {};
+     }
+ 
+     if (Operand.IsGPRDirect()) {
+-      return IsStackDerivedReg(Operand.Data.GPR.GPR);
++      return GetPrivateRegs(Operand.Data.GPR.GPR);
+     } else if (Operand.IsGPRIndirect()) {
+-      return IsStackDerivedReg(Operand.Data.GPRIndirect.GPR);
+-    } else if (Operand.IsSIB()) {
+-      return Operand.Data.SIB.Index == X86State::REG_INVALID && Operand.Data.SIB.Base != X86State::REG_INVALID &&
+-             IsStackDerivedReg(Operand.Data.SIB.Base);
++      return GetPrivateRegs(Operand.Data.GPRIndirect.GPR);
++    } else if (Operand.IsSIB() && Operand.Data.SIB.Index == X86State::REG_INVALID) {
++      return GetPrivateRegs(Operand.Data.SIB.Base);
+     }
+ 
+-    return false;
++    return {};
+   }
+ 
+-  // Only a 64-bit GPR destination can keep the RSP-derived property.
+-  void SetStackDerivedReg(const X86Tables::DecodedOperand& Dest, bool Derived) {
+-    if (!Derived || !Dest.IsGPR() || Dest.Data.GPR.GPR >= 16 || Dest.Data.GPR.GPR == X86State::REG_RSP) {
+-      return;
++  // The thread private properties of a 64-bit load from Operand. The TEB and its TLS array are loaded from fixed offsets, and a TLS
++  // block loaded from the array belongs to this thread. Any other loaded value may be shared, so it does not keep the property.
++  [[nodiscard]]
++  PrivatePtrs GetLoadPrivateRegs(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand) const {
++    PrivatePtrs Loaded {};
++    if (!Is64BitMode || (Op->Flags & X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE)) {
++      return Loaded;
++    }
++
++    uint8_t Base = X86State::REG_INVALID;
++    bool HasIndex = false;
++    int64_t Disp = 0;
++    if (Operand.IsGPRIndirect()) {
++      Base = Operand.Data.GPRIndirect.GPR;
++      Disp = Operand.Data.GPRIndirect.Displacement;
++    } else if (Operand.IsSIB()) {
++      Base = Operand.Data.SIB.Base;
++      HasIndex = Operand.Data.SIB.Index != X86State::REG_INVALID;
++      Disp = Operand.Data.SIB.Offset;
++    } else {
++      return Loaded;
+     }
+ 
+-    StackDerivedRegs = static_cast<uint16_t>(StackDerivedRegs | (1u << Dest.Data.GPR.GPR));
++    if (Base == X86State::REG_INVALID) {
++      // An absolute gs:[disp32] address is relative to the TEB.
++      if (!HasIndex && (Op->Flags & X86Tables::DecodeFlags::FLAG_SEGMENTS) == X86Tables::DecodeFlags::FLAG_GS_PREFIX) {
++        Loaded.Teb = Disp == TEBSelfPointerOffset;
++        Loaded.TlsArray = Disp == TEBTLSArrayOffset;
++      }
++      return Loaded;
++    }
++
++    // A register base is relative to the segment base, so it only matches without an FS or GS prefix.
++    if (HasThreadLocalSegment(Op->Flags)) {
++      return Loaded;
++    }
++
++    const PrivatePtrs BaseRegs = GetPrivateRegs(Base);
++    if (BaseRegs.TlsArray) {
++      // The index selects a slot of the array, and every slot holds a TLS block of this thread.
++      Loaded.ThreadLocal = true;
++    } else if (BaseRegs.Teb && !HasIndex && Disp == TEBTLSArrayOffset) {
++      Loaded.TlsArray = true;
++    }
++    return Loaded;
+   }
+ 
+   [[nodiscard]]
+   bool IsNonTSOReg(MemoryAccessType Access, uint8_t Reg) const {
+-    return Access == MemoryAccessType::DEFAULT && (Reg == X86State::REG_RSP || (StackDerivedNonTSO() && IsStackDerivedReg(Reg)));
++    if (Access != MemoryAccessType::DEFAULT) {
++      return false;
++    }
++
++    const PrivatePtrs Regs = GetPrivateRegs(Reg);
++    return Reg == X86State::REG_RSP || (StackDerivedNonTSO() && Regs.Stack) ||
++           (ThreadLocalNonTSO() && (Regs.Teb || Regs.TlsArray || Regs.ThreadLocal));
+   }
+ 
+   AddressMode DecodeAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, MemoryAccessType AccessType, bool IsLoad);
+@@ -2095,8 +2207,12 @@ private:
+ 
+   void StoreRegister(uint8_t Reg, bool FPR, Ref Value) {
+     if (!FPR && Reg < 16) {
+-      // Writing a register invalidates what was derived from its old value. Writing RSP invalidates all of it.
+-      StackDerivedRegs = Reg == X86State::REG_RSP ? 0 : static_cast<uint16_t>(StackDerivedRegs & ~(1u << Reg));
++      // Writing a register invalidates what was derived from its old value. Writing RSP invalidates all stack derived state.
++      const uint16_t Keep = static_cast<uint16_t>(~(1u << Reg));
++      StackDerivedRegs = Reg == X86State::REG_RSP ? 0 : static_cast<uint16_t>(StackDerivedRegs & Keep);
++      TebRegs = static_cast<uint16_t>(TebRegs & Keep);
++      TlsArrayRegs = static_cast<uint16_t>(TlsArrayRegs & Keep);
++      ThreadLocalRegs = static_cast<uint16_t>(ThreadLocalRegs & Keep);
+     }
+ 
+     StoreContext(Reg + (FPR ? FPR0Index : GPR0Index), Value);

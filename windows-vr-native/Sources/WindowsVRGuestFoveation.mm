@@ -82,18 +82,34 @@ struct EyeTarget {
   __strong id<MTLTexture> root = nil;
   uint32_t role = 0, slice = 0, eyeWidth = 0, eyeHeight = 0;
   bool atlas = false;
+  // Size-derived targets are not registered eyes. singleEye targets follow the
+  // eye of the most recent registered identity pass in the current frame.
+  bool derived = false, singleEye = false;
   __strong id<MTLTexture> scratchColor[8] = {}, scratchDepth = nil;
   __strong id<MTLRasterizationRateMap> sourceMap = nil, adaptedMap = nil,
                                        rightSourceMap = nil;
   __strong id<MTLBuffer> parameters = nil;
   uint32_t mapLayer = 0, rightMapLayer = 0;
+  // Cached with adaptedMap so resolves do not query the map per pass.
+  uint32_t bounds[4] = {};
+  MTLSize physicalSize = {};
+  // Layered stereo pairs cache a two-layer scene map and each layer's
+  // single-slice adaptation. Both are rebuilt when a source map or size changes.
+  __strong id<MTLRasterizationRateMap> layeredMap = nil, layeredSource[2] = {};
+  __strong id<MTLBuffer> layeredParameters = nil, layerParameters[2] = {};
+  uint32_t layeredSourceLayer[2] = {}, layeredWidth = 0, layeredHeight = 0;
+  uint32_t layerBounds[2][4] = {};
+  MTLSize layerPhysical[2] = {};
 };
 std::array<EyeTarget, 64> targets;
 size_t nextTarget = 0;
+uint32_t lastIdentityRole = 0;
+bool lastIdentityKnown = false;
 std::atomic<uint64_t> sceneDraws{0}, logicalArea{0}, mappedArea{0},
     unmatchedTargets{0}, staleMaps{0}, atlasBegun{0}, bridgeCalls{0},
     capabilities{0}, uniformBindings{0};
 std::atomic<uint64_t> sliceViewHits{0}, sliceViewCreates{0};
+std::atomic<uint64_t> layeredBegun{0}, anySizeTargets{0};
 std::atomic<uint64_t> begun{0}, resolved{0}, rejected{0}, nextToken{1},
     mapAdaptations{0}, mapAdaptNanoseconds{0};
 __strong id<MTLLibrary> resolveLibrary = nil;
@@ -101,6 +117,13 @@ __strong id<MTLBuffer> identityParameters = nil;
 __strong id<MTLSamplerState> linearSampler = nil, pointSampler = nil;
 __strong id<MTLDepthStencilState> resolveStates[2][4] = {};
 __strong NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *pipelines;
+// Small fixed cache in front of the dictionary, keyed by (format, flags).
+struct PipelineSlot {
+  MTLPixelFormat format = MTLPixelFormatInvalid;
+  uint8_t flags = 0;
+  __strong id<MTLRenderPipelineState> state = nil;
+};
+PipelineSlot pipelineSlots[32];
 
 id<MTLTexture> rootTexture(id<MTLTexture> texture,
                            NSUInteger *slice = nullptr) {
@@ -128,20 +151,19 @@ id<MTLTexture> singleSlice(id<MTLTexture> texture, uint32_t slice) {
   return view;
 }
 
-// Adapt the system's separable rate functions in normalized screen space.
-// Conservative neighboring maxima widen high-quality regions; no gaze point is
-// reconstructed, persisted or exposed. The original system map stays immutable.
-id<MTLRasterizationRateMap> adaptMap(id<MTLRasterizationRateMap> source,
-                                     NSUInteger layer, NSUInteger width,
-                                     NSUInteger height) {
-  if (!source || layer >= source.layerCount || !width || !height)
-    return nil;
+// Samples one layer's system rate functions and adapts them in normalized
+// screen space. Conservative neighboring maxima widen high-quality regions;
+// no gaze point is reconstructed, persisted or exposed.
+static bool sampleAdaptedRates(id<MTLRasterizationRateMap> source,
+                               NSUInteger layer, float (&x)[32],
+                               float (&y)[32]) {
   constexpr unsigned count = 32;
-  float x[count], y[count], sx[count], sy[count];
+  if (!source || layer >= source.layerCount)
+    return false;
+  float sx[count], sy[count];
   const auto screen = source.screenSize;
   if (!screen.width || !screen.height)
-    return nil;
-  const auto started = std::chrono::steady_clock::now();
+    return false;
   auto maximumRate = [&](bool horizontal, float begin, float end) {
     auto coordinate = [&](float at) {
       const auto p = [source
@@ -172,8 +194,21 @@ id<MTLRasterizationRateMap> adaptMap(id<MTLRasterizationRateMap> source,
     x[i] = std::min(1.0f, std::ceil(std::max({sx[lo], sx[i], sx[hi]}) * 8) / 8);
     y[i] = std::min(1.0f, std::ceil(std::max({sy[lo], sy[i], sy[hi]}) * 8) / 8);
   }
+  return true;
+}
+
+// The original system map stays immutable; the adapted map is a new object.
+id<MTLRasterizationRateMap> adaptMap(id<MTLRasterizationRateMap> source,
+                                     NSUInteger layer, NSUInteger width,
+                                     NSUInteger height) {
+  if (!source || layer >= source.layerCount || !width || !height)
+    return nil;
+  float x[32], y[32];
+  const auto started = std::chrono::steady_clock::now();
+  if (!sampleAdaptedRates(source, layer, x, y))
+    return nil;
   auto rates = [[MTLRasterizationRateLayerDescriptor alloc]
-      initWithSampleCount:MTLSizeMake(count, count, 1)
+      initWithSampleCount:MTLSizeMake(32, 32, 1)
                horizontal:x
                  vertical:y];
   auto descriptor = [MTLRasterizationRateMapDescriptor
@@ -193,6 +228,7 @@ const char *shader = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 struct V { float4 position [[position]]; };
+struct DO { float depth [[depth(any)]]; };
 vertex V wvr_fov_resolve_vertex(uint id [[vertex_id]]) {
     const float2 p[3]={float2(-1,-1),float2(3,-1),float2(-1,3)};
     return {float4(p[id],0,1)};
@@ -208,6 +244,10 @@ fragment float4 wvr_fov_resolve_color(V in [[stage_in]], texture2d<float> color 
     return color.sample(linearClamp,sourceUV(in.position.xy,map,uint2(color.get_width(),color.get_height()),physicalSize));
 }
 struct O { float4 color [[color(0)]]; float depth [[depth(any)]]; };
+fragment DO wvr_fov_resolve_depth_only(V in [[stage_in]],depth2d<float> depth [[texture(1)]],
+    sampler pointClamp [[sampler(1)]],constant rasterization_rate_map_data &map [[buffer(0)]],constant uint4 &physicalSize [[buffer(1)]]) {
+    return {depth.sample(pointClamp,sourceUV(in.position.xy,map,uint2(depth.get_width(),depth.get_height()),physicalSize))};
+}
 fragment O wvr_fov_resolve_depth(V in [[stage_in]],texture2d<float> color [[texture(0)]],depth2d<float> depth [[texture(1)]],
     sampler linearClamp [[sampler(0)]],sampler pointClamp [[sampler(1)]],constant rasterization_rate_map_data &map [[buffer(0)]],constant uint4 &physicalSize [[buffer(1)]]) {
     float2 uv=sourceUV(in.position.xy,map,uint2(color.get_width(),color.get_height()),physicalSize);
@@ -241,6 +281,19 @@ fragment S wvr_fov_load_stencil(V in [[stage_in]],texture2d<float> color [[textu
     return {color.sample(linearClamp,uniformUV(in.position.xy,map,uint2(color.get_width(),color.get_height()),bounds)),depth.sample(pointClamp,uniformUV(in.position.xy,map,uint2(depth.get_width(),depth.get_height()),bounds)),stencil.read(pixel).r};
 }
 )MSL";
+
+// Pixel dimensions match an eye at 1x or a listed scale, within one pixel.
+// Scaled targets are adapted to their own size by adaptMap.
+static bool eyeSizeMatches(uint64_t width, uint64_t height, uint32_t eyeWidth,
+                           uint32_t eyeHeight) {
+  static constexpr double scales[] = {1.0, 0.5, 0.75, 1.25, 1.5, 2.0};
+  for (double scale : scales) {
+    if (std::fabs(double(width) - eyeWidth * scale) <= 1.0 &&
+        std::fabs(double(height) - eyeHeight * scale) <= 1.0)
+      return true;
+  }
+  return false;
+}
 
 // A side-by-side stereo atlas has one shared vertical rate function. Use the
 // maximum required by either eye at every row, and keep each eye's horizontal
@@ -290,6 +343,98 @@ static id<MTLRasterizationRateMap> adaptStereoAtlas(const EyeMap &left,
   return [left.map.device newRasterizationRateMapWithDescriptor:descriptor];
 }
 
+// Two-layer map for one stereo pair at one target size. Layer 0 and layer 1
+// keep their own eye's adapted rates, matching the per-layer resolve maps that
+// are built from the same eye maps.
+static id<MTLRasterizationRateMap> adaptLayeredPair(const EyeMap &left,
+                                                    const EyeMap &right,
+                                                    NSUInteger width,
+                                                    NSUInteger height) {
+  if (!left.map || !right.map || left.map.device != right.map.device ||
+      !width || !height)
+    return nil;
+  float lx[32], ly[32], rx[32], ry[32];
+  if (!sampleAdaptedRates(left.map, left.layer, lx, ly) ||
+      !sampleAdaptedRates(right.map, right.layer, rx, ry))
+    return nil;
+  const auto started = std::chrono::steady_clock::now();
+  auto l = [[MTLRasterizationRateLayerDescriptor alloc]
+      initWithSampleCount:MTLSizeMake(32, 32, 1)
+               horizontal:lx
+                 vertical:ly];
+  auto r = [[MTLRasterizationRateLayerDescriptor alloc]
+      initWithSampleCount:MTLSizeMake(32, 32, 1)
+               horizontal:rx
+                 vertical:ry];
+  MTLRasterizationRateLayerDescriptor *layers[2] = {l, r};
+  auto descriptor = [MTLRasterizationRateMapDescriptor
+      rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake(width, height, 1)
+                                        layerCount:2
+                                            layers:layers];
+  auto result =
+      [left.map.device newRasterizationRateMapWithDescriptor:descriptor];
+  mapAdaptations.fetch_add(1);
+  mapAdaptNanoseconds.fetch_add(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - started)
+          .count());
+  return result;
+}
+
+// Rebuilds the cached layered scene map and the per-layer resolve adaptations
+// whenever either eye map, its layer, or the target size changes.
+static bool refreshLayered(EyeTarget &entry,
+                           const std::array<EyeMap, 2> &eyes, uint32_t width,
+                           uint32_t height, id<MTLDevice> device) {
+  bool current = entry.layeredMap && entry.layeredWidth == width &&
+                 entry.layeredHeight == height;
+  for (unsigned l = 0; l < 2; ++l)
+    current &= entry.layeredSource[l] == eyes[l].map &&
+               entry.layeredSourceLayer[l] == eyes[l].layer;
+  if (current)
+    return true;
+  auto map = adaptLayeredPair(eyes[0], eyes[1], width, height);
+  if (!map)
+    return false;
+  auto parameters =
+      [device newBufferWithLength:map.parameterBufferSizeAndAlign.size
+                          options:MTLResourceStorageModeShared];
+  if (!parameters)
+    return false;
+  [map copyParameterDataToBuffer:parameters offset:0];
+  for (unsigned l = 0; l < 2; ++l) {
+    auto single = adaptMap(eyes[l].map, eyes[l].layer, width, height);
+    if (!single)
+      return false;
+    auto buffer =
+        [device newBufferWithLength:single.parameterBufferSizeAndAlign.size
+                            options:MTLResourceStorageModeShared];
+    if (!buffer)
+      return false;
+    [single copyParameterDataToBuffer:buffer offset:0];
+    entry.layerParameters[l] = buffer;
+    entry.layerPhysical[l] = [single physicalSizeForLayer:0];
+    // Same logical-extent clamp as the single-slice path.
+    const auto logicalEnd = [single
+        mapScreenToPhysicalCoordinates:(MTLCoordinate2D){float(width),
+                                                         float(height)}
+                              forLayer:0];
+    entry.layerBounds[l][0] = uint32_t(std::round(logicalEnd.x));
+    entry.layerBounds[l][1] = uint32_t(std::round(logicalEnd.y));
+    entry.layerBounds[l][2] = 0;
+    entry.layerBounds[l][3] = 0;
+  }
+  entry.layeredMap = map;
+  entry.layeredParameters = parameters;
+  entry.layeredWidth = width;
+  entry.layeredHeight = height;
+  for (unsigned l = 0; l < 2; ++l) {
+    entry.layeredSource[l] = eyes[l].map;
+    entry.layeredSourceLayer[l] = eyes[l].layer;
+  }
+  return true;
+}
+
 struct Pass {
   __strong id<MTLCommandBuffer> commands;
   __strong id<MTLTexture> color[8] = {}, compressedColor[8] = {}, depth = nil,
@@ -305,14 +450,23 @@ struct Pass {
   __strong id<MTLRasterizationRateMap> map;
   __strong id<MTLBuffer> parameters;
   __strong id<MTLRenderPipelineState> pipeline[8] = {}, loadPipeline[8] = {};
+  __strong id<MTLRenderPipelineState> depthPipeline = nil;
+  uint32_t bounds[4] = {};
   uint64_t token = 0;
+  // Layered stereo passes: the two-slice destination, and each layer's
+  // adaptation for the per-slice resolve.
+  bool layered = false;
+  __strong id<MTLTexture> layeredColor = nil, layeredDepth = nil;
+  __strong id<MTLBuffer> layerParameters[2] = {};
+  uint32_t layerBounds[2][4] = {};
 };
 thread_local std::unique_ptr<Pass> activePass;
 
 id<MTLRenderPipelineState> pipelineFor(id<MTLDevice> device,
                                        MTLPixelFormat color, bool depth,
                                        bool load = false,
-                                       bool stencil = false) {
+                                       bool stencil = false,
+                                       bool depthOnly = false) {
   // stateMutex protects the cache and shader/sampler publication.
   if (!resolveLibrary) {
     NSError *error = nil;
@@ -347,21 +501,35 @@ id<MTLRenderPipelineState> pipelineFor(id<MTLDevice> device,
             [device newDepthStencilStateWithDescriptor:depth];
       }
   }
-  NSNumber *key = @((uint64_t(color) << 3) | (uint64_t(stencil) << 2) |
-                    (uint64_t(load) << 1) | depth);
-  if (pipelines[key])
-    return pipelines[key];
+  const uint8_t flags = uint8_t((unsigned(depthOnly) << 4) |
+                                (unsigned(stencil) << 2) |
+                                (unsigned(load) << 1) | unsigned(depth));
+  for (auto &slot : pipelineSlots)
+    if (slot.state && slot.format == color && slot.flags == flags)
+      return slot.state;
+  NSNumber *key = @((uint64_t(color) << 5) | flags);
+  if (auto cached = pipelines[key]) {
+    for (auto &slot : pipelineSlots)
+      if (!slot.state) {
+        slot = {color, flags, cached};
+        break;
+      }
+    return cached;
+  }
   auto descriptor = [MTLRenderPipelineDescriptor new];
   descriptor.vertexFunction =
       [resolveLibrary newFunctionWithName:@"wvr_fov_resolve_vertex"];
   descriptor.fragmentFunction = [resolveLibrary
-      newFunctionWithName:stencil
-                              ? (load ? @"wvr_fov_load_stencil"
-                                      : @"wvr_fov_resolve_stencil")
-                              : (load ? (depth ? @"wvr_fov_load_depth"
-                                               : @"wvr_fov_load_color")
-                                      : (depth ? @"wvr_fov_resolve_depth"
-                                               : @"wvr_fov_resolve_color"))];
+      newFunctionWithName:depthOnly
+                              ? @"wvr_fov_resolve_depth_only"
+                              : (stencil
+                                     ? (load ? @"wvr_fov_load_stencil"
+                                             : @"wvr_fov_resolve_stencil")
+                                     : (load ? (depth ? @"wvr_fov_load_depth"
+                                                      : @"wvr_fov_load_color")
+                                             : (depth
+                                                    ? @"wvr_fov_resolve_depth"
+                                                    : @"wvr_fov_resolve_color")))];
   descriptor.colorAttachments[0].pixelFormat = color;
   descriptor.depthAttachmentPixelFormat =
       depth ? (stencil ? MTLPixelFormatDepth32Float_Stencil8
@@ -372,11 +540,31 @@ id<MTLRenderPipelineState> pipelineFor(id<MTLDevice> device,
   NSError *error = nil;
   auto result = [device newRenderPipelineStateWithDescriptor:descriptor
                                                        error:&error];
-  if (result)
+  if (result) {
     pipelines[key] = result;
-  else
+    for (auto &slot : pipelineSlots)
+      if (!slot.state) {
+        slot = {color, flags, result};
+        break;
+      }
+  } else {
     NSLog(@"[guest-foveation] resolve pipeline failed: %@", error);
+  }
   return result;
+}
+
+// Encoders copy descriptor state when they are created, so one descriptor per
+// thread serves the short-lived preload and resolve encoders. Every attachment
+// and the rate map are reset so no state leaks between uses.
+static MTLRenderPassDescriptor *scratchDescriptor() {
+  static thread_local __strong MTLRenderPassDescriptor *descriptor = nil;
+  if (!descriptor)
+    descriptor = [MTLRenderPassDescriptor new];
+  descriptor.rasterizationRateMap = nil;
+  descriptor.colorAttachments[0].texture = nil;
+  descriptor.depthAttachment.texture = nil;
+  descriptor.stencilAttachment.texture = nil;
+  return descriptor;
 }
 
 int bridgeDispatch(void *opaque) {
@@ -433,6 +621,8 @@ extern "C" int wvr_guest_foveation_install_v1(void) {
         !pipelineFor(device, format, true, true, true))
       return 0;
   }
+  if (!pipelineFor(device, MTLPixelFormatInvalid, true, false, false, true))
+    return 0;
   float fullRate = 1.0f;
   auto layer = [[MTLRasterizationRateLayerDescriptor alloc]
       initWithSampleCount:MTLSizeMake(1, 1, 1)
@@ -469,6 +659,7 @@ extern "C" void wvr_guest_foveation_reset_v1(void) {
   eyeMaps = {};
   targets = {};
   nextTarget = 0;
+  lastIdentityKnown = false;
 }
 extern "C" void wvr_guest_foveation_publish_maps_v1(void *left,
                                                     uint32_t leftLayer,
@@ -479,6 +670,9 @@ extern "C" void wvr_guest_foveation_publish_maps_v1(void *left,
                 CACurrentMediaTime()};
   eyeMaps[1] = {(__bridge id<MTLRasterizationRateMap>)right, rightLayer,
                 CACurrentMediaTime()};
+  // Maps are published once per frame, so this bounds the identity used for
+  // single eye-sized offscreen targets to the current frame.
+  lastIdentityKnown = false;
 }
 extern "C" void wvr_guest_foveation_register_eye_v1(uint32_t role, void *opaque,
                                                     uint32_t slice, uint32_t x,
@@ -517,7 +711,7 @@ extern "C" void wvr_guest_foveation_register_eye_v1(uint32_t role, void *opaque,
 // preload/resolve encoders are explicitly chained so an update on the final
 // encoder covers every attachment, including untracked guest resources.
 static id<MTLRenderCommandEncoder> preloadEncoder(Pass &pass, unsigned index) {
-  auto d = [MTLRenderPassDescriptor new];
+  auto d = scratchDescriptor();
   d.rasterizationRateMap = pass.map;
   d.colorAttachments[0].texture = pass.compressedColor[index];
   d.colorAttachments[0].loadAction = MTLLoadActionDontCare;
@@ -559,31 +753,57 @@ static void encodeCopy(Pass &pass, id<MTLRenderCommandEncoder> encoder,
   [encoder setFragmentSamplerState:linearSampler atIndex:0];
   [encoder setFragmentSamplerState:pointSampler atIndex:1];
   [encoder setFragmentBuffer:pass.parameters offset:0 atIndex:0];
-  const auto physical = [pass.map physicalSizeForLayer:0];
-  const auto seam = [pass.map
-      mapScreenToPhysicalCoordinates:(MTLCoordinate2D){
-                                         float(pass.request.width / 2), 0}
-                            forLayer:0];
-  const auto logicalEnd =
-      [pass.map mapScreenToPhysicalCoordinates:(MTLCoordinate2D){
-                                                   float(pass.request.width),
-                                                   float(pass.request.height)}
-                                      forLayer:0];
-  // physicalSizeForLayer includes tile padding that the scene never rasterizes.
-  // Clamp reconstruction to pixel centers actually covered by the logical
-  // image.
-  uint32_t bounds[4] = {uint32_t(std::round(logicalEnd.x)),
-                        uint32_t(std::round(logicalEnd.y)),
-                        pass.atlas ? pass.request.width / 2 : 0,
-                        pass.atlas ? uint32_t(std::round(seam.x)) : 0};
-  [encoder setFragmentBytes:bounds length:sizeof(bounds) atIndex:1];
+  // Bounds come from the per-map cache. They clamp reconstruction to pixel
+  // centers covered by the logical image, excluding physical tile padding.
+  [encoder setFragmentBytes:pass.bounds length:sizeof(pass.bounds) atIndex:1];
   [encoder setViewport:(MTLViewport){0, 0, double(pass.request.width),
                                      double(pass.request.height), 0, 1}];
   [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 }
+static void encodeDepthCopy(Pass &pass, id<MTLRenderCommandEncoder> encoder) {
+  [encoder setRenderPipelineState:pass.depthPipeline];
+  [encoder setDepthStencilState:resolveStates[0][pass.request
+                                                     .depthStencilReadOnlyMask &
+                                                 3]];
+  [encoder setFragmentTexture:pass.compressedDepth atIndex:1];
+  [encoder setFragmentSamplerState:pointSampler atIndex:1];
+  [encoder setFragmentBuffer:pass.parameters offset:0 atIndex:0];
+  [encoder setFragmentBytes:pass.bounds length:sizeof(pass.bounds) atIndex:1];
+  [encoder setViewport:(MTLViewport){0, 0, double(pass.request.width),
+                                     double(pass.request.height), 0, 1}];
+  [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+}
+// One layer of the per-slice resolve. The compressed slice is sampled through
+// that layer's own adapted map, and the copy lands in the matching slice.
+static void encodeLayerCopy(Pass &pass, id<MTLRenderCommandEncoder> encoder,
+                            unsigned layer) {
+  [encoder setRenderPipelineState:pass.pipeline[0]];
+  if (pass.depth) {
+    [encoder setDepthStencilState:resolveStates[0][pass.request
+                                                     .depthStencilReadOnlyMask &
+                                                 3]];
+    [encoder setFragmentTexture:singleSlice(pass.compressedDepth, layer)
+                        atIndex:1];
+  }
+  [encoder setFragmentTexture:singleSlice(pass.compressedColor[0], layer)
+                      atIndex:0];
+  [encoder setFragmentSamplerState:linearSampler atIndex:0];
+  [encoder setFragmentSamplerState:pointSampler atIndex:1];
+  [encoder setFragmentBuffer:pass.layerParameters[layer] offset:0 atIndex:0];
+  [encoder setFragmentBytes:pass.layerBounds[layer]
+                     length:sizeof(pass.layerBounds[layer])
+                    atIndex:1];
+  [encoder setViewport:(MTLViewport){0, 0, double(pass.request.width),
+                                     double(pass.request.height), 0, 1}];
+  [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+}
+
+// Legacy 492-byte requests are accepted. The layer count is read only from
+// the 496-byte version.
 extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
   if (!r || r->abiVersion != WVR_GUEST_FOVEATION_ABI ||
-      r->structSize != sizeof(*r))
+      (r->structSize != WVR_GUEST_FOVEATION_PASS_V1_LEGACY_SIZE &&
+       r->structSize != sizeof(*r)))
     return -1;
   const auto suppliedEncoder = r->encoder;
   r->status = -1;
@@ -689,6 +909,67 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
         activePass->firstPreload >= 0)
       return -1;
     auto pass = std::move(activePass);
+    if (!pass->colorCount) {
+      // Depth-only: one resolve encoder, returned for DXMT to end.
+      auto d = scratchDescriptor();
+      d.depthAttachment.texture = pass->depth;
+      d.depthAttachment.loadAction =
+          (pass->request.depthStencilReadOnlyMask & 1) ? MTLLoadActionLoad
+                                                       : MTLLoadActionDontCare;
+      d.depthAttachment.storeAction = MTLStoreActionStore;
+      auto encoder = [pass->commands renderCommandEncoderWithDescriptor:d];
+      if (!encoder) {
+        wvr_compositor_request_session_exit_v1();
+        return -1;
+      }
+      encodeDepthCopy(*pass, encoder);
+      r->encoder = (uint64_t)(__bridge void *)encoder;
+      r->status = 0;
+      ++resolved;
+      return 0;
+    }
+    if (pass->layered) {
+      // Each layer resolves its compressed slice through that layer's own
+      // map into the matching destination slice. Layer 0 signals the chain
+      // fence and layer 1 waits on it, as the MRT resolve does.
+      id<MTLRenderCommandEncoder> encoder = nil;
+      for (unsigned layer = 0; layer < 2; ++layer) {
+        auto d = scratchDescriptor();
+        d.colorAttachments[0].texture = singleSlice(pass->layeredColor, layer);
+        d.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        d.colorAttachments[0].storeAction = MTLStoreActionStore;
+        if (pass->depth) {
+          d.depthAttachment.texture = singleSlice(pass->layeredDepth, layer);
+          d.depthAttachment.loadAction =
+              (pass->request.depthStencilReadOnlyMask & 1)
+                  ? MTLLoadActionLoad
+                  : MTLLoadActionDontCare;
+          d.depthAttachment.storeAction = MTLStoreActionStore;
+        }
+        if (!d.colorAttachments[0].texture ||
+            (pass->depth && !d.depthAttachment.texture)) {
+          wvr_compositor_request_session_exit_v1();
+          return -1;
+        }
+        encoder = [pass->commands renderCommandEncoderWithDescriptor:d];
+        if (!encoder) {
+          wvr_compositor_request_session_exit_v1();
+          return -1;
+        }
+        if (layer)
+          [encoder waitForFence:pass->chain
+                   beforeStages:MTLRenderStageVertex | MTLRenderStageFragment];
+        encodeLayerCopy(*pass, encoder, layer);
+        if (!layer) {
+          [encoder updateFence:pass->chain afterStages:MTLRenderStageFragment];
+          [encoder endEncoding];
+        }
+      }
+      r->encoder = (uint64_t)(__bridge void *)encoder;
+      r->status = 0;
+      ++resolved;
+      return 0;
+    }
     int last = -1;
     for (unsigned i = 0; i < pass->colorCount; ++i)
       if (pass->color[i])
@@ -697,7 +978,7 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
     for (unsigned index = 0; index < pass->colorCount; ++index) {
       if (!pass->color[index])
         continue;
-      auto d = [MTLRenderPassDescriptor new];
+      auto d = scratchDescriptor();
       d.colorAttachments[0].texture = pass->color[index];
       d.colorAttachments[0].loadAction = MTLLoadActionDontCare;
       d.colorAttachments[0].storeAction = MTLStoreActionStore;
@@ -739,20 +1020,45 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
     ++resolved;
     return 0; // DXMT signals its fences on the final resolve, then ends it.
   }
+  // Depth-only passes carry no colour (colorTexture and colorCount are zero).
+  const bool hasColor = r->colorTexture != 0;
+  // Version 496 carries arrayLength. Legacy requests are single-layer, so the
+  // field is read only when the caller supplied it.
+  const uint32_t arrayLength =
+      r->structSize == sizeof(*r) ? r->arrayLength : 1u;
+  const bool layered = arrayLength == 2;
   if (r->operation != 1 || activePass ||
       r->flags != WVR_GUEST_FOVEATION_SAFE_SHADER || !r->commandBuffer ||
-      !r->colorTexture || r->colorCount > 8 ||
-      r->depthStencilReadOnlyMask > 3) {
+      (!hasColor && (!r->depthTexture || r->colorCount)) || r->colorCount > 8 ||
+      r->depthStencilReadOnlyMask > 3 || (arrayLength != 1 && !layered) ||
+      (layered && !hasColor)) {
+    ++rejected;
+    return -1;
+  }
+  // Depth-only resolves do not preload depth or carry stencil.
+  if (!hasColor && (r->stencilTexture || r->depthLoad == MTLLoadActionLoad)) {
     ++rejected;
     return -1;
   }
   auto commands = (__bridge id<MTLCommandBuffer>)(void *)r->commandBuffer;
   auto pass = std::make_unique<Pass>();
   pass->commands = commands;
-  pass->request = *r;
-  pass->colorCount = r->colorCount ? r->colorCount : 1;
-  auto firstRoot = (__bridge id<MTLTexture>)(void *)r->colorTexture;
-  NSUInteger absoluteSlice = r->colorSlice;
+  // Copy only the caller's bytes: a legacy request is shorter than the struct.
+  std::memcpy(&pass->request, r, r->structSize);
+  pass->colorCount = hasColor ? (r->colorCount ? r->colorCount : 1) : 0;
+  pass->layered = layered;
+  // Layered passes take one colour target at slice 0, with no preload and no
+  // stencil. Anything else stays uniform.
+  if (layered && (pass->colorCount != 1 || r->stencilTexture || r->colorSlice ||
+                  r->colorLoad == MTLLoadActionLoad ||
+                  r->depthLoad == MTLLoadActionLoad)) {
+    ++rejected;
+    return -1;
+  }
+  auto firstRoot = hasColor
+      ? (__bridge id<MTLTexture>)(void *)r->colorTexture
+      : (__bridge id<MTLTexture>)(void *)r->depthTexture;
+  NSUInteger absoluteSlice = hasColor ? r->colorSlice : r->depthSlice;
   firstRoot = rootTexture(firstRoot, &absoluteSlice);
   for (unsigned i = 0; i < pass->colorCount; ++i) {
     auto handle = i ? r->additionalColors[i - 1].texture : r->colorTexture;
@@ -770,6 +1076,18 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
     }
     if (load == MTLLoadActionLoad && pass->firstPreload < 0)
       pass->firstPreload = int(i);
+  }
+  if (layered) {
+    // The two-slice destination stays whole so each layer resolves into its
+    // own slice.
+    auto texture = (__bridge id<MTLTexture>)(void *)r->colorTexture;
+    if (!firstRoot || texture.textureType != MTLTextureType2DArray ||
+        texture.arrayLength != 2 || texture.device != commands.device ||
+        absoluteSlice + 1 >= firstRoot.arrayLength) {
+      ++rejected;
+      return -1;
+    }
+    pass->layeredColor = texture;
   }
   pass->depth = singleSlice((__bridge id<MTLTexture>)(void *)r->depthTexture,
                             r->depthSlice);
@@ -806,6 +1124,15 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
     ++rejected;
     return -1;
   }
+  if (layered && depth) {
+    auto layeredDepth = (__bridge id<MTLTexture>)(void *)r->depthTexture;
+    if (r->depthSlice || layeredDepth.textureType != MTLTextureType2DArray ||
+        layeredDepth.arrayLength != 2) {
+      ++rejected;
+      return -1;
+    }
+    pass->layeredDepth = layeredDepth;
+  }
   if (depth &&
       (r->depthLoad == MTLLoadActionLoad ||
        (pass->stencil && r->stencilLoad == MTLLoadActionLoad)) &&
@@ -813,127 +1140,278 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
     pass->firstPreload = 0;
   std::lock_guard<std::mutex> lock(stateMutex);
   EyeTarget *entry = nullptr;
-  for (auto &target : targets)
-    if (target.root == firstRoot && target.slice == absoluteSlice) {
-      entry = &target;
-      break;
-    }
-  if (!entry) {
-    uint32_t matchedEyeWidth = 0, matchedEyeHeight = 0;
-    bool matchedAtlas = false;
-    for (const auto &existing : targets) {
-      if (!existing.root || existing.eyeWidth < 512 || existing.eyeHeight < 512)
-        continue;
-      if (existing.atlas && absoluteSlice == 0 &&
-          r->width == 2 * existing.eyeWidth &&
-          r->height == existing.eyeHeight) {
-        matchedEyeWidth = existing.eyeWidth;
-        matchedEyeHeight = existing.eyeHeight;
-        matchedAtlas = true;
+  MTLSize size{};
+  if (layered) {
+    // The pair occupies slice s for role 0 and slice s+1 for role 1 of one root.
+    for (auto &target : targets)
+      if (target.root == firstRoot && target.slice == absoluteSlice &&
+          target.role == 0 && !target.derived && !target.atlas &&
+          target.eyeWidth >= 512 &&
+          eyeSizeMatches(r->width, r->height, target.eyeWidth,
+                         target.eyeHeight)) {
+        entry = &target;
         break;
       }
-      if (!existing.atlas && firstRoot.arrayLength >= 2 && absoluteSlice < 2 &&
-          r->width == existing.eyeWidth && r->height == existing.eyeHeight) {
-        matchedEyeWidth = existing.eyeWidth;
-        matchedEyeHeight = existing.eyeHeight;
-        matchedAtlas = false;
+    bool paired = false;
+    if (entry)
+      for (const auto &other : targets)
+        paired |= other.root == firstRoot &&
+                  other.slice == absoluteSlice + 1 && other.role == 1 &&
+                  !other.derived && !other.atlas &&
+                  other.eyeWidth == entry->eyeWidth &&
+                  other.eyeHeight == entry->eyeHeight;
+    if (!entry || !paired) {
+      ++unmatchedTargets;
+      ++rejected;
+      return -1;
+    }
+    const auto now = CACurrentMediaTime();
+    if (!eyeMaps[0].map || !eyeMaps[1].map ||
+        now - eyeMaps[0].published > 0.025 ||
+        now - eyeMaps[1].published > 0.025) {
+      ++staleMaps;
+      ++rejected;
+      return -1;
+    }
+    if (!refreshLayered(*entry, eyeMaps, r->width, r->height,
+                        commands.device)) {
+      ++rejected;
+      return -1;
+    }
+    pass->map = entry->layeredMap;
+    pass->parameters = entry->layeredParameters;
+    pass->layerParameters[0] = entry->layerParameters[0];
+    pass->layerParameters[1] = entry->layerParameters[1];
+    std::memcpy(pass->layerBounds, entry->layerBounds,
+                sizeof(pass->layerBounds));
+    size = MTLSizeMake(
+        std::max(entry->layerPhysical[0].width, entry->layerPhysical[1].width),
+        std::max(entry->layerPhysical[0].height,
+                 entry->layerPhysical[1].height),
+        1);
+    if (!pass->map || !pass->parameters || !pass->layerParameters[0] ||
+        !pass->layerParameters[1]) {
+      ++rejected;
+      return -1;
+    }
+    if (!size.width || !size.height ||
+        size.width * size.height >= uint64_t(r->width) * r->height) {
+      ++rejected;
+      return -1;
+    }
+  } else {
+    for (auto &target : targets)
+      if (target.root == firstRoot && target.slice == absoluteSlice) {
+        entry = &target;
         break;
       }
+    if (entry && entry->singleEye) {
+      // A single eye-sized offscreen target follows the latest eye identity.
+      if (!lastIdentityKnown) {
+        ++unmatchedTargets;
+        ++rejected;
+        return -1;
+      }
+      entry->role = lastIdentityRole;
+    } else if (entry && !entry->derived && !entry->atlas) {
+      lastIdentityRole = entry->role;
+      lastIdentityKnown = true;
     }
-    if (matchedEyeWidth && matchedEyeHeight) {
-      if (matchedAtlas) {
-        for (uint32_t role : {0u, 1u}) {
+    if (!entry) {
+      uint32_t matchedEyeWidth = 0, matchedEyeHeight = 0;
+      bool matchedAtlas = false, matchedSingle = false;
+      for (const auto &existing : targets) {
+        if (!existing.root || existing.derived || existing.eyeWidth < 512 ||
+            existing.eyeHeight < 512)
+          continue;
+        if (existing.atlas) {
+          if (absoluteSlice == 0 && r->width == 2 * existing.eyeWidth &&
+              r->height == existing.eyeHeight) {
+            matchedEyeWidth = existing.eyeWidth;
+            matchedEyeHeight = existing.eyeHeight;
+            matchedAtlas = true;
+            break;
+          }
+          continue;
+        }
+        if (firstRoot.arrayLength >= 2 && absoluteSlice < 2 &&
+            eyeSizeMatches(r->width, r->height, existing.eyeWidth,
+                           existing.eyeHeight)) {
+          matchedEyeWidth = existing.eyeWidth;
+          matchedEyeHeight = existing.eyeHeight;
+          matchedAtlas = false;
+          break;
+        }
+        if (firstRoot.arrayLength == 1 && absoluteSlice == 0 &&
+            lastIdentityKnown &&
+            eyeSizeMatches(r->width, r->height, existing.eyeWidth,
+                           existing.eyeHeight)) {
+          matchedEyeWidth = existing.eyeWidth;
+          matchedEyeHeight = existing.eyeHeight;
+          matchedAtlas = false;
+          matchedSingle = true;
+          break;
+        }
+      }
+      if (matchedEyeWidth && matchedEyeHeight) {
+        if (matchedAtlas) {
+          for (uint32_t role : {0u, 1u}) {
+            auto &slot = targets[nextTarget++ % targets.size()];
+            slot = EyeTarget{};
+            slot.root = firstRoot;
+            slot.role = role;
+            slot.slice = 0;
+            slot.eyeWidth = matchedEyeWidth;
+            slot.eyeHeight = matchedEyeHeight;
+            slot.atlas = true;
+            slot.derived = true;
+            if (role == 0)
+              entry = &slot;
+          }
+        } else {
           auto &slot = targets[nextTarget++ % targets.size()];
           slot = EyeTarget{};
           slot.root = firstRoot;
-          slot.role = role;
-          slot.slice = 0;
+          slot.role = matchedSingle ? lastIdentityRole : uint32_t(absoluteSlice);
+          slot.slice = uint32_t(absoluteSlice);
           slot.eyeWidth = matchedEyeWidth;
           slot.eyeHeight = matchedEyeHeight;
-          slot.atlas = true;
-          if (role == 0)
-            entry = &slot;
+          slot.atlas = false;
+          slot.derived = true;
+          slot.singleEye = matchedSingle;
+          entry = &slot;
         }
-      } else {
-        auto &slot = targets[nextTarget++ % targets.size()];
-        slot = EyeTarget{};
-        slot.root = firstRoot;
-        slot.role = uint32_t(absoluteSlice);
-        slot.slice = uint32_t(absoluteSlice);
-        slot.eyeWidth = matchedEyeWidth;
-        slot.eyeHeight = matchedEyeHeight;
-        slot.atlas = false;
-        entry = &slot;
+      }
+      // Eye-like targets that match no eye size or scale reuse the reference
+      // eye's rates at their own size. The reference is the most recent eye-0
+      // map, or the last identity-matched eye when one is known. The adapted
+      // map is cached on the target entry, so it is rebuilt only on resize.
+      if (!entry && firstRoot.arrayLength == 1 && absoluteSlice == 0 &&
+          (firstRoot.usage & MTLTextureUsageRenderTarget) != 0) {
+        const uint32_t reference = lastIdentityKnown ? lastIdentityRole : 0;
+        const EyeTarget *eyeRef = nullptr;
+        for (const auto &existing : targets)
+          if (existing.root && !existing.derived && !existing.atlas &&
+              existing.role == reference && existing.eyeWidth >= 512 &&
+              existing.eyeHeight >= 512) {
+            eyeRef = &existing;
+            break;
+          }
+        if (eyeRef) {
+          const uint32_t refWidth = eyeRef->eyeWidth,
+                         refHeight = eyeRef->eyeHeight;
+          const double refAspect = double(refWidth) / refHeight;
+          const double aspect = double(r->width) / r->height;
+          const bool eyeLike =
+              std::fabs(aspect / refAspect - 1.0) <= 0.02 &&
+              r->width >= 0.25 * refWidth && r->width <= 2.0 * refWidth &&
+              r->height >= 0.25 * refHeight && r->height <= 2.0 * refHeight;
+          if (eyeLike) {
+            auto &slot = targets[nextTarget++ % targets.size()];
+            slot = EyeTarget{};
+            slot.root = firstRoot;
+            slot.role = reference;
+            slot.slice = uint32_t(absoluteSlice);
+            slot.eyeWidth = refWidth;
+            slot.eyeHeight = refHeight;
+            slot.derived = true;
+            entry = &slot;
+            ++anySizeTargets;
+          }
+        }
       }
     }
-  }
-  if (!entry) {
-    ++unmatchedTargets;
-    ++rejected;
-    return -1;
-  }
-  if (!eyeMaps[entry->role].map ||
-      CACurrentMediaTime() - eyeMaps[entry->role].published > 0.025) {
-    ++staleMaps;
-    ++rejected;
-    return -1;
-  }
-  const auto &eye = eyeMaps[entry->role];
-  const auto &right = eyeMaps[1];
-  if (entry->atlas) {
-    bool paired = false;
-    for (const auto &other : targets)
-      paired |= other.root == firstRoot && other.slice == absoluteSlice &&
-                other.atlas && other.role != entry->role &&
-                other.eyeWidth == entry->eyeWidth &&
-                other.eyeHeight == entry->eyeHeight;
-    if (!paired || r->width != 2 * entry->eyeWidth ||
-        r->height != entry->eyeHeight || !eyeMaps[0].map || !right.map ||
-        CACurrentMediaTime() - eyeMaps[0].published > 0.025 ||
-        CACurrentMediaTime() - right.published > 0.025) {
+    if (!entry) {
+      ++unmatchedTargets;
+      ++rejected;
+      return -1;
+    }
+    if (!eyeMaps[entry->role].map ||
+        CACurrentMediaTime() - eyeMaps[entry->role].published > 0.025) {
+      ++staleMaps;
+      ++rejected;
+      return -1;
+    }
+    const auto &eye = eyeMaps[entry->role];
+    const auto &right = eyeMaps[1];
+    if (entry->atlas) {
+      bool paired = false;
+      for (const auto &other : targets)
+        paired |= other.root == firstRoot && other.slice == absoluteSlice &&
+                  other.atlas && other.role != entry->role &&
+                  other.eyeWidth == entry->eyeWidth &&
+                  other.eyeHeight == entry->eyeHeight;
+      if (!paired || r->width != 2 * entry->eyeWidth ||
+          r->height != entry->eyeHeight || !eyeMaps[0].map || !right.map ||
+          CACurrentMediaTime() - eyeMaps[0].published > 0.025 ||
+          CACurrentMediaTime() - right.published > 0.025) {
+        ++rejected;
+        return -1;
+      }
+    }
+    const auto &left = entry->atlas ? eyeMaps[0] : eye;
+    if (entry->sourceMap != left.map || entry->mapLayer != left.layer ||
+        (entry->atlas && (entry->rightSourceMap != right.map ||
+                          entry->rightMapLayer != right.layer)) ||
+        entry->adaptedMap.screenSize.width != r->width ||
+        entry->adaptedMap.screenSize.height != r->height) {
+      entry->adaptedMap =
+          entry->atlas
+              ? adaptStereoAtlas(left, right, entry->eyeWidth, entry->eyeHeight)
+              : adaptMap(left.map, left.layer, r->width, r->height);
+      entry->sourceMap = left.map;
+      entry->mapLayer = left.layer;
+      entry->rightSourceMap = entry->atlas ? right.map : nil;
+      entry->rightMapLayer = right.layer;
+      entry->parameters =
+          entry->adaptedMap
+              ? [commands.device
+                    newBufferWithLength:entry->adaptedMap
+                                            .parameterBufferSizeAndAlign.size
+                                options:MTLResourceStorageModeShared]
+              : nil;
+      if (entry->parameters)
+        [entry->adaptedMap copyParameterDataToBuffer:entry->parameters offset:0];
+      entry->physicalSize = entry->adaptedMap
+          ? [entry->adaptedMap physicalSizeForLayer:0]
+          : MTLSize{};
+      if (entry->adaptedMap) {
+        // physicalSizeForLayer includes tile padding that the scene never
+        // rasterizes. Clamp reconstruction to pixel centers actually covered by
+        // the logical image.
+        const auto seam = [entry->adaptedMap
+            mapScreenToPhysicalCoordinates:(MTLCoordinate2D){
+                                               float(r->width / 2), 0}
+                                  forLayer:0];
+        const auto logicalEnd = [entry->adaptedMap
+            mapScreenToPhysicalCoordinates:(MTLCoordinate2D){float(r->width),
+                                                             float(r->height)}
+                                  forLayer:0];
+        entry->bounds[0] = uint32_t(std::round(logicalEnd.x));
+        entry->bounds[1] = uint32_t(std::round(logicalEnd.y));
+        entry->bounds[2] = entry->atlas ? r->width / 2 : 0;
+        entry->bounds[3] = entry->atlas ? uint32_t(std::round(seam.x)) : 0;
+      }
+    }
+    pass->atlas = entry->atlas;
+    pass->map = entry->adaptedMap;
+    pass->parameters = entry->parameters;
+    if (!pass->map || !pass->parameters) {
+      ++rejected;
+      return -1;
+    }
+    std::memcpy(pass->bounds, entry->bounds, sizeof(pass->bounds));
+    size = entry->physicalSize;
+    if (!size.width || !size.height ||
+        size.width * size.height >= uint64_t(r->width) * r->height) {
       ++rejected;
       return -1;
     }
   }
-  const auto &left = entry->atlas ? eyeMaps[0] : eye;
-  if (entry->sourceMap != left.map || entry->mapLayer != left.layer ||
-      (entry->atlas && (entry->rightSourceMap != right.map ||
-                        entry->rightMapLayer != right.layer)) ||
-      entry->adaptedMap.screenSize.width != r->width ||
-      entry->adaptedMap.screenSize.height != r->height) {
-    entry->adaptedMap =
-        entry->atlas
-            ? adaptStereoAtlas(left, right, entry->eyeWidth, entry->eyeHeight)
-            : adaptMap(left.map, left.layer, r->width, r->height);
-    entry->sourceMap = left.map;
-    entry->mapLayer = left.layer;
-    entry->rightSourceMap = entry->atlas ? right.map : nil;
-    entry->rightMapLayer = right.layer;
-    entry->parameters =
-        entry->adaptedMap
-            ? [commands.device
-                  newBufferWithLength:entry->adaptedMap
-                                          .parameterBufferSizeAndAlign.size
-                              options:MTLResourceStorageModeShared]
-            : nil;
-    if (entry->parameters)
-      [entry->adaptedMap copyParameterDataToBuffer:entry->parameters offset:0];
-  }
-  pass->atlas = entry->atlas;
-  pass->map = entry->adaptedMap;
-  pass->parameters = entry->parameters;
-  if (!pass->map || !pass->parameters) {
-    ++rejected;
-    return -1;
-  }
-  const auto size = [pass->map physicalSizeForLayer:0];
-  if (!size.width || !size.height ||
-      size.width * size.height >= uint64_t(r->width) * r->height) {
-    ++rejected;
-    return -1;
-  }
   pass->scene = [MTLRenderPassDescriptor new];
   pass->scene.rasterizationRateMap = pass->map;
+  if (layered)
+    pass->scene.renderTargetArrayLength = 2;
   unsigned firstColor = 0;
   while (firstColor < pass->colorCount && !pass->color[firstColor])
     ++firstColor;
@@ -970,8 +1448,13 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
     td.storageMode = MTLStorageModePrivate;
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                MTLTextureUsagePixelFormatView;
+    if (layered) {
+      td.textureType = MTLTextureType2DArray;
+      td.arrayLength = 2;
+    }
     if (!cached || cached.width < size.width || cached.height < size.height ||
-        cached.pixelFormat != color.pixelFormat)
+        cached.pixelFormat != color.pixelFormat ||
+        cached.arrayLength != (layered ? 2u : 1u))
       entry->scratchColor[i] = [commands.device newTextureWithDescriptor:td];
     pass->compressedColor[i] = entry->scratchColor[i];
     if (!pass->compressedColor[i])
@@ -988,6 +1471,14 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
                 sizeof(clear));
     a.clearColor = MTLClearColorMake(clear[0], clear[1], clear[2], clear[3]);
   }
+  if (!hasColor) {
+    pass->depthPipeline = pipelineFor(commands.device, MTLPixelFormatInvalid,
+                                      true, false, false, true);
+    if (!pass->depthPipeline) {
+      ++rejected;
+      return -1;
+    }
+  }
   if (depth) {
     auto cached = entry->scratchDepth;
     auto td = [MTLTextureDescriptor
@@ -998,8 +1489,13 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
     td.storageMode = MTLStorageModePrivate;
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                MTLTextureUsagePixelFormatView;
+    if (layered) {
+      td.textureType = MTLTextureType2DArray;
+      td.arrayLength = 2;
+    }
     if (!cached || cached.width < size.width || cached.height < size.height ||
-        cached.pixelFormat != depth.pixelFormat)
+        cached.pixelFormat != depth.pixelFormat ||
+        cached.arrayLength != (layered ? 2u : 1u))
       entry->scratchDepth = [commands.device newTextureWithDescriptor:td];
     pass->compressedDepth = entry->scratchDepth;
     if (!pass->compressedDepth)
@@ -1019,12 +1515,14 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
     pass->scene.depthAttachment.storeAction = MTLStoreActionStore;
     pass->scene.depthAttachment.clearDepth = r->clearDepth;
   }
-  if (pass->firstPreload >= 0 || pass->colorCount > 1) {
+  // Layered resolves chain their two encoders with a fence, as MRT does.
+  if (pass->firstPreload >= 0 || pass->colorCount > 1 || layered) {
     pass->chain = [commands.device newFence];
     if (!pass->chain)
       return -1;
   }
-  if (CACurrentMediaTime() - eye.published > 0.025) {
+  if (CACurrentMediaTime() - eyeMaps[layered ? 0 : entry->role].published >
+      0.025) {
     ++rejected;
     return -1;
   }
@@ -1041,6 +1539,8 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
   r->status = 0;
   activePass = std::move(pass);
   ++begun;
+  if (layered)
+    ++layeredBegun;
   if (entry->atlas)
     ++atlasBegun;
   sceneDraws.fetch_add(r->drawCalls);
@@ -1060,7 +1560,8 @@ extern "C" int wvr_guest_foveation_copy_stats_v1(char *buffer,
       "unmatchedTargets=%llu staleMaps=%llu mapAreaRatio=%.3f "
       "systemMaps=per-eye maxAgeMs=25 adaptations=%llu meanAdaptCPUms=%.3f "
       "atlas=%llu bridgeCalls=%llu capabilities=%llu uniform=%llu "
-      "eventNotifications=%llu sliceViewHits=%llu sliceViewCreates=%llu",
+      "eventNotifications=%llu sliceViewHits=%llu sliceViewCreates=%llu "
+      "layeredBegun=%llu anySizeTargets=%llu",
       (unsigned long long)begun.load(), (unsigned long long)resolved.load(),
       (unsigned long long)rejected.load(),
       (unsigned long long)sceneDraws.load(),
@@ -1077,6 +1578,8 @@ extern "C" int wvr_guest_foveation_copy_stats_v1(char *buffer,
       (unsigned long long)uniformBindings.load(),
       (unsigned long long)progressNotifications.load(),
       (unsigned long long)sliceViewHits.load(std::memory_order_relaxed),
-      (unsigned long long)sliceViewCreates.load(std::memory_order_relaxed));
+      (unsigned long long)sliceViewCreates.load(std::memory_order_relaxed),
+      (unsigned long long)layeredBegun.load(),
+      (unsigned long long)anySizeTargets.load());
   return 1;
 }

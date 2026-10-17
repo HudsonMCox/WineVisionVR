@@ -415,7 +415,17 @@ enum MadeiraDock {
     }
 
     /// The host's environment for one launch.
+    /// Internal Steam host settings stay outside imported manifest environments.
+    static func extraLaunchArguments(appID: Int) -> String? {
+        appID == 386690 ? "-vrmode openvr" : nil
+    }
+
     @MainActor static func configure(_ game: DockGame, launchOption: UInt32 = 0) {
+        if let arguments = extraLaunchArguments(appID: game.id) {
+            setenv("MADEIRA_STEAM_HOST_EXTRA_ARGS", arguments, 1)
+        } else {
+            unsetenv("MADEIRA_STEAM_HOST_EXTRA_ARGS")
+        }
         // WineProcessBridge uses this to suppress its legacy fixed game identity.
         // Valve's client supplies the selected game's identity to its child.
         setenv("MADEIRA_DOCK_SESSION", "1", 1)

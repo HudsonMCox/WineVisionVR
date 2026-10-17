@@ -11,6 +11,7 @@ OUTPUT_ROOT="${AVPPLAY_PREFIX_OUTPUT_ROOT:-$BUILD_ROOT/artifact}"
 WINE_BIN="${AVPPLAY_PREFIX_WINE_BIN:-}"
 WINEBOOT_BIN="${AVPPLAY_PREFIX_WINEBOOT_BIN:-}"
 SNAPSHOT_SCRIPT="$MADEIRA/tools/build-prefix-snapshot.sh"
+SNAPSHOT_PATCH="$ROOT/windows-vr-tools/patches/0002-prefix-temporary-directory.patch"
 
 for value in "$MADEIRA" "$BUILD_ROOT" "$WINE_BUILD_ROOT" "$OUTPUT_ROOT"; do
     [[ "$value" == /* ]] || { echo "All prefix source/build/output paths must be absolute." >&2; exit 2; }
@@ -69,6 +70,10 @@ mkdir "$INVOCATION"
 mkdir -p "$INVOCATION/tools" "$INVOCATION/app/Madeira"
 cp "$SNAPSHOT_SCRIPT" "$INVOCATION/tools/build-prefix-snapshot.sh"
 cmp -s "$SNAPSHOT_SCRIPT" "$INVOCATION/tools/build-prefix-snapshot.sh" || { echo "Could not preserve the pinned prefix script byte-for-byte." >&2; exit 1; }
+# Keep the pinned input untouched. Adapt only the private invocation's scratch
+# path so TMPDIR can place prefix initialization on the external build volume.
+# Both the original and invoked script hashes are recorded in provenance.
+patch -p1 -d "$INVOCATION" < "$SNAPSHOT_PATCH"
 
 echo "Running pinned Madeira prefix creation script with $wine_version"
 (
@@ -84,9 +89,10 @@ python3 "$ROOT/windows-vr-tools/sanitize_prefix_snapshot.py" \
     --receipt "$OUTPUT_ROOT/prefix-portability-receipt.json"
 
 python3 - "$SNAPSHOT_SCRIPT" "$OUTPUT_ROOT/prefix-template.tar.gz" "$OUTPUT_ROOT/prefix-template-provenance.json" \
-    "$expected_madeira" "$actual_wine" "$wine_version" "$WINE_BIN" "$WINEBOOT_BIN" "$wine_real" "$wineboot_real" "$BUILD_RECEIPT" "$OUTPUT_ROOT/prefix-portability-receipt.json" <<'PY'
+    "$expected_madeira" "$actual_wine" "$wine_version" "$WINE_BIN" "$WINEBOOT_BIN" "$wine_real" "$wineboot_real" "$BUILD_RECEIPT" "$OUTPUT_ROOT/prefix-portability-receipt.json" \
+    "$INVOCATION/tools/build-prefix-snapshot.sh" "$SNAPSHOT_PATCH" <<'PY'
 import hashlib, json, os, pathlib, platform, sys
-script, archive, out, madeira, wine_rev, version, wine, wineboot, wine_real, wineboot_real, build_receipt, portability = sys.argv[1:]
+script, archive, out, madeira, wine_rev, version, wine, wineboot, wine_real, wineboot_real, build_receipt, portability, invocation, adaptation = sys.argv[1:]
 def sha(path):
     h = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -107,6 +113,10 @@ payload = {
     "winebootBinary": str(pathlib.Path(wineboot).absolute()),
     "winebootBinaryResolved": wineboot_real,
     "snapshotScriptSha256": sha(script),
+    "snapshotInvocationScriptSha256": sha(invocation),
+    "snapshotAdaptation": "windows-vr-tools/patches/0002-prefix-temporary-directory.patch",
+    "snapshotAdaptationSha256": sha(adaptation),
+    "temporaryDirectoryRoot": os.environ.get("TMPDIR", "/tmp"),
     "hostArchitecture": platform.machine(),
     "archiveSha256": sha(archive),
     "wineHostBuildReceiptSha256": sha(build_receipt),

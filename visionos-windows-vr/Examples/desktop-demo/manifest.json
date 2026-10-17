@@ -1,0 +1,10 @@
+{
+  "id": "winevision.desktop-demo",
+  "title": "Windows desktop test",
+  "executableRelativePath": "desktop-demo.exe",
+  "backend": "windowsWineFEX",
+  "graphics": "direct3D11",
+  "launchArguments": [],
+  "presentation": "desktop",
+  "schemaVersion": 1
+}

@@ -1,0 +1,65 @@
+diff --git a/OpenOVR/Compositor/dx11compositor.cpp b/OpenOVR/Compositor/dx11compositor.cpp
+--- a/OpenOVR/Compositor/dx11compositor.cpp
++++ b/OpenOVR/Compositor/dx11compositor.cpp
+@@ -159,6 +159,12 @@
+ 
+ 	resolvedMSAATextures.clear();
+ 
++	if (quad_texture_view) {
++		quad_texture_view->Release();
++		quad_texture_view = nullptr;
++	}
++	cached_srv_source = nullptr;
++
+ 	if (boundsUniform) boundsUniform->Release();
+ 	if (boundsContext) boundsContext->Release();
+ 	context->Release();
+@@ -226,6 +232,12 @@
+ 			tex->Release();
+ 
+ 		resolvedMSAATextures.clear();
++
++		if (quad_texture_view) {
++			quad_texture_view->Release();
++			quad_texture_view = nullptr;
++		}
++		cached_srv_source = nullptr;
+ 
+ 		// Figure out what format we need to use
+ 		DxgiFormatInfo info = {};
+@@ -381,7 +393,12 @@
+ 		srv.Format = static_cast<DXGI_FORMAT>(createInfo.format);
+ 		srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+ 		srv.Texture2D.MipLevels = 1;
+-		OOVR_FAILED_DX_ABORT(device->CreateShaderResourceView(sampleTexture, &srv, &quad_texture_view));
++		if (sampleTexture != cached_srv_source || !quad_texture_view) {
++			if (quad_texture_view) quad_texture_view->Release();
++			quad_texture_view = nullptr;
++			OOVR_FAILED_DX_ABORT(device->CreateShaderResourceView(sampleTexture, &srv, &quad_texture_view));
++			cached_srv_source = sampleTexture;
++		}
+ 		D3D11_MAPPED_SUBRESOURCE mapped{};
+ 		OOVR_FAILED_DX_ABORT(boundsContext->Map(boundsUniform, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
+ 		std::memcpy(mapped.pData, &uv, sizeof(uv));
+@@ -401,8 +418,6 @@
+ 		OOVR_FAILED_DX_ABORT(boundsContext->FinishCommandList(FALSE, &commands));
+ 		context->ExecuteCommandList(commands, TRUE);
+ 		commands->Release();
+-		quad_texture_view->Release();
+-		quad_texture_view = nullptr;
+ 	} else {
+ 		// Apparently SteamVR supports apps just sending array textures without specifying what's what.
+ 		const int arrayIndex = (srcDesc.ArraySize > 1 && eye.has_value()) ? static_cast<int>(*eye) : 0;
+diff --git a/OpenOVR/Compositor/dx11compositor.h b/OpenOVR/Compositor/dx11compositor.h
+--- a/OpenOVR/Compositor/dx11compositor.h
++++ b/OpenOVR/Compositor/dx11compositor.h
+@@ -30,7 +30,8 @@
+ 	ID3D11Device* device = nullptr;
+ 	ID3D11DeviceContext* context = nullptr;
+ 
+-	ID3D11ShaderResourceView* quad_texture_view;
++	ID3D11ShaderResourceView* quad_texture_view = nullptr;
++	ID3D11Texture2D* cached_srv_source = nullptr;
+ 	ID3D11SamplerState* quad_sampleState;
+ 	ID3D11VertexShader* fs_vshader;
+ 	ID3D11PixelShader* fs_pshader;

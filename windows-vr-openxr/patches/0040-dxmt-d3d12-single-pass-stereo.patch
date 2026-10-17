@@ -1,0 +1,1111 @@
+diff --git a/src/airconv/airconv_public.h b/src/airconv/airconv_public.h
+index 31a4d3d..c999b26 100644
+--- a/src/airconv/airconv_public.h
++++ b/src/airconv/airconv_public.h
+@@ -34,6 +34,8 @@ enum SM50_BINDING_INDEX: uint32_t {
+   /* per-eye tables for vertex amplification (stereo) */
+   SM50_BINDING_INDEX_ARGUMENT_TABLE_EYE1 = 8,
+   SM50_BINDING_INDEX_CONSTANT_BUFFER_EYE1 = 9,
++  /* eye 1 root arguments for vertex amplification (stereo) with a root signature */
++  SM50_BINDING_INDEX_ROOT_ARGUMENTS_EYE1 = 10,
+ 
+   SM50_BINDING_INDEX_ROOT_ARGUMENTS = 0,
+   SM50_BINDING_INDEX_STATIC_SAMPLERS = 1,
+diff --git a/src/airconv/dxbc_binding_rootsig.cpp b/src/airconv/dxbc_binding_rootsig.cpp
+index 1808d84..105fe98 100644
+--- a/src/airconv/dxbc_binding_rootsig.cpp
++++ b/src/airconv/dxbc_binding_rootsig.cpp
+@@ -29,11 +29,23 @@ using namespace llvm::air;
+ 
+ class RootSignatureBindingMap : public BindingMap {
+ public:
++  /* stereo: the root arguments of the eye being rendered, chosen by the amplification id */
+   llvm::Value *
+-  GetArgument(llvm::air::AIRBuilder &AIR, uint32_t TableIndex, uint32_t Index) {
++  GetRootArguments(llvm::air::AIRBuilder &AIR, uint32_t TableIndex) {
+     auto &B = AIR.builder;
+     auto Fn = B.GetInsertBlock()->getParent();
+-    auto Arg = Fn->getArg(TableIndex);
++    llvm::Value *Arg = Fn->getArg(TableIndex);
++    if (TableIndex == RootSignatureArgumentIndex && AmplificationIndex != ~0u && EyeRootSignatureArgumentIndex != ~0u) {
++      auto IsEye1 = B.CreateICmpEQ(Fn->getArg(AmplificationIndex), B.getInt32(1));
++      Arg = B.CreateSelect(IsEye1, Fn->getArg(EyeRootSignatureArgumentIndex), Arg);
++    }
++    return Arg;
++  }
++
++  llvm::Value *
++  GetArgument(llvm::air::AIRBuilder &AIR, uint32_t TableIndex, uint32_t Index) {
++    auto &B = AIR.builder;
++    auto Arg = GetRootArguments(AIR, TableIndex);
+     auto TyArg = llvm::cast<llvm::PointerType>(Arg->getType())->getNonOpaquePointerElementType();
+     auto TyStruct = llvm::cast<llvm::StructType>(TyArg);
+     return B.CreateLoad(TyStruct->getElementType(Index), B.CreateStructGEP(TyStruct, Arg, Index));
+@@ -89,8 +101,7 @@ public:
+   llvm::Value *
+   GetRootConstantPointer(llvm::air::AIRBuilder &AIR, uint32_t TableIndex, uint32_t Index) {
+     auto &B = AIR.builder;
+-    auto Fn = B.GetInsertBlock()->getParent();
+-    auto Arg = Fn->getArg(TableIndex);
++    auto Arg = GetRootArguments(AIR, TableIndex);
+     auto TyArg = llvm::cast<llvm::PointerType>(Arg->getType())->getNonOpaquePointerElementType();
+     auto TyStruct = llvm::cast<llvm::StructType>(TyArg);
+     return B.CreatePointerCast(B.CreateStructGEP(TyStruct, Arg, Index), AIR.getIntTy(4)->getPointerTo(2));
+@@ -341,6 +352,9 @@ public:
+ 
+   uint32_t RootSignatureArgumentIndex = ~0u;
+   uint32_t StaticSamplerArgumentIndex = ~0u;
++  /* stereo: eye 1 root arguments and the function input carrying the amplification id */
++  uint32_t EyeRootSignatureArgumentIndex = ~0u;
++  uint32_t AmplificationIndex = ~0u;
+ 
+   std::map<RangeId, std::pair<ConstantBufferInfo, uint64_t>> ConstantBuffers;
+   std::map<RangeId, std::pair<SamplerInfo, uint64_t>> Samplers;
+@@ -352,7 +366,7 @@ std::unique_ptr<BindingMap>
+ setup_binding_rootsig(
+     const ShaderInfo *shader_info, air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
+     microsoft::D3D10_SB_TOKENIZED_PROGRAM_TYPE shader_type, const void *bytecode, size_t bytecode_length,
+-    uint32_t root_sig_slot, uint32_t static_sampler_slot
++    uint32_t root_sig_slot, uint32_t static_sampler_slot, bool stereo_eye1
+ ) {
+   using namespace microsoft;
+   using namespace dxmt::dxbc;
+@@ -586,6 +600,19 @@ setup_binding_rootsig(
+       .arg_name = "rootsig",
+   });
+ 
++  if (stereo_eye1) {
++    binding_map->EyeRootSignatureArgumentIndex = func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
++        .location_index = SM50_BINDING_INDEX_ROOT_ARGUMENTS_EYE1,
++        .array_size = 1,
++        .memory_access = air::MemoryAccess::read,
++        .address_space = air::AddressSpace::constant,
++        .struct_type = type,
++        .struct_type_info = metadata,
++        .arg_name = "rootsig_eye1",
++    });
++    binding_map->AmplificationIndex = func_signature.DefineInput(air::InputAmplificationID{});
++  }
++
+   if (root_sig.NumStaticSamplers == 0)
+     return binding_map;
+ 
+diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
+index b501abe..04f25b6 100644
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -353,6 +353,11 @@ llvm::Error convert_dxbc_pixel_shader(
+   }
+   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
+   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
++  /* stereo (vertex amplification) pixel shader: the eye root arguments are selected by the amplification id */
++  SM50_SHADER_STEREO_AMPLIFICATION_DATA *stereo_data = nullptr;
++  bool stereo_amplified =
++      args_get_data<SM50_SHADER_STEREO_AMPLIFICATION, SM50_SHADER_STEREO_AMPLIFICATION_DATA>(pArgs, &stereo_data) &&
++      stereo_data->enabled;
+ 
+   IREffect prologue([](auto) { return std::monostate(); });
+   IRValue epilogue([](struct context ctx) -> pvalue {
+@@ -395,7 +400,8 @@ llvm::Error convert_dxbc_pixel_shader(
+ 
+   auto binding_map = rootsig ? setup_binding_rootsig(
+                                    shader_info, func_signature, module, D3D10_SB_PIXEL_SHADER, rootsig->bytecode,
+-                                   rootsig->bytecode_length
++                                   rootsig->bytecode_length, SM50_BINDING_INDEX_ROOT_ARGUMENTS,
++                                   SM50_BINDING_INDEX_STATIC_SAMPLERS, stereo_amplified
+                                )
+                              : setup_binding_table2(shader_info, func_signature, module);
+ 
+@@ -624,7 +630,7 @@ llvm::Error convert_dxbc_vertex_shader(
+           out.systemValue() == D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX)
+         writes_layer_index = true;
+     }
+-    if (writes_layer_index || vertex_so || rootsig ||
++    if (writes_layer_index || vertex_so ||
+         (gs_passthrough && (gs_passthrough->Data.RenderTargetArrayIndexReg != 255 ||
+                             gs_passthrough->Data.ViewportArrayIndexReg != 255)))
+       return llvm::make_error<UnsupportedFeature>("Vertex amplification is not supported for this shader");
+@@ -727,7 +733,8 @@ llvm::Error convert_dxbc_vertex_shader(
+ 
+   auto binding_map = rootsig ? setup_binding_rootsig(
+                                    shader_info, func_signature, module, D3D10_SB_VERTEX_SHADER, rootsig->bytecode,
+-                                   rootsig->bytecode_length
++                                   rootsig->bytecode_length, SM50_BINDING_INDEX_ROOT_ARGUMENTS,
++                                   SM50_BINDING_INDEX_STATIC_SAMPLERS, stereo_amplified
+                                )
+                              : setup_binding_table2(
+                                    shader_info, func_signature, module, SM50_BINDING_INDEX_CONSTANT_BUFFER,
+diff --git a/src/airconv/dxbc_converter.hpp b/src/airconv/dxbc_converter.hpp
+index 2f5e1a1..61a0c43 100644
+--- a/src/airconv/dxbc_converter.hpp
++++ b/src/airconv/dxbc_converter.hpp
+@@ -484,7 +484,7 @@ std::unique_ptr<BindingMap> setup_binding_rootsig(
+     const ShaderInfo *shader_info, air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
+     microsoft::D3D10_SB_TOKENIZED_PROGRAM_TYPE shader_type, const void *bytecode, size_t bytecode_length,
+     uint32_t root_sig_slot = SM50_BINDING_INDEX_ROOT_ARGUMENTS,
+-    uint32_t static_sampler_slot = SM50_BINDING_INDEX_STATIC_SAMPLERS
++    uint32_t static_sampler_slot = SM50_BINDING_INDEX_STATIC_SAMPLERS, bool stereo_eye1 = false
+ );
+ 
+ void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version);
+diff --git a/src/d3d12/d3d12_command_allocator.hpp b/src/d3d12/d3d12_command_allocator.hpp
+index 482792a..9abc5b7 100644
+--- a/src/d3d12/d3d12_command_allocator.hpp
++++ b/src/d3d12/d3d12_command_allocator.hpp
+@@ -19,6 +19,7 @@
+ #pragma once
+ 
+ #include "d3d12_pageable.hpp"
++#include <cstring>
+ #include "dxmt_command_clear.hpp"
+ #include "dxmt_ring_bump_allocator.hpp"
+ 
+@@ -189,6 +190,8 @@ public:
+     assert(encoder_current->type == EncoderType::Render);
+     auto encoder = static_cast<RenderEncoderData *>(encoder_current);
+     auto storage = (cmd_struct *)AllocateCPUHeap(sizeof(cmd_struct), 16);
++    // zeroed so padding and DXMT-side fields are comparable by stereo pass pairing
++    std::memset((void *)storage, 0, sizeof(cmd_struct));
+     encoder->cmd_tail->next.set(storage);
+     encoder->cmd_tail = (wmtcmd_base *)storage;
+     storage->next.set(nullptr);
+diff --git a/src/d3d12/d3d12_command_encoder.hpp b/src/d3d12/d3d12_command_encoder.hpp
+index 4986676..d9cffdd 100644
+--- a/src/d3d12/d3d12_command_encoder.hpp
++++ b/src/d3d12/d3d12_command_encoder.hpp
+@@ -19,10 +19,18 @@
+ #pragma once
+ 
+ #include "dxmt_texture.hpp"
++#include "util_env.hpp"
+ #include <cstdint>
+ 
+ namespace dxmt {
+ 
++/* single pass stereo: renders two consecutive layered eye passes with Metal vertex amplification, default off */
++inline bool
++SinglePassStereoEnabled() {
++  static const bool enabled = env::getEnvVar("DXMT_D3D12_SINGLE_PASS_STEREO") == "1";
++  return enabled;
++}
++
+ enum class EncoderType {
+   Null,
+   Clear,
+@@ -105,6 +113,15 @@ struct RenderEncoderData : EncoderData {
+   bool use_geometry = 0;
+   bool foveation_safe = true;
+   uint32_t foveation_draw_calls = 0;
++  /* set by ExecuteIndirect or any command the merged stereo pass cannot replay */
++  bool stereo_blocked = false;
++  /* set when the 2-slice views below exist, so this pass may be the slice 0 half of a stereo pair */
++  bool stereo_candidate = false;
++  /* CPU mapping of the allocator GPU heap that the argument table offsets of this pass point into */
++  const char *gpu_heap_mapping = nullptr;
++  /* 2-slice array views (slices 0 and 1) of the attachments, only for passes that render slice 0 of an array */
++  std::array<TextureViewRef, 8> stereo_color_views;
++  TextureViewRef stereo_depth_view;
+ };
+ 
+ struct BlitEncoderData : EncoderData {
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index f6beb44..d271278 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -298,6 +298,62 @@ public:
+     return {offset, stride};
+   }
+ 
++  // 2-slice array view (slices 0 and 1) of the texture a view of slice 0 belongs to, empty if not applicable
++  TextureViewRef
++  CreateStereoArrayView(TextureView *view) {
++    TextureViewRef result;
++    auto texture = view->allocation->descriptor;
++    auto key = view->key;
++    if (texture->sampleCount() != 1 || texture->textureType() != WMTTextureType2DArray || texture->arrayLength() < 2)
++      return result;
++    if (key.array_start != 0 || key.array_end - key.array_start != 1)
++      return result;
++    TextureViewDescriptor descriptor;
++    descriptor.format = texture->pixelFormat(key);
++    descriptor.type = WMTTextureType2DArray;
++    descriptor.firstMiplevel = key.mip_start;
++    descriptor.miplevelCount = key.mip_end - key.mip_start;
++    descriptor.firstArraySlice = 0;
++    descriptor.arraySize = 2;
++    result = texture->view(texture->createView(descriptor));
++    return result;
++  }
++
++  // Single pass stereo: a pass that renders slice 0 of a layered target may become the first eye of a merged pass,
++  // so create the array views it would need here (on the recording thread) and mark it as a candidate.
++  void
++  PrepareStereoPass(RenderEncoderData *render) {
++    std::array<TextureViewRef, 8> color_views;
++    TextureViewRef depth_view;
++    bool any = false;
++    for (unsigned i = 0; i < color_views.size(); i++) {
++      auto &color = render->colors[i];
++      if (!color.attachment)
++        continue;
++      if (color.depth_plane || color.resolve_attachment)
++        return;
++      color_views[i] = CreateStereoArrayView(color.attachment.ptr());
++      if (!color_views[i])
++        return;
++      any = true;
++    }
++    if (render->depth.attachment || render->stencil.attachment) {
++      auto &ds = render->depth.attachment ? render->depth.attachment : render->stencil.attachment;
++      if (render->depth.attachment && render->stencil.attachment &&
++          render->depth.attachment.ptr() != render->stencil.attachment.ptr())
++        return;
++      depth_view = CreateStereoArrayView(ds.ptr());
++      if (!depth_view)
++        return;
++      any = true;
++    }
++    if (!any)
++      return;
++    render->stereo_color_views = std::move(color_views);
++    render->stereo_depth_view = std::move(depth_view);
++    render->stereo_candidate = true;
++  }
++
+   bool
+   IsPendingDiscard(Texture *texture) {
+     for (auto &discard : pending_discards_) {
+@@ -425,6 +481,10 @@ public:
+       pending_discards_.clear();
+       FoldPrecedingClear(render);
+ 
++      render->gpu_heap_mapping = static_cast<const char *>(allocator_->gpu_heap_);
++      if (SinglePassStereoEnabled())
++        PrepareStereoPass(render);
++
+       dirty_state_.set(DirtyState::VertexBuffer, DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
+       dirty_state_.set(DirtyState::Viewport, DirtyState::ScissorRect);
+       dirty_state_.set(DirtyState::BlendFactor, DirtyState::StencilRef);
+@@ -440,6 +500,9 @@ public:
+       auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
+       cmd_setpso.type = WMTRenderCommandSetPSO;
+       cmd_setpso.pso = pso_graphics_->pso;
++      // resolved at record time; only slice 0 candidates can be merged, and ineligible pipelines leave it null
++      if (static_cast<RenderEncoderData *>(allocator_->encoder_current)->stereo_candidate)
++        cmd_setpso.stereo_pso = pso_graphics_->GetStereoPipeline();
+ 
+       auto &cmd_setdsso = allocator_->EncodeRenderCommand<wmtcmd_render_setdepthstencilstate>();
+       cmd_setdsso.type = WMTRenderCommandSetDepthStencilState;
+@@ -468,6 +531,9 @@ public:
+         cmd_vsvb.buffer = allocator_->gpu_heap_buffer_;
+         cmd_vsvb.offset = Offset;
+         cmd_vsvb.index = SM50_BINDING_INDEX_VERTEX_BUFFER;
++        // bytes of the table the emitter wrote, compared across passes by stereo pairing
++        cmd_vsvb.table_size = __builtin_popcount(pso_graphics_->slot_mask) * 16u /* VERTEX_BUFFER_ENTRY */;
++        cmd_vsvb.table_size_known = 1;
+       }
+       dirty_state_.clr(DirtyState::VertexBuffer);
+     }
+@@ -497,11 +563,15 @@ public:
+         cmd_vsargbuf.buffer = allocator_->gpu_heap_buffer_;
+         cmd_vsargbuf.offset = Offset;
+         cmd_vsargbuf.index = SM50_BINDING_INDEX_STATIC_SAMPLERS;
++        cmd_vsargbuf.table_size = sizeof(uint64_t) * rootsig_graphics_->NumStaticSamplers * 4;
++        cmd_vsargbuf.table_size_known = 1;
+         auto &cmd_fsargbuf = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+         cmd_fsargbuf.type = WMTRenderCommandSetFragmentBuffer;
+         cmd_fsargbuf.buffer = allocator_->gpu_heap_buffer_;
+         cmd_fsargbuf.offset = Offset;
+         cmd_fsargbuf.index = SM50_BINDING_INDEX_STATIC_SAMPLERS;
++        cmd_fsargbuf.table_size = sizeof(uint64_t) * rootsig_graphics_->NumStaticSamplers * 4;
++        cmd_fsargbuf.table_size_known = 1;
+       }
+       dirty_state_.clr(DirtyState::GraphicsRootSignature);
+     }
+@@ -1596,6 +1666,8 @@ public:
+     }
+     // indirect draws run pipelines chosen inside the argument buffer, which the pass safety tracking cannot see
+     static_cast<RenderEncoderData *>(allocator_->encoder_current)->foveation_safe = false;
++    // nor can the merged stereo pass replay them
++    static_cast<RenderEncoderData *>(allocator_->encoder_current)->stereo_blocked = true;
+ 
+     auto cmd = allocator_->EncodeIndirectRenderCommand(sig, pso_graphics_.ptr(), MaxCommandCount);
+     cmd->max_count_buffer = CountBufferAddress;
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 731519d..6fda5f0 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -38,6 +38,332 @@ namespace dxmt {
+ 
+ constexpr auto kCommandQueueSize = 32u;
+ 
++// size of the command allocator GPU heap that pass argument table offsets point into
++constexpr uint64_t kStereoGPUHeapLimit = 0x400000u;
++
++enum class StereoFallback : unsigned {
++  NoNextPass,
++  Blocked,
++  Attachments,
++  Commands,
++  NoStereoPipeline,
++  Count,
++};
++
++constexpr const char *kStereoFallbackNames[] = {
++    "next encoder is not a render pass", "pass uses commands the merged pass cannot replay",
++    "attachments are not the two layers of one target", "command streams differ", "no stereo pipeline variant",
++};
++
++static std::atomic_uint64_t stereo_pass_merged{0};
++static std::atomic_uint64_t stereo_pass_fallback{0};
++
++inline void
++NoteStereoMerged() {
++  auto count = stereo_pass_merged.fetch_add(1, std::memory_order_relaxed) + 1;
++  if (count == 1 || (count >= 1024 && (count & (count - 1)) == 0))
++    WARN("wvr-stereo d3d12 stereo_pass_merged=", count, " stereo_pass_fallback=", stereo_pass_fallback.load());
++}
++
++inline void
++NoteStereoFallback(StereoFallback reason, const char *detail) {
++  static std::atomic_bool logged[unsigned(StereoFallback::Count)];
++  auto count = stereo_pass_fallback.fetch_add(1, std::memory_order_relaxed) + 1;
++  if (!logged[unsigned(reason)].exchange(true))
++    WARN("wvr-stereo d3d12 fallback: ", kStereoFallbackNames[unsigned(reason)], " (", detail, ") stereo_pass_merged=",
++         stereo_pass_merged.load(), " stereo_pass_fallback=", count);
++}
++
++/**
++Builds the command list of one pass that renders both eyes with vertex amplification from two consecutive layered
++eye passes (a renders slice 0, b renders slice 1). Only succeeds when both passes are provably the same work apart from
++the root arguments, which eye 1 receives at SM50_BINDING_INDEX_ROOT_ARGUMENTS_EYE1. Nothing is modified on failure.
++*/
++class StereoPassBuilder {
++  std::vector<std::unique_ptr<uint64_t[]>> blocks_;
++  wmtcmd_render_nop head_{};
++  wmtcmd_base *tail_ = nullptr;
++
++  static size_t
++  CommandSize(uint16_t type) {
++    switch (type) {
++    case WMTRenderCommandSetVertexBuffer:
++    case WMTRenderCommandSetFragmentBuffer:
++      return sizeof(wmtcmd_render_setbuffer);
++    case WMTRenderCommandSetPSO:
++      return sizeof(wmtcmd_render_setpso);
++    case WMTRenderCommandSetDepthStencilState:
++      return sizeof(wmtcmd_render_setdepthstencilstate);
++    case WMTRenderCommandSetRasterizerState:
++      return sizeof(wmtcmd_render_setrasterizerstate);
++    case WMTRenderCommandSetViewports:
++      return sizeof(wmtcmd_render_setviewports);
++    case WMTRenderCommandSetScissorRects:
++      return sizeof(wmtcmd_render_setscissorrects);
++    case WMTRenderCommandSetBlendFactor:
++      return sizeof(wmtcmd_render_setblendcolor);
++    case WMTRenderCommandSetStencilRef:
++      return sizeof(wmtcmd_render_setstencilref);
++    case WMTRenderCommandDraw:
++      return sizeof(wmtcmd_render_draw);
++    case WMTRenderCommandDrawIndexed:
++      return sizeof(wmtcmd_render_draw_indexed);
++    default:
++      return 0;
++    }
++  }
++
++  wmtcmd_base *
++  Allocate(size_t size) {
++    blocks_.emplace_back(new uint64_t[(size + 7) / 8]());
++    return reinterpret_cast<wmtcmd_base *>(blocks_.back().get());
++  }
++
++  wmtcmd_base *
++  Clone(wmtcmd_base *src, size_t size) {
++    auto dst = Allocate(size);
++    std::memcpy((void *)dst, (void *)src, size);
++    dst->next.set(nullptr);
++    return dst;
++  }
++
++  void
++  Append(wmtcmd_base *cmd) {
++    tail_->next.set(cmd);
++    tail_ = cmd;
++  }
++
++  static bool
++  SameAttachment(const TextureViewRef &a, const TextureViewRef &b) {
++    // the same allocation of one texture, a on slice 0 and b on slice 1 of the same level and format
++    if (!a || !b || a.ptr()->allocation != b.ptr()->allocation)
++      return false;
++    auto texture = a.ptr()->allocation->descriptor;
++    auto ka = a.ptr()->key;
++    auto kb = b.ptr()->key;
++    if (ka.array_start != 0 || ka.array_end != 1 || kb.array_start != 1 || kb.array_end != 2)
++      return false;
++    if (ka.mip_start != kb.mip_start || ka.mip_end != kb.mip_end)
++      return false;
++    return texture->pixelFormat(ka) == texture->pixelFormat(kb);
++  }
++
++  // compares the bytes of an argument table that both passes wrote into the GPU heap of their allocator
++  static bool
++  SameTable(RenderEncoderData *a, wmtcmd_render_setbuffer *ca, RenderEncoderData *b, wmtcmd_render_setbuffer *cb) {
++    if (!ca->table_size_known || !cb->table_size_known || ca->table_size != cb->table_size)
++      return false;
++    if (!ca->table_size)
++      return true;
++    if (!a->gpu_heap_mapping || !b->gpu_heap_mapping)
++      return false;
++    if (ca->offset + ca->table_size > kStereoGPUHeapLimit || cb->offset + cb->table_size > kStereoGPUHeapLimit)
++      return false;
++    return std::memcmp(a->gpu_heap_mapping + ca->offset, b->gpu_heap_mapping + cb->offset, ca->table_size) == 0;
++  }
++
++public:
++  wmtcmd_render_nop *
++  Build(RenderEncoderData *a, RenderEncoderData *b, StereoFallback &reason, const char *&detail) {
++    reason = StereoFallback::Blocked;
++    detail = "";
++    if (a->stereo_blocked || b->stereo_blocked || !a->stereo_candidate) {
++      detail = a->stereo_blocked || b->stereo_blocked ? "indirect draw" : "not a layered slice 0 target";
++      return nullptr;
++    }
++    if (a->use_visibility_result || b->use_visibility_result || a->use_tessellation || b->use_tessellation ||
++        a->use_geometry || b->use_geometry) {
++      detail = "visibility, tessellation or geometry";
++      return nullptr;
++    }
++
++    reason = StereoFallback::Attachments;
++    if (a->render_target_array_length > 1 || b->render_target_array_length > 1 ||
++        a->render_target_count != b->render_target_count ||
++        a->default_raster_sample_count != b->default_raster_sample_count ||
++        a->render_target_width != b->render_target_width || a->render_target_height != b->render_target_height ||
++        a->dsv_planar_flags != b->dsv_planar_flags || a->dsv_readonly_flags != b->dsv_readonly_flags) {
++      detail = "pass shape";
++      return nullptr;
++    }
++    for (unsigned i = 0; i < a->colors.size(); i++) {
++      auto &ca = a->colors[i];
++      auto &cb = b->colors[i];
++      if (!ca.attachment && !cb.attachment)
++        continue;
++      if (!SameAttachment(ca.attachment, cb.attachment) || !a->stereo_color_views[i]) {
++        detail = "colour target";
++        return nullptr;
++      }
++      if (ca.level || cb.level || ca.depth_plane || cb.depth_plane || ca.resolve_attachment || cb.resolve_attachment ||
++          ca.store_action != cb.store_action || ca.store_action != WMTStoreActionStore ||
++          ca.load_action != cb.load_action) {
++        detail = "colour actions";
++        return nullptr;
++      }
++      if (ca.load_action == WMTLoadActionClear && std::memcmp(&ca.clear_color, &cb.clear_color, sizeof(ca.clear_color))) {
++        detail = "clear colour";
++        return nullptr;
++      }
++    }
++    if (static_cast<bool>(a->depth.attachment) != static_cast<bool>(b->depth.attachment) ||
++        static_cast<bool>(a->stencil.attachment) != static_cast<bool>(b->stencil.attachment)) {
++      detail = "depth presence";
++      return nullptr;
++    }
++    if (a->depth.attachment || a->stencil.attachment) {
++      auto &view_a = a->depth.attachment ? a->depth.attachment : a->stencil.attachment;
++      auto &view_b = b->depth.attachment ? b->depth.attachment : b->stencil.attachment;
++      if (!SameAttachment(view_a, view_b) || !a->stereo_depth_view) {
++        detail = "depth target";
++        return nullptr;
++      }
++    }
++    if (a->depth.attachment &&
++        (a->depth.level || b->depth.level || a->depth.depth_plane || b->depth.depth_plane ||
++         a->depth.load_action != b->depth.load_action || a->depth.store_action != b->depth.store_action ||
++         (a->depth.load_action == WMTLoadActionClear && a->depth.clear_depth != b->depth.clear_depth))) {
++      detail = "depth actions";
++      return nullptr;
++    }
++    if (a->stencil.attachment &&
++        (a->stencil.level || b->stencil.level || a->stencil.depth_plane || b->stencil.depth_plane ||
++         a->stencil.load_action != b->stencil.load_action || a->stencil.store_action != b->stencil.store_action ||
++         (a->stencil.load_action == WMTLoadActionClear && a->stencil.clear_stencil != b->stencil.clear_stencil))) {
++      detail = "stencil actions";
++      return nullptr;
++    }
++
++    head_.type = WMTRenderCommandNop;
++    head_.next.set(nullptr);
++    tail_ = reinterpret_cast<wmtcmd_base *>(&head_);
++
++    {
++      auto amplify = (wmtcmd_render_setvertexamplification *)Allocate(sizeof(wmtcmd_render_setvertexamplification));
++      amplify->type = WMTRenderCommandSetVertexAmplification;
++      amplify->count = 2;
++      amplify->mappings[0] = {0, 0};
++      amplify->mappings[1] = {0, 1};
++      Append((wmtcmd_base *)amplify);
++    }
++
++    reason = StereoFallback::Commands;
++    auto *ca = static_cast<wmtcmd_base *>(a->cmd_head.next.get());
++    auto *cb = static_cast<wmtcmd_base *>(b->cmd_head.next.get());
++    bool saw_pipeline = false, saw_draw = false, saw_root_vertex = false, saw_root_fragment = false;
++    while (ca && cb) {
++      if (ca->type != cb->type) {
++        detail = "command type";
++        return nullptr;
++      }
++      const size_t size = CommandSize(ca->type);
++      if (!size) {
++        detail = "unsupported command";
++        return nullptr;
++      }
++      switch (ca->type) {
++      case WMTRenderCommandSetPSO: {
++        auto pa = (wmtcmd_render_setpso *)ca;
++        auto pb = (wmtcmd_render_setpso *)cb;
++        if (pa->pso != pb->pso) {
++          detail = "pipeline";
++          return nullptr;
++        }
++        if (!pa->stereo_pso) {
++          reason = StereoFallback::NoStereoPipeline;
++          detail = "pipeline";
++          return nullptr;
++        }
++        auto stereo = (wmtcmd_render_setpso *)Clone(ca, size);
++        stereo->pso = stereo->stereo_pso;
++        Append((wmtcmd_base *)stereo);
++        saw_pipeline = true;
++        break;
++      }
++      case WMTRenderCommandSetVertexBuffer:
++      case WMTRenderCommandSetFragmentBuffer: {
++        auto ba = (wmtcmd_render_setbuffer *)ca;
++        auto bb = (wmtcmd_render_setbuffer *)cb;
++        const bool vertex = ca->type == WMTRenderCommandSetVertexBuffer;
++        if (ba->index != bb->index) {
++          detail = "buffer slot";
++          return nullptr;
++        }
++        if (ba->index == SM50_BINDING_INDEX_ROOT_ARGUMENTS) {
++          // eye 0 keeps its own root arguments, eye 1 gets those of b at the EYE1 slot
++          Append(Clone(ca, size));
++          auto eye1 = (wmtcmd_render_setbuffer *)Allocate(sizeof(wmtcmd_render_setbuffer));
++          eye1->type = ca->type;
++          eye1->buffer = bb->buffer;
++          eye1->offset = bb->offset;
++          eye1->index = SM50_BINDING_INDEX_ROOT_ARGUMENTS_EYE1;
++          Append((wmtcmd_base *)eye1);
++          (vertex ? saw_root_vertex : saw_root_fragment) = true;
++        } else if ((vertex && ba->index == SM50_BINDING_INDEX_VERTEX_BUFFER) ||
++                   ba->index == SM50_BINDING_INDEX_STATIC_SAMPLERS) {
++          // must be identical: compare the table contents, their offsets differ between the passes
++          if (!SameTable(a, ba, b, bb)) {
++            detail = vertex && ba->index == SM50_BINDING_INDEX_VERTEX_BUFFER ? "vertex buffer table"
++                                                                              : "static samplers";
++            return nullptr;
++          }
++          Append(Clone(ca, size));
++        } else {
++          detail = "buffer slot";
++          return nullptr;
++        }
++        break;
++      }
++      case WMTRenderCommandSetViewports: {
++        auto va = (wmtcmd_render_setviewports *)ca;
++        auto vb = (wmtcmd_render_setviewports *)cb;
++        if (va->viewport_count != vb->viewport_count ||
++            std::memcmp(va->viewports.get(), vb->viewports.get(), va->viewport_count * sizeof(WMTViewport))) {
++          detail = "viewports";
++          return nullptr;
++        }
++        Append(Clone(ca, size));
++        break;
++      }
++      case WMTRenderCommandSetScissorRects: {
++        auto sa = (wmtcmd_render_setscissorrects *)ca;
++        auto sb = (wmtcmd_render_setscissorrects *)cb;
++        if (sa->rect_count != sb->rect_count ||
++            std::memcmp(sa->scissor_rects.get(), sb->scissor_rects.get(), sa->rect_count * sizeof(WMTScissorRect))) {
++          detail = "scissors";
++          return nullptr;
++        }
++        Append(Clone(ca, size));
++        break;
++      }
++      case WMTRenderCommandDraw:
++      case WMTRenderCommandDrawIndexed:
++        if (!saw_pipeline || !saw_root_vertex || !saw_root_fragment) {
++          detail = "draw before pipeline or root arguments";
++          return nullptr;
++        }
++        saw_draw = true;
++        [[fallthrough]];
++      default:
++        if (std::memcmp((char *)ca + sizeof(wmtcmd_base), (char *)cb + sizeof(wmtcmd_base), size - sizeof(wmtcmd_base))) {
++          detail = ca->type == WMTRenderCommandDraw || ca->type == WMTRenderCommandDrawIndexed ? "draw arguments"
++                                                                                                 : "state";
++          return nullptr;
++        }
++        Append(Clone(ca, size));
++        break;
++      }
++      ca = static_cast<wmtcmd_base *>(ca->next.get());
++      cb = static_cast<wmtcmd_base *>(cb->next.get());
++    }
++    if (ca || cb || !saw_draw) {
++      detail = "length or no draw";
++      return nullptr;
++    }
++    return &head_;
++  }
++};
++
+ const GUID kD3D12CommandQueueDownlevelUUID = {
+     0x38a8c5ef, 0x7ccb, 0x4e81, {0x91, 0x4f, 0xa6, 0xe9, 0xd0, 0x72, 0xc4, 0x94}
+ };
+@@ -482,6 +808,8 @@ public:
+     for (unsigned i = 0; i < Count; i++) {
+       auto pCommandList = static_cast<MTLD3D12GraphicsCommandList *>(ppCommandLists[i]);
+       EncoderData *current = pCommandList->entry;
++      // render pass absorbed into the previous one by single pass stereo
++      EncoderData *stereo_absorbed = nullptr;
+       while (current) {
+         switch (current->type) {
+         case EncoderType::Null:
+@@ -525,6 +853,8 @@ public:
+           break;
+         }
+         case EncoderType::Render: {
++          if (current == stereo_absorbed)
++            break;
+           auto data = static_cast<RenderEncoderData *>(current);
+           WMTRenderPassInfo render_pass_info;
+           WMT::InitializeRenderPassInfo(render_pass_info);
+@@ -573,6 +903,43 @@ public:
+             render_pass_info.render_target_width = data->render_target_width;
+             render_pass_info.render_target_height = data->render_target_height;
+           }
++          // Single pass stereo: when the next pass renders the other eye layer, encode both as one amplified pass.
++          StereoPassBuilder stereo_builder;
++          wmtcmd_render_nop *stereo_commands = nullptr;
++          bool stereo_foveation_safe = true;
++          if (SinglePassStereoEnabled() && data->stereo_candidate) {
++            EncoderData *next = data->next;
++            while (next && next->type == EncoderType::Null)
++              next = next->next;
++            StereoFallback reason = StereoFallback::NoNextPass;
++            const char *detail = "";
++            if (next && next->type == EncoderType::Render) {
++              auto second = static_cast<RenderEncoderData *>(next);
++              stereo_commands = stereo_builder.Build(data, second, reason, detail);
++              if (stereo_commands) {
++                stereo_foveation_safe = second->foveation_safe;
++                stereo_absorbed = next;
++                for (unsigned i = 0; i < std::size(render_pass_info.colors); i++) {
++                  if (data->colors[i].attachment) {
++                    render_pass_info.colors[i].texture = data->stereo_color_views[i].texture();
++                    render_pass_info.colors[i].slice = 0;
++                  }
++                }
++                if (data->depth.attachment) {
++                  render_pass_info.depth.texture = data->stereo_depth_view.texture();
++                  render_pass_info.depth.slice = 0;
++                }
++                if (data->stencil.attachment) {
++                  render_pass_info.stencil.texture = data->stereo_depth_view.texture();
++                  render_pass_info.stencil.slice = 0;
++                }
++                render_pass_info.render_target_array_length = 2;
++                NoteStereoMerged();
++              }
++            }
++            if (!stereo_commands)
++              NoteStereoFallback(reason, detail);
++          }
+           auto &color = render_pass_info.colors[0];
+           WVRGuestFoveationPassV1 foveation{};
+           foveation.abiVersion = WVR_GUEST_FOVEATION_ABI;
+@@ -581,7 +948,7 @@ public:
+           foveation.operation = 1;
+           // Depth-only passes (no colour target) are eligible with a stored depth attachment.
+           const bool depthOnlyPass = !color.texture && !data->render_target_count && render_pass_info.depth.texture;
+-          bool eligible = data->foveation_safe && data->foveation_draw_calls && !data->use_visibility_result &&
++          bool eligible = data->foveation_safe && stereo_foveation_safe && data->foveation_draw_calls && !data->use_visibility_result &&
+               !data->use_geometry && !data->use_tessellation && data->render_target_count <= 8 &&
+               render_pass_info.default_raster_sample_count == 1 &&
+               (render_pass_info.render_target_array_length == 1 ||
+@@ -689,7 +1056,7 @@ public:
+             identity.next.set(nullptr);
+             encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&identity));
+           }
+-          encoder.encodeCommands(&data->cmd_head);
++          encoder.encodeCommands(stereo_commands ? stereo_commands : &data->cmd_head);
+           if (foveation.status == 0 && foveation.encoder) {
+             encoder.endEncoding();
+             foveation.operation = 2;
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index 756a92b..cbf13c2 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -151,6 +151,9 @@ public:
+ 
+   virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
+ 
++  // vertex amplification (single pass stereo) variant, compiled on first use; 0 if the pipeline is not eligible
++  virtual obj_handle_t GetStereoPipeline() = 0;
++
+   virtual void AddRefPrivate() = 0;
+   virtual void ReleasePrivate() = 0;
+ };
+diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
+index b6c951a..24cb3bd 100644
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -23,6 +23,7 @@
+ #include "com/com_object.hpp"
+ #include "com/com_pointer.hpp"
+ #include "sha1/sha1_util.hpp"
++#include <mutex>
+ #include "DXBCParser/BlobContainer.h"
+ #include "DXBCParser/DXBCUtils.h"
+ 
+@@ -258,6 +259,24 @@ protected:
+   MTL_SHADER_REFLECTION ref_vs;
+   MTL_SHADER_REFLECTION ref_ps;
+ 
++  SM50Shader shader_vs_, shader_ps_;
++
++  // inputs retained from the creation desc so the stereo variant can be compiled later
++  std::vector<uint8_t> vs_bytecode_;
++  std::vector<uint8_t> ps_bytecode_;
++  std::vector<uint8_t> rootsig_blob_;
++  std::vector<SM50_IA_INPUT_ELEMENT> input_elements_;
++  uint32_t input_slot_mask_ = 0;
++  bool dual_source_blending_ = false;
++  bool stereo_eligible_ = false;
++  uint32_t sample_mask_ = 0xffffffff;
++  uint32_t pixel_formats_[8] = {};
++  WMTRenderPipelineInfo pipeline_info_{};
++
++  std::mutex stereo_mutex_;
++  bool stereo_attempted_ = false;
++  WMT::Reference<WMT::RenderPipelineState> stereo_pso_;
++
+   WMT::Reference<WMT::DepthStencilState> dsso;
+   WMT::Reference<WMT::DepthStencilState> dsso_depth_readonly;
+   WMT::Reference<WMT::DepthStencilState> dsso_stencil_readonly;
+@@ -490,30 +509,13 @@ public:
+     return true;
+   }
+ 
+-  virtual HRESULT
+-  Initialize(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
+-    if (pDesc->StreamOutput.NumEntries) {
+-      ERR("CreatePipelineState: SO not supported");
+-      return E_NOTIMPL;
+-    }
+-
+-    if (pDesc->GS.pShaderBytecode) {
+-      ERR("CreatePipelineState: GS not supported");
+-      return E_NOTIMPL;
+-    }
+-
+-    if (pDesc->HS.pShaderBytecode || pDesc->DS.pShaderBytecode) {
+-      ERR("CreatePipelineState: Tess not supported");
+-      return E_NOTIMPL;
+-    }
+-
+-    HRESULT hr;
+-
+-    SM50Shader shader_vs, shader_ps;
+-    SM50Error sm50_err;
++  // Compiles the vertex and pixel functions from the retained inputs. `stereo` requests the vertex amplification
++  // variants, which select their root arguments by amplification id.
++  HRESULT
++  CompileFunctions(bool stereo, WMT::Reference<WMT::Function> &vs_func, WMT::Reference<WMT::Function> &ps_func) {
+     auto metal = device_->GetMTLDevice();
+     WMT::Reference<WMT::Error> err;
+-    WMT::Reference<WMT::Function> vs_func, ps_func;
++    SM50Error sm50_err;
+ 
+     SM50_SHADER_COMMON_DATA common;
+     common.flags = {};
+@@ -521,46 +523,38 @@ public:
+     common.metal_version = SM50_SHADER_METAL_310;
+     common.next = nullptr;
+ 
+-    if (pDesc->VS.pShaderBytecode) {
+-      if (FAILED(hr = InitializeShader(pDesc->VS, &shader_vs, &ref_vs)))
+-        return hr;
++    SM50_SHADER_STEREO_AMPLIFICATION_DATA data_stereo;
++    data_stereo.type = SM50_SHADER_STEREO_AMPLIFICATION;
++    data_stereo.enabled = true;
++    data_stereo.next = &common;
++    void *stage_next = stereo ? (void *)&data_stereo : (void *)&common;
++
++    {
+       SM50_SHADER_IA_INPUT_LAYOUT_DATA data_ia_layout;
+       data_ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
+       data_ia_layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
+-      std::vector<SM50_IA_INPUT_ELEMENT> elements(pDesc->InputLayout.NumElements);
+-      if (FAILED(
+-              hr = ExtractMTLInputLayoutElements(
+-                  device_, pDesc->VS.pShaderBytecode, pDesc->InputLayout.pInputElementDescs,
+-                  pDesc->InputLayout.NumElements, elements.data(), &data_ia_layout.num_elements
+-              )
+-          ))
+-        return hr;
+-      elements.resize(data_ia_layout.num_elements);
+-      data_ia_layout.elements = elements.data();
+-      slot_mask = 0;
+-      for (auto &element : elements) {
+-        slot_mask |= (1 << element.slot);
+-      }
+-      data_ia_layout.slot_mask = slot_mask;
+-      data_ia_layout.next = &common;
++      data_ia_layout.num_elements = input_elements_.size();
++      data_ia_layout.elements = input_elements_.data();
++      data_ia_layout.slot_mask = input_slot_mask_;
++      data_ia_layout.next = stage_next;
+ 
+       SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
+       rootsig.type = SM50_SHADER_ROOT_SIGNATURE;
+-      if (pDesc->pRootSignature) {
+-        rootsig.bytecode_length =
+-            static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->GetBlob(&rootsig.bytecode);
++      if (!rootsig_blob_.empty()) {
++        rootsig.bytecode = rootsig_blob_.data();
++        rootsig.bytecode_length = rootsig_blob_.size();
+       } else {
+-        rootsig.bytecode = pDesc->VS.pShaderBytecode;
+-        rootsig.bytecode_length = pDesc->VS.BytecodeLength;
++        rootsig.bytecode = vs_bytecode_.data();
++        rootsig.bytecode_length = vs_bytecode_.size();
+       }
+       rootsig.next = &data_ia_layout;
+ 
+       SM50ShaderBitcode vs_bitcode;
+ 
+       if (SM50Compile(
+-              shader_vs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main", &vs_bitcode, &sm50_err
++              shader_vs_, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main", &vs_bitcode, &sm50_err
+           )) {
+-        ERR("Failed to compile vs shader");
++        ERR("Failed to compile vs shader", stereo ? " (stereo)" : "");
+         return E_FAIL;
+       }
+ 
+@@ -569,55 +563,38 @@ public:
+       auto vs_data = WMT::MakeDispatchData(vs_bitcode_compiled.Data, vs_bitcode_compiled.Size);
+       auto vs_lib = metal.newLibrary(vs_data, err);
+       vs_func = vs_lib.newFunction("vs_main");
+-    } else {
+-      ERR("no vertex shader");
+-      return E_INVALIDARG;
+     }
+ 
+-    WMTRenderPipelineInfo info;
+-    WMT::InitializeRenderPipelineInfo(info);
+-
+-    bool dual_source_blending = false;
+-
+-    if (FAILED(hr = InitializePSO(pDesc, info, dual_source_blending)))
+-      return hr;
+-
+-    if (pDesc->PS.pShaderBytecode) {
+-      auto sha1 = Sha1HashState::compute(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength);
++    if (!ps_bytecode_.empty()) {
++      auto sha1 = Sha1HashState::compute(ps_bytecode_.data(), ps_bytecode_.size());
+ 
+       std::string ps_name = "ps_main" + sha1.string().substr(0, 8);
+ 
+-      if (FAILED(hr = InitializeShader(pDesc->PS, &shader_ps, &ref_ps)))
+-        return hr;
+       SM50_SHADER_PSO_PIXEL_SHADER_DATA data_ps;
+-      data_ps.dual_source_blending = dual_source_blending;
++      data_ps.dual_source_blending = dual_source_blending_;
+       data_ps.disable_depth_output = false;
+       data_ps.unorm_output_reg_mask = 0;
+-      data_ps.sample_mask = pDesc->SampleMask;
++      data_ps.sample_mask = sample_mask_;
+       data_ps.type = SM50_SHADER_PSO_PIXEL_SHADER;
+-      data_ps.next = &common;
+-
+-      memset(data_ps.pixel_formats, 0, sizeof(data_ps.pixel_formats));
+-      for (unsigned i = 0; i < pDesc->NumRenderTargets; i++) {
+-        data_ps.pixel_formats[i] = ORIGINAL_FORMAT(info.colors[i].pixel_format);
+-      }
++      data_ps.next = stage_next;
++      memcpy(data_ps.pixel_formats, pixel_formats_, sizeof(data_ps.pixel_formats));
+ 
+       SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
+       rootsig.type = SM50_SHADER_ROOT_SIGNATURE;
+-      if (pDesc->pRootSignature) {
+-        rootsig.bytecode_length =
+-            static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->GetBlob(&rootsig.bytecode);
++      if (!rootsig_blob_.empty()) {
++        rootsig.bytecode = rootsig_blob_.data();
++        rootsig.bytecode_length = rootsig_blob_.size();
+       } else {
+-        rootsig.bytecode = pDesc->PS.pShaderBytecode;
+-        rootsig.bytecode_length = pDesc->PS.BytecodeLength;
++        rootsig.bytecode = ps_bytecode_.data();
++        rootsig.bytecode_length = ps_bytecode_.size();
+       }
+       rootsig.next = &data_ps;
+ 
+       SM50ShaderBitcode ps_bitcode;
+       if (SM50Compile(
+-              shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &ps_bitcode, &sm50_err
++              shader_ps_, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &ps_bitcode, &sm50_err
+           )) {
+-        ERR("Failed to compile ps shader");
++        ERR("Failed to compile ps shader", stereo ? " (stereo)" : "");
+         return E_FAIL;
+       }
+       SM50_COMPILED_BITCODE ps_bitcode_compiled;
+@@ -627,11 +604,125 @@ public:
+       ps_func = ps_lib.newFunction(ps_name.c_str());
+     }
+ 
++    return S_OK;
++  }
++
++  obj_handle_t
++  GetStereoPipeline() override {
++    if (!stereo_eligible_)
++      return 0;
++    std::lock_guard<std::mutex> lock(stereo_mutex_);
++    if (stereo_attempted_)
++      return stereo_pso_.handle;
++    stereo_attempted_ = true;
++
++    WMT::Reference<WMT::Function> vs_func, ps_func;
++    if (FAILED(CompileFunctions(true, vs_func, ps_func))) {
++      WARN("wvr-stereo d3d12 stereo pipeline variant unavailable: shader compile failed");
++      return 0;
++    }
++    auto stereo_info = pipeline_info_;
++    stereo_info.vertex_function = vs_func.handle;
++    stereo_info.fragment_function = ps_func.handle;
++    stereo_info.max_vertex_amplification_count = 2;
++
++    WMT::Reference<WMT::Error> err;
++    stereo_pso_ = device_->GetMTLDevice().newRenderPipelineState(stereo_info, err);
++    if (!stereo_pso_)
++      WARN("wvr-stereo d3d12 stereo pipeline variant unavailable: ", err.description().getUTF8String());
++    return stereo_pso_.handle;
++  }
++
++  virtual HRESULT
++  Initialize(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
++    if (pDesc->StreamOutput.NumEntries) {
++      ERR("CreatePipelineState: SO not supported");
++      return E_NOTIMPL;
++    }
++
++    if (pDesc->GS.pShaderBytecode) {
++      ERR("CreatePipelineState: GS not supported");
++      return E_NOTIMPL;
++    }
++
++    if (pDesc->HS.pShaderBytecode || pDesc->DS.pShaderBytecode) {
++      ERR("CreatePipelineState: Tess not supported");
++      return E_NOTIMPL;
++    }
++
++    HRESULT hr;
++
++    auto metal = device_->GetMTLDevice();
++    WMT::Reference<WMT::Error> err;
++    WMT::Reference<WMT::Function> vs_func, ps_func;
++
++    if (pDesc->VS.pShaderBytecode) {
++      if (FAILED(hr = InitializeShader(pDesc->VS, &shader_vs_, &ref_vs)))
++        return hr;
++      input_elements_.resize(pDesc->InputLayout.NumElements);
++      uint32_t num_elements = 0;
++      if (FAILED(
++              hr = ExtractMTLInputLayoutElements(
++                  device_, pDesc->VS.pShaderBytecode, pDesc->InputLayout.pInputElementDescs,
++                  pDesc->InputLayout.NumElements, input_elements_.data(), &num_elements
++              )
++          ))
++        return hr;
++      input_elements_.resize(num_elements);
++      slot_mask = 0;
++      for (auto &element : input_elements_) {
++        slot_mask |= (1 << element.slot);
++      }
++      input_slot_mask_ = slot_mask;
++
++      // retained so the stereo variant can be compiled later
++      auto vs_begin = static_cast<const uint8_t *>(pDesc->VS.pShaderBytecode);
++      vs_bytecode_.assign(vs_begin, vs_begin + pDesc->VS.BytecodeLength);
++      if (pDesc->pRootSignature) {
++        const void *blob = nullptr;
++        auto blob_length = static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->GetBlob(&blob);
++        auto blob_begin = static_cast<const uint8_t *>(blob);
++        rootsig_blob_.assign(blob_begin, blob_begin + blob_length);
++      }
++    } else {
++      ERR("no vertex shader");
++      return E_INVALIDARG;
++    }
++
++    WMTRenderPipelineInfo info;
++    WMT::InitializeRenderPipelineInfo(info);
++
++    bool dual_source_blending = false;
++
++    if (FAILED(hr = InitializePSO(pDesc, info, dual_source_blending)))
++      return hr;
++
++    dual_source_blending_ = dual_source_blending;
++    sample_mask_ = pDesc->SampleMask;
++    memset(pixel_formats_, 0, sizeof(pixel_formats_));
++    for (unsigned i = 0; i < pDesc->NumRenderTargets; i++) {
++      pixel_formats_[i] = ORIGINAL_FORMAT(info.colors[i].pixel_format);
++    }
++    // vertex amplification needs a plain rasterized pipeline: no tessellation, geometry or stream output
++    stereo_eligible_ = pDesc->PS.pShaderBytecode && !pDesc->HS.pShaderBytecode && !pDesc->DS.pShaderBytecode &&
++                       !pDesc->GS.pShaderBytecode && !pDesc->StreamOutput.NumEntries;
++
++    if (pDesc->PS.pShaderBytecode) {
++      if (FAILED(hr = InitializeShader(pDesc->PS, &shader_ps_, &ref_ps)))
++        return hr;
++      auto ps_begin = static_cast<const uint8_t *>(pDesc->PS.pShaderBytecode);
++      ps_bytecode_.assign(ps_begin, ps_begin + pDesc->PS.BytecodeLength);
++    }
++
++    if (FAILED(hr = CompileFunctions(false, vs_func, ps_func)))
++      return hr;
++
+     // PSO
+     {
+       info.vertex_function = vs_func.handle;
+       info.fragment_function = ps_func.handle;
+ 
++      pipeline_info_ = info;
+       pso = metal.newRenderPipelineState(info, err);
+ 
+       if (!pso) {
+diff --git a/src/winemetal/winemetal.h b/src/winemetal/winemetal.h
+index ec6dc9b..9b42e90 100644
+--- a/src/winemetal/winemetal.h
++++ b/src/winemetal/winemetal.h
+@@ -1264,6 +1264,9 @@ struct wmtcmd_render_setbuffer {
+   obj_handle_t buffer;
+   uint64_t offset;
+   uint8_t index;
++  /* DXMT-side only: byte size of the table written at offset, valid when table_size_known */
++  uint8_t table_size_known;
++  uint32_t table_size;
+ };
+ 
+ struct wmtcmd_render_setbytes {

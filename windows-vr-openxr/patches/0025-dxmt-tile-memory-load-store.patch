@@ -1,0 +1,244 @@
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index 4572e74..017d79e 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -1300,7 +1300,35 @@ public:
+   void
+   STDMETHODCALLTYPE
+   DiscardView1(ID3D11View *pResourceView, const D3D11_RECT *pRects, UINT NumRects) override {
+-    ERR_ONCE("Not implemented");
++    std::lock_guard<mutex_t> lock(mutex);
++
++    // only discards of the whole view are tracked, partial rects keep their contents
++    auto discard = [&](auto *view) {
++      if (NumRects && !pRects)
++        return;
++      if (NumRects) {
++        auto texture = view->texture();
++        auto width = texture->width(view->viewId());
++        auto height = texture->height(view->viewId());
++        bool covers = false;
++        for (UINT i = 0; i < NumRects && !covers; i++) {
++          covers = pRects[i].left <= 0 && pRects[i].top <= 0 && pRects[i].right >= (LONG)width &&
++                   pRects[i].bottom >= (LONG)height;
++        }
++        if (!covers)
++          return;
++      }
++      InvalidateCurrentPass();
++      EmitOP([texture = view->texture(), viewId = view->viewId()](ArgumentEncodingContext &enc) mutable {
++        enc.discardAttachment(forward_rc(texture), viewId);
++      });
++    };
++
++    if (auto rtv = com_cast<ID3D11RenderTargetView>(pResourceView)) {
++      discard(static_cast<D3D11RenderTargetView *>(rtv.ptr()));
++    } else if (auto dsv = com_cast<ID3D11DepthStencilView>(pResourceView)) {
++      discard(static_cast<D3D11DepthStencilView *>(dsv.ptr()));
++    }
+   }
+ #pragma endregion
+ 
+diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
+index 1faf496..bd78ee4 100644
+--- a/src/d3d11/d3d11_texture_device.cpp
++++ b/src/d3d11/d3d11_texture_device.cpp
+@@ -367,6 +367,13 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+   bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&
+                             !(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE);
+   auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
++  // Nothing can sample or copy from it, so a pass that is fully overwritten by the next one may skip its store.
++  // Memoryless storage is not used, as contents must survive pass boundaries when a later pass reads them.
++  texture->transient_attachment =
++      ((finalDesc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)) != 0) &&
++      (info.sample_count > 1 || (finalDesc.BindFlags & D3D11_BIND_DEPTH_STENCIL)) &&
++      ((finalDesc.BindFlags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS)) == 0) &&
++      finalDesc.Usage == D3D11_USAGE_DEFAULT && finalDesc.CPUAccessFlags == 0 && finalDesc.MiscFlags == 0;
+ 
+   MTL_DXGI_FORMAT_DESC format_desc;
+   MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, format_desc);
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 9f5e4d6..127ee14 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -512,6 +512,32 @@ ArgumentEncodingContext::clearDepthStencil(
+   endPass();
+ }
+ 
++void
++ArgumentEncodingContext::discardAttachment(Rc<Texture> &&texture, uint64_t viewId) {
++  // contents are undefined from here on, so the pass that produced them does not need to store them
++  if (encoder_current)
++    endPass();
++  auto matches = [&](const TextureViewRef &attachment) {
++    return attachment.ptr() && attachment->allocation->descriptor == texture.ptr() &&
++           static_cast<uint64_t>(attachment->key) == viewId;
++  };
++  if (encoder_last->type == EncoderType::Render) {
++    auto render = static_cast<RenderEncoderData *>(encoder_last);
++    for (unsigned i = 0; i < render->render_target_count; i++) {
++      auto &color = render->colors[i];
++      if (matches(color.attachment) && color.store_action == WMTStoreActionStore)
++        color.store_action = WMTStoreActionDontCare;
++    }
++    if (matches(render->depth.attachment) && render->depth.store_action == WMTStoreActionStore)
++      render->depth.store_action = WMTStoreActionDontCare;
++    if (matches(render->stencil.attachment) && render->stencil.store_action == WMTStoreActionStore)
++      render->stencil.store_action = WMTStoreActionDontCare;
++  }
++  // the next render pass on this view starts with DontCare, see endPass()
++  discarded_texture_ = texture;
++  discarded_view_ = viewId;
++}
++
+ void
+ ArgumentEncodingContext::resolveTexture(
+     Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view
+@@ -731,6 +757,22 @@ ArgumentEncodingContext::endPass() {
+     }
+   }
+ 
++  // the first pass after a discard does not need the discarded contents
++  if (discarded_texture_ && encoder_current->type == EncoderType::Render) {
++    auto render_encoder = static_cast<RenderEncoderData *>(encoder_current);
++    for (unsigned i = 0; i < render_encoder->render_target_count; i++) {
++      auto &color = render_encoder->colors[i];
++      if (color.load_action == WMTLoadActionLoad && isDiscardedAttachment(color.attachment))
++        color.load_action = WMTLoadActionDontCare;
++    }
++    if (render_encoder->depth.load_action == WMTLoadActionLoad && isDiscardedAttachment(render_encoder->depth.attachment))
++      render_encoder->depth.load_action = WMTLoadActionDontCare;
++    if (render_encoder->stencil.load_action == WMTLoadActionLoad &&
++        isDiscardedAttachment(render_encoder->stencil.attachment))
++      render_encoder->stencil.load_action = WMTLoadActionDontCare;
++  }
++  discarded_texture_ = nullptr;
++
+   encoder_current = nullptr;
+   encoder_count_++;
+ }
+@@ -865,6 +907,28 @@ ArgumentEncodingContext::$$setEncodingContext(uint64_t seq_id, uint64_t frame_id
+ 
+ constexpr unsigned kEncoderOptimizerThreshold = 64;
+ 
++// true if `next` overwrites the whole attachment before anything can read it
++static bool
++isNextPassOverwriting(const RenderEncoderColorAttachmentData &color, EncoderData *next) {
++  if (!next || !color.attachment.ptr() || color.depth_plane != 0)
++    return false;
++  if (next->type == EncoderType::Clear) {
++    auto clear = static_cast<ClearEncoderData *>(next);
++    return clear->clear_dsv == 0 && clear->attachment.ptr() == color.attachment.ptr();
++  }
++  if (next->type == EncoderType::Render) {
++    auto render = static_cast<RenderEncoderData *>(next);
++    for (unsigned i = 0; i < render->render_target_count; i++) {
++      auto &attachment = render->colors[i];
++      if (attachment.attachment.ptr() != color.attachment.ptr())
++        continue;
++      return attachment.depth_plane == 0 &&
++             (attachment.load_action == WMTLoadActionClear || attachment.load_action == WMTLoadActionDontCare);
++    }
++  }
++  return false;
++}
++
+ QueryReadbacks
+ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id) {
+   assert(!encoder_current);
+@@ -910,6 +974,14 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+     switch (current->type) {
+     case EncoderType::Render: {
+       auto data = static_cast<RenderEncoderData *>(current);
++      // the encoder after this one may fully overwrite an attachment that is never read by anything else
++      EncoderData *next_encoder = nullptr;
++      for (unsigned k = encoder_count - encoder_index + 1; k < encoder_count; k++) {
++        if (encoders[k]->type != EncoderType::Null) {
++          next_encoder = encoders[k];
++          break;
++        }
++      }
+       WMTRenderPassInfo render_pass_info;
+       WMT::InitializeRenderPassInfo(render_pass_info);
+       {
+@@ -921,6 +993,10 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+           color_info.texture = color_data.attachment.texture();
+           color_info.load_action = color_data.load_action;
+           color_info.store_action = color_data.store_action;
++          if (color_data.store_action == WMTStoreActionStore && !color_data.resolve_attachment &&
++              color_data.attachment->allocation->descriptor->transient_attachment &&
++              isNextPassOverwriting(color_data, next_encoder))
++            color_info.store_action = WMTStoreActionDontCare;
+           color_info.level = color_data.level;
+           color_info.slice = color_data.slice;
+           color_info.depth_plane = color_data.depth_plane;
+@@ -1630,7 +1706,7 @@ ArgumentEncodingContext::isEncoderSignatureMatched(RenderEncoderData *r0, Render
+     } else {
+       if (r0->depth.store_action != WMTStoreActionStore)
+         return false;
+-      if (r1->depth.load_action != WMTLoadActionLoad)
++      if (r1->depth.load_action != WMTLoadActionLoad && r1->depth.load_action != WMTLoadActionDontCare)
+         return false;
+     }
+   }
+@@ -1643,7 +1719,7 @@ ArgumentEncodingContext::isEncoderSignatureMatched(RenderEncoderData *r0, Render
+     } else {
+       if (r0->stencil.store_action != WMTStoreActionStore)
+         return false;
+-      if (r1->stencil.load_action != WMTLoadActionLoad)
++      if (r1->stencil.load_action != WMTLoadActionLoad && r1->stencil.load_action != WMTLoadActionDontCare)
+         return false;
+     }
+   }
+@@ -1658,7 +1734,7 @@ ArgumentEncodingContext::isEncoderSignatureMatched(RenderEncoderData *r0, Render
+       continue;
+     if (a0.store_action != WMTStoreActionStore)
+       return false;
+-    if (a1.load_action != WMTLoadActionLoad)
++    if (a1.load_action != WMTLoadActionLoad && a1.load_action != WMTLoadActionDontCare)
+       return false;
+   }
+   return true;
+diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
+index 20ed9bd..a306032 100644
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -719,6 +719,7 @@ public:
+   void clearDepthStencil(
+       Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag, float depth, uint8_t stencil
+   );
++  void discardAttachment(Rc<Texture> &&texture, uint64_t viewId);
+   void resolveTexture(Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view);
+ 
+   RenderEncoderData *startRenderPass(
+@@ -912,6 +913,16 @@ private:
+   void *dummy_cbuffer_host_;
+   WMTBufferInfo dummy_cbuffer_info_;
+ 
++  // attachment discarded since the last ended encoder, its first render pass may load DontCare
++  Rc<Texture> discarded_texture_;
++  uint64_t discarded_view_ = 0;
++
++  bool
++  isDiscardedAttachment(const TextureViewRef &attachment) {
++    return attachment.ptr() && discarded_texture_ && attachment->allocation->descriptor == discarded_texture_.ptr() &&
++           static_cast<uint64_t>(attachment->key) == discarded_view_;
++  }
++
+   EncoderData encoder_head = {EncoderType::Null, nullptr, ~0ull};
+   EncoderData *encoder_last = &encoder_head;
+   EncoderData *encoder_current = nullptr;
+diff --git a/src/dxmt/dxmt_texture.hpp b/src/dxmt/dxmt_texture.hpp
+index ba57499..cf3c55e 100644
+--- a/src/dxmt/dxmt_texture.hpp
++++ b/src/dxmt/dxmt_texture.hpp
+@@ -291,6 +291,9 @@ public:
+ 
+   Texture(unsigned bytes_per_image, unsigned bytes_per_row, const WMTTextureInfo &info, WMT::Device device);
+ 
++  // render target or depth stencil that no shader or copy reads, see CreateDeviceTexture
++  bool transient_attachment = false;
++
+ private:
+   void prepareAllocationViews(TextureAllocation* allocation);
+ 
