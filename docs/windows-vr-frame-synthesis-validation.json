@@ -1,0 +1,45 @@
+{
+  "snapshotDate": "2026-10-16",
+  "target": "Vision Pro M2 / visionOS 27",
+  "gameLaunched": false,
+  "installedOnHeadset": false,
+  "headsetFPSMeasured": false,
+  "neuralModelImplemented": false,
+  "releaseBuild": "passed",
+  "unsandboxedCodeSignatureVerification": "passed",
+  "productionRuntimeBundleVerification": "passed",
+  "nativeSyntheticProbes": "passed; see documentation for scope",
+  "simulatorFrameTransferExecution": "not run: no booted simulator; native macOS probe passed instead",
+  "sourceSha256": {
+    "windows-vr-native/Sources/WindowsVRFrameSynthesis.mm": "0a539bc893396946f09eaf097cc83107e7e5a06f0c478aa510a57d16d4e1e422",
+    "windows-vr-native/include/WindowsVRFrameSynthesis.h": "14c8e18f1b0f30bb6d56bbff29c39166935969be061f784e028b77d771ca511c",
+    "windows-vr-native/Tests/FrameSynthesisProbe.mm": "dd009ba32539593a96e84f96d27d7a8d24b4045488e88cf02f6d692f08f57cf0",
+    "windows-vr-openvr/patches/0008-openvr-scene-depth.patch": "6ee8ef621d9464a8053de08bd38be775c0732bccb00366e603748430260362d5",
+    "windows-vr-openvr/include/WindowsVRDepthProjection.h": "d693e382f147aa2a460b949b213888724d18f7d41ac5714cb223a707cd7773d2",
+    "windows-vr-openvr/tests/DepthProjectionProbe.cpp": "fc781b02fb848ee9dc8ac57f4baf63c3b9c56661726636fcf94a2fbf39f14689",
+    "windows-vr-tools/test_frame_synthesis.sh": "e4f6150996585587bee0085e80827d5fbfb9f5f6a733d81a197f013c06c972e7",
+    "visionos-windows-vr/Sources/Rendering/WindowsVRCompositorScene.swift": "bdd9e59c6c806ab047f34bbbad23a139bb10f22d2c9a11e4b9ade9cc6582a46a"
+  },
+  "localEvidence": {
+    "synthesis-test.log": {
+      "localPath": "/private/tmp/wvr-research-pass/synthesis-test.log",
+      "sha256": "0afae3e698cf9263cbeba57eac282f9252b7bc590f8a20b944e6ec16ad87b48e"
+    },
+    "app-build.log": {
+      "localPath": "/private/tmp/wvr-research-pass/app-build.log",
+      "sha256": "69a5d9c182d81f7877410b0e581dbb71dff0dd21a30a46c9e5b8282637b80ed1"
+    },
+    "reconstruction-regression.log": {
+      "localPath": "/private/tmp/wvr-research-pass/reconstruction-regression.log",
+      "sha256": "6451603a33b717e3f7c5cc4d12609452def8e084d5db0303333eef95ae9ab6c2"
+    },
+    "foveation-regression.log": {
+      "localPath": "/private/tmp/wvr-research-pass/foveation-regression.log",
+      "sha256": "a47e3c3237ebcc2ed944be9911cffcda00bb93c0d3670d801b169d076e900c99"
+    },
+    "frame-transfer-mac.log": {
+      "localPath": "/private/tmp/wvr-research-pass/frame-transfer-mac.log",
+      "sha256": "395574ecfad5c88b264c28e987b203695eb8871d2e1696def28220d604ea10f7"
+    }
+  }
+}

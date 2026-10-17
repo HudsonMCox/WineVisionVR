@@ -1,0 +1,185 @@
+{
+  "schemaVersion": 1,
+  "stage": "explicit depth transport, owned history and shadow reconstruction validation",
+  "signedVisionOSDeviceBuildSucceeded": true,
+  "signatureVerified": true,
+  "productionBundleVerified": true,
+  "visionOS27ShaderCompileSucceeded": true,
+  "realMacGPUValidatedVariants": [
+    "unorm",
+    "srgb",
+    "array-subrectangle",
+    "srgb-array-subrectangle"
+  ],
+  "gameLaunched": false,
+  "installedOnHeadset": false,
+  "headsetFPSMeasured": false,
+  "resolutionChanged": false,
+  "d3d11CompositionDepthCaptureImplemented": true,
+  "d3d12DepthCaptureEnabled": false,
+  "openVRColorOnlyDepthProviderImplemented": false,
+  "motionVectorsCaptured": false,
+  "secondEyeSceneRenderingSuppressed": false,
+  "generatedDisplayFramesEnabled": false,
+  "defaultValidationEnabled": false,
+  "preservedNativeJITExecutableTextSha256": "3df46aed87b830943c883ed7d68818a272ceb245304d1d4e2ead2609c417f77a",
+  "matchedGraphicsHeadersVerified": true,
+  "graphicsExportsUnchanged": true,
+  "artifacts": {
+    "Runtime/arm64ec-windows/d3d11.dll": {
+      "sha256": "0469609fce37e7abf45d246f9f9b592345412b6ca6dcccd579f318e69d32731f",
+      "buildCopyMatches": true
+    },
+    "Runtime/arm64ec-windows/dxgi.dll": {
+      "sha256": "ace99f2f0f7b5872882494c1c1d9166d10d045fe1b532bb1d83987c5c50323af",
+      "buildCopyMatches": true
+    },
+    "Runtime/arm64ec-windows/d3d12.dll": {
+      "sha256": "5f72e934d94dd3285784665b976e037225e05c4628fc5cad26ab10fe8fc6e09d",
+      "buildCopyMatches": true
+    },
+    "Runtime/arm64ec-windows/d3d10core.dll": {
+      "sha256": "bcaeb29d3d454fe8b4284edd5a1929f4aa7619cb6438b2fed99f5ce1db2d7b23",
+      "buildCopyMatches": true
+    },
+    "WindowsVR/Guest/arm64ec/wvr_openxr.dll": {
+      "sha256": "0ab84427a7c5a480f857f4df6228e66fb3eb48f5c03d36ba5b5e0a26f043645f",
+      "buildCopyMatches": true
+    },
+    "WindowsVR/Guest/x64/wvr_openxr.dll": {
+      "sha256": "efefa13bdc27d179c7b1928c253d0082b6310ddb492b752ec953203dac80b228",
+      "buildCopyMatches": true
+    },
+    "WineVision VR": {
+      "sha256": "7719ea948c3a0f203f6b2cd89cf0b556bb63d7ecb2f4575adeb42fb3ffd2c074"
+    },
+    "Frameworks/WindowsVRNativeBridge.framework/WindowsVRNativeBridge": {
+      "sha256": "d8450f085ba969585f0696487039e9ab700b47a4cf92a653d1d22b07bb2f5f76"
+    }
+  },
+  "sourceSha256": {
+    "windows-vr-native/include/WindowsVRReconstruction.h": "301f3aafd0ea3587d0f6a26410a90a1084a76543abf2c6eb167aba87570769df",
+    "windows-vr-native/Sources/WindowsVRReconstruction.mm": "83943493b31d8474811acce7e85841685397a8d865f5a0ec53f649fbda74a18c",
+    "windows-vr-native/Sources/WindowsVRCompositorBridge.mm": "8e0a65879dddea11a3f7d5a7685135a191feb32549d882b33c863bd342f74050",
+    "windows-vr-native/Sources/WindowsVRGuestFoveation.mm": "3c418c10c6ffd55124dd03fbe9f1c44e6743243c82e626e257d35400db71f9aa",
+    "windows-vr-native/Tests/ReconstructionProbe.mm": "57caf9530c3fafe9e5c31425a638d0f0a02d583e20825ca4b9b99cff0f1dda14",
+    "windows-vr-openxr/include/WindowsVRD3D11ContextExt.h": "eeff1989322509af9c97d5006928d53513a4e9de266ba2ff1c2f10f4cfd06765",
+    "windows-vr-openxr/include/WindowsVRReconstruction.h": "94014fa36befae95e22cc378d6fff7c45f12a1ceabbe7f7e1045a0f5762f8ac4",
+    "windows-vr-openxr/src/WindowsVROpenXR.cpp": "2f77fe8640a9cf026d9fbe146d470ac98b43225472f5bdbb01e58e70e9514a5a",
+    "windows-vr-openxr/patches/0024-dxmt-explicit-scene-depth.patch": "2f482250968e368ab0ec5a32a0091aa4b6610f92abdaefb8c639dcb6998f5ffa",
+    "windows-vr-openxr/tests/test_depth_projection.py": "59caeaf6b326b6933185349632b31cdd016a413f6b0f6065d2ec2e52dcc92208",
+    "windows-vr-openxr/tests/test_depth_submission.py": "39e221a02c55779c1a986ab4e2c9ba905e8a32951330c62626d875271012a185",
+    "windows-vr-openxr/tests/test_depth_pending_lifetime.py": "91b80cf8bf4cb1ac7f0396867dca0ee8be34a86ee586e009d4bb7b8759f1ec95",
+    "windows-vr-tools/prepare_d3d12_profile.sh": "2857314e095118ac73807ad6c28f074f20dd1754aa3fe0867ffe396b0b12c7f1",
+    "windows-vr-tools/test_reconstruction.sh": "fa925b720c716423c208b2e29ecf34cbe9966beee6056070cb3c63fddbdea76b",
+    "visionos-windows-vr/Sources/WindowsVR-Bridging-Header.h": "a412cbea1003bb2c0441f2f15d23b46260a6029f40ec466f08d71bf5b6ff3895",
+    "visionos-windows-vr/Sources/ContentView.swift": "d57fe27b594ba7c2d8dacc115cc5087470451df1ecd9055b94e6c4889d695869",
+    "visionos-windows-vr/Sources/LaunchLog.swift": "cd56f095fb07d3faffd9c455aa69d1cace6aef691b633c25be7b66cffe4bbedf",
+    "visionos-windows-vr/Sources/Rendering/WindowsVRCompositorScene.swift": "0408202493f469b6f6e368a98f4bc87dd97c6dc801e6a1f164799152028b0d67"
+  },
+  "embeddedShaderSha256": "6405dd41181ab8254b993f4386f097f0165bc343adc5641735f2a43c55813e25",
+  "installedSDKMetalFXInterpolationAvailableOnVisionOS": false,
+  "installedSDKMetalFXHeaderSha256": "233d20aadea260a5a1bbcab2452788cc29f22f793a8d767b4a6a65eaf1fb9a35",
+  "localEvidence": {
+    "app-build.log": {
+      "localPath": ".build-reconstruction/app-build.log",
+      "sha256": "8cef61428540492fed201590ef8ba77d7f0b3c3e4b9240d56e0df0080b056bcf"
+    },
+    "depth-lifetime-test.log": {
+      "localPath": ".build-reconstruction/depth-lifetime-test.log",
+      "sha256": "a89e42cea6dcaa3f6340de3291e48643334e48e8f262e584e6883ad98bbfcbfb"
+    },
+    "depth-submission-test.log": {
+      "localPath": ".build-reconstruction/depth-submission-test.log",
+      "sha256": "27cdc00b3608d970a3ef1eb49607b2828719ced926727f340019d3ca3ffcc3c5"
+    },
+    "depth-test.log": {
+      "localPath": ".build-reconstruction/depth-test.log",
+      "sha256": "5ff226998e7a6ad53e0e4e12c164b3bb5f5ae7c7b51d35550b2693e2dc5f4290"
+    },
+    "dxmt-build.log": {
+      "localPath": ".build-reconstruction/dxmt-build.log",
+      "sha256": "95e40b09c4026efa25baea1bc0e7aa98308ae1e8e69cb11049b37eab71e9e835"
+    },
+    "dxmt-configure.log": {
+      "localPath": ".build-reconstruction/dxmt-configure.log",
+      "sha256": "a7877df3d141604b8ba73b3320fb3d960fe54ad53e425bfa6b2cd378b689a6fe"
+    },
+    "final-bundle-check.log": {
+      "localPath": ".build-reconstruction/final-bundle-check.log",
+      "sha256": "52cfa68f122003a49ec4589d90ccb8b2a9b145c0dcfa9870e1d7280c25001042"
+    },
+    "foveation-test.log": {
+      "localPath": ".build-reconstruction/foveation-test.log",
+      "sha256": "86097cd6fd2ad0e290013477cdeca95f3678b50d1bf7652ec0f950304a8cf4b0"
+    },
+    "frame-transport-test.log": {
+      "localPath": ".build-reconstruction/frame-transport-test.log",
+      "sha256": "e5ca1ac0893695e82a1a53475634d0e62b799689d83d2fb559e3b8942e80ba68"
+    },
+    "frame-wait-test.log": {
+      "localPath": ".build-reconstruction/frame-wait-test.log",
+      "sha256": "27b6930b67485aea8e31da05cdfc8db2f5fd0b0b72fc2f71fd260bdbf0e643ad"
+    },
+    "gpu-array-srgb-test.log": {
+      "localPath": ".build-reconstruction/gpu-array-srgb-test.log",
+      "sha256": "d5b3cfca4e0e82196f5d1382b160726cca8c158ee2fb750ddc8b7d5c37ba30e2"
+    },
+    "gpu-test.log": {
+      "localPath": ".build-reconstruction/gpu-test.log",
+      "sha256": "bb532dcf5438154aee5d3cb5a4221a11d9093e5624a692d57cb8d42c767d6f24"
+    },
+    "graphics-closure-build.log": {
+      "localPath": ".build-reconstruction/graphics-closure-build.log",
+      "sha256": "e74c7b24eef852f65029b94843450a08fb86c8cb81b11c11972c475d956c2d90"
+    },
+    "header-sync-build.log": {
+      "localPath": ".build-reconstruction/header-sync-build.log",
+      "sha256": "1738af0d3868fd9673a3cc453703ea00f9ea0f01cac89b449815232e75a24d61"
+    },
+    "input-test.log": {
+      "localPath": ".build-reconstruction/input-test.log",
+      "sha256": "cf881f91da262b0f287311cc2122c7eee670064772286594897b26bd6ee8ea66"
+    },
+    "metal-toolchain-download.log": {
+      "localPath": ".build-reconstruction/metal-toolchain-download.log",
+      "sha256": "b5be4f01c3caea9885b533781d1baba4f4daba9a8ba880d441f6adedbf953ea8"
+    },
+    "native-build.log": {
+      "localPath": ".build-reconstruction/native-build.log",
+      "sha256": "eff08e5d8d6793fb339acb6a7004ad7d391ea8bf7419b2f24d9f733cffb70097"
+    },
+    "openxr-build.log": {
+      "localPath": ".build-reconstruction/openxr-build.log",
+      "sha256": "acc07760232943079804d7ca41649e8ffa52ffa06967fc0449cbe2b059f06bc5"
+    },
+    "openxr-x64-build.log": {
+      "localPath": ".build-reconstruction/openxr-x64-build.log",
+      "sha256": "a4a8b3a5b71b02a5f17c0d3264a1e46e18df39185136ac6dfce52e993c2cc581"
+    },
+    "package-test.log": {
+      "localPath": ".build-reconstruction/package-test.log",
+      "sha256": "1cfa9ca2d91a8f060b7a8be9ebd2ec9f7784e164b6ac6250b3388f21713245df"
+    },
+    "patch-test.log": {
+      "localPath": ".build-reconstruction/patch-test.log",
+      "sha256": "1ed944a3d29bb90a84e40931810a075e80eb5197248833ca4f6d9a7e21dfdd2f"
+    },
+    "regression.log": {
+      "localPath": ".build-reconstruction/regression.log",
+      "sha256": "086430d575c93dd231e79239c0567329b8b24f05ff5700e8ccd4415ed813dff4"
+    },
+    "stage.log": {
+      "localPath": ".build-reconstruction/stage.log",
+      "sha256": "23ed411afd0d0543fd709bd082d6b988217eb118223ff4e633cc3c2d826df13c"
+    },
+    "visionos-shader-test.log": {
+      "localPath": ".build-reconstruction/visionos-shader-test.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "xcodegen.log": {
+      "localPath": ".build-reconstruction/xcodegen.log",
+      "sha256": "243b17608fd849260246bad52c50e752add3904e154678c1859a824990eb07b5"
+    }
+  }
+}

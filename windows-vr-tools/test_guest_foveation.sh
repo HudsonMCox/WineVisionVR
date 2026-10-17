@@ -22,3 +22,9 @@ PY
 xcrun --sdk macosx clang++ -std=c++20 -O2 -fobjc-arc "$ROOT/windows-vr-native/Tests/LayeredFoveatedPresentationProbe.mm" -framework Foundation -framework Metal -o "$BUILD/layered"
 "$BUILD/layered" "$BUILD/presentation.metal"
 echo "GPU checks: $BUILD"
+
+xcrun --sdk macosx clang++ -std=c++20 -O2 -fobjc-arc -DWVR_GUEST_FOVEATION_TEST=1 \
+ -I "$ROOT/windows-vr-native/include" "$ROOT/windows-vr-native/Sources/WindowsVRGuestFoveation.mm" \
+ "$ROOT/windows-vr-native/Sources/WindowsVRCompositorBridge.mm" "$ROOT/windows-vr-native/Tests/StereoAtlasFoveationProbe.mm" \
+ -Wl,-export_dynamic -framework Foundation -framework Metal -framework CoreFoundation -framework QuartzCore -o "$BUILD/atlas"
+"$BUILD/atlas"

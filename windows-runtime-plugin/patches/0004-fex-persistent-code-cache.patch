@@ -1,0 +1,766 @@
+--- a/FEX/FEXCore/Source/Interface/Core/CodeCache.cpp
++++ b/FEX/FEXCore/Source/Interface/Core/CodeCache.cpp
+@@ -30,6 +30,11 @@
+ #include <FEXCore/Utils/AllocatorHooks.h>
+ 
+ #include <fstream>
++#include <FEXCore/Utils/DualMap.h>
++#if defined(FEX_IOS_HOST) && !defined(__APPLE__)
++extern "C" long NtFlushInstructionCache(void*, const void*, unsigned long long);
++extern "C" long NtUnmapViewOfSection(void*, void*);
++#endif
+ 
+ namespace FEXCore {
+ 
+@@ -50,6 +55,11 @@
+   if (!CodeBuffer.empty()) {
+     FEXCore::Allocator::munmap(CodeBuffer.data(), CodeBuffer.size_bytes());
+   }
++#elif defined(_M_ARM64EC)
++  if (!CodeBuffer.empty()) FEXCore::Allocator::VirtualFree(CodeBuffer.data(), CodeBuffer.size_bytes());
++#if defined(FEX_IOS_HOST)
++  if (!MappedFile.empty()) NtUnmapViewOfSection(reinterpret_cast<void*>(~0ull), MappedFile.data());
++#endif
+ #endif
+ }
+ 
+@@ -277,7 +287,7 @@
+   // Version history:
+   // 1: Initial version
+   // 2: Padding code buffer data to enable direct mapping
+-  uint32_t FormatVersion = 2;
++  uint32_t FormatVersion = 3;
+   uint8_t FEXVersion[20] = {};
+   uint32_t NumBlocks;
+   uint32_t NumCodePages;
+@@ -285,10 +295,85 @@
+   uint32_t NumRelocations;
+   uint32_t padding;
+   uint64_t SerializedBaseAddress;
++  uint64_t SourceHash;
++  uint64_t PayloadHash;
+   // TODO: Consider including information from LookupCache.BlockLinks
+ 
+   static constexpr std::array<char, 4> ExpectedMagic = {'F', 'X', 'C', 'C'};
+ };
++
++// Full source bytes invalidate caches even when a publisher preserves PE metadata.
++static uint64_t SourceHash(const fextl::string& Filename) {
++  std::string Path(Filename.c_str());
++  if (Path.starts_with("\\??\\")) Path.erase(0, 4);
++  std::ifstream File(Path, std::ios::binary);
++  if (!File) return 0;
++  auto State = XXH3_createState();
++  if (!State) return 0;
++  XXH3_64bits_reset(State);
++  char Buffer[65536];
++  while (File.read(Buffer, sizeof(Buffer)) || File.gcount()) XXH3_64bits_update(State, Buffer, File.gcount());
++  auto Hash = File.bad() ? 0 : XXH3_64bits_digest(State);
++  XXH3_freeState(State);
++  return Hash;
++}
++
++// Validate the complete layout before allocating or dereferencing variable counts.
++static bool ValidateCacheLayout(std::span<const std::byte> File, const CodeCacheHeader& H) {
++  size_t Cursor = sizeof(H);
++  auto Skip = [&](uint64_t N, size_t Unit) {
++    if (N > (File.size() - Cursor) / Unit) return false;
++    Cursor += N * Unit; return true;
++  };
++  auto Read = [&](uint64_t& Value) {
++    if (!Skip(1, 8)) return false;
++    memcpy(&Value, File.data() + Cursor - 8, 8); return true;
++  };
++  if (File.size() < sizeof(H) || H.FormatVersion != 3 || !H.NumBlocks ||
++      !H.CodeBufferSize || H.CodeBufferSize > 96 * 1024 * 1024 || H.CodeBufferSize % 4096 ||
++      H.NumBlocks > 1000000 || H.NumCodePages > 1000000) return false;
++  uint64_t LastGuest = 0;
++  for (uint32_t I = 0; I < H.NumBlocks; ++I) {
++    uint64_t Guest, Host, Pages;
++    if (!Read(Guest) || !Read(Host) || !Read(Pages) || !Pages ||
++        Guest > UINT32_MAX || (I && Guest <= LastGuest) || Host >= H.CodeBufferSize || Host % 4 || !Skip(Pages, 8)) return false;
++    LastGuest = Guest;
++  }
++  uint64_t LastOffset = 0;
++  for (uint32_t I = 0; I < H.NumRelocations; ++I) {
++    if (!Skip(1, sizeof(CPU::Relocation))) return false;
++    CPU::Relocation R;
++    memcpy(&R, File.data() + Cursor - sizeof(R), sizeof(R));
++    auto Type = static_cast<uint32_t>(R.Header.Type);
++    auto Bytes = (Type == 0 || Type == 2) ? 8U : 16U;
++    if (Type > 3 || R.Header.Offset > H.CodeBufferSize - Bytes || (I && R.Header.Offset < LastOffset) ||
++        (Type == 0 && static_cast<uint32_t>(R.NamedSymbolLiteral.Symbol) != 0) ||
++        (Type == 1) ||
++        (Type == 3 && R.GuestRIP.RegisterIndex > 30)) return false;
++    LastOffset = R.Header.Offset;
++  }
++  Cursor = AlignUp(Cursor, 4096);
++  if (Cursor > File.size() || !Skip(H.CodeBufferSize, 1)) return false;
++  for (uint32_t I = 0; I < H.NumCodePages; ++I) {
++    uint64_t Page, Entries;
++    if (!Read(Page) || Page > UINT32_MAX || Page % 4096 || !Read(Entries) || !Skip(Entries, 8)) return false;
++  }
++  // NtMapView rounds the final page up; trailing mapped padding is not hashed.
++  if (Cursor > File.size() || H.padding != Cursor || H.padding < sizeof(H)) return false;
++  return XXH3_64bits(File.data() + sizeof(H), Cursor - sizeof(H)) == H.PayloadHash;
++}
++
++bool IsPersistentCacheCurrent(const char* Filename, const char* SourceFilename) {
++  std::ifstream File(Filename, std::ios::binary | std::ios::ate);
++  if (!File) return false;
++  auto Size = File.tellg();
++  if (Size < static_cast<std::streamoff>(sizeof(CodeCacheHeader)) || Size > 128 * 1024 * 1024) return false;
++  fextl::vector<std::byte> Data(static_cast<size_t>(Size));
++  File.seekg(0); if (!File.read(reinterpret_cast<char*>(Data.data()), Size)) return false;
++  CodeCacheHeader H; memcpy(&H, Data.data(), sizeof(H));
++  return std::ranges::equal(H.Magic, H.ExpectedMagic) && std::ranges::equal(H.FEXVersion, GIT_HASH) &&
++    ValidateCacheLayout(Data, H) && H.SourceHash && H.SourceHash == SourceHash(fextl::string(SourceFilename));
++}
+ 
+ template<typename T>
+ concept OrderedContainer = requires { typename T::key_compare; };
+@@ -297,6 +382,11 @@
+   auto CodeBuffer = CTX.GetLatest();
+   auto& LookupCache = *Thread.LookupCache->Shared;
+   auto Relocations = Thread.CPUBackend->TakeRelocations(SourceBinary.FileStartVA);
++
++  bool IOOkay = true;
++  auto Write = [&](int FD, const void* Data, size_t Size) {
++    if (::write(FD, Data, Size) != static_cast<ssize_t>(Size)) IOOkay = false;
++  };
+ 
+   // Write file header
+   CodeCacheHeader header {};
+@@ -307,7 +397,9 @@
+   header.CodeBufferSize = FEXCore::AlignUp(CTX.LatestOffset, Utils::FEX_PAGE_SIZE);
+   header.NumRelocations = Relocations.size();
+   header.SerializedBaseAddress = SerializedBaseAddress;
+-  ::write(fd, &header, sizeof(header));
++  header.SourceHash = SourceHash(SourceBinary.FileInfo.Filename);
++  if (!header.SourceHash || !header.NumBlocks) return false;
++  Write(fd, &header, sizeof(header));
+ 
+   // Dump guest<->host block mappings
+   {
+@@ -326,22 +418,22 @@
+       static_assert(sizeof(Host->CodePages[0]) == 8, "Breaking change in code cache data layout");
+ 
+       Guest -= SourceBinary.FileStartVA;
+-      ::write(fd, &Guest, sizeof(Guest));
++      Write(fd, &Guest, sizeof(Guest));
+       uint64_t HostCode = Host->HostCode - reinterpret_cast<uintptr_t>(CodeBuffer->Ptr);
+-      ::write(fd, &HostCode, sizeof(HostCode));
++      Write(fd, &HostCode, sizeof(HostCode));
+       uint64_t NumCodePages = Host->CodePages.size();
+-      ::write(fd, &NumCodePages, sizeof(NumCodePages));
++      Write(fd, &NumCodePages, sizeof(NumCodePages));
+       LOGMAN_THROW_A_FMT(std::ranges::is_sorted(Host->CodePages), "Code pages aren't sorted");
+       for (auto CodePage : Host->CodePages) {
+         CodePage -= SourceBinary.FileStartVA;
+-        ::write(fd, &CodePage, sizeof(CodePage));
++        Write(fd, &CodePage, sizeof(CodePage));
+       }
+     }
+   }
+ 
+   // Dump relocations
+   static_assert(sizeof(Relocations[0]) == 48, "Breaking change in code cache data layout");
+-  ::write(fd, Relocations.data(), Relocations.size() * sizeof(Relocations[0]));
++  Write(fd, Relocations.data(), Relocations.size() * sizeof(Relocations[0]));
+ 
+   // Pad to next page in file so that the CodeBuffer can be mmap'ed into process on load
+ #if defined(__APPLE__)
+@@ -352,7 +444,7 @@
+   auto Off = lseek(fd, 0, SEEK_CUR);
+   while (Off != AlignUp(Off, Utils::FEX_PAGE_SIZE)) {
+     auto BytesToWrite = std::min(static_cast<size_t>(AlignUp(Off, Utils::FEX_PAGE_SIZE) - Off), sizeof(Zero));
+-    ::write(fd, Zero, BytesToWrite);
++    Write(fd, Zero, BytesToWrite);
+     Off += BytesToWrite;
+   }
+ #else
+@@ -364,12 +456,15 @@
+ #endif
+ 
+   // Dump the host code (relocated for position-independent serialization)
+-  std::span CodeBufferData(reinterpret_cast<std::byte*>(CodeBuffer->Ptr), reinterpret_cast<std::byte*>(CodeBuffer->Ptr) + CTX.LatestOffset);
++  // Serialize immutable bytes; relocation must never modify executing code.
++  fextl::vector<std::byte> Snapshot(CTX.LatestOffset);
++  memcpy(Snapshot.data(), CodeBuffer->Ptr, Snapshot.size());
++  std::span CodeBufferData {Snapshot.data(), Snapshot.size()};
+   if (!ApplyCodeRelocations(SerializedBaseAddress, CodeBufferData, Relocations, 0, true)) {
+     LOGMAN_THROW_A_FMT(false, "Failed to apply code relocations");
+     return false;
+   }
+-  ::write(fd, CodeBufferData.data(), CodeBufferData.size());
++  Write(fd, CodeBufferData.data(), CodeBufferData.size());
+   // Pad to next page in file for mmap
+   {
+     auto PaddedSize = AlignUp(lseek(fd, 0, SEEK_CUR), Utils::FEX_PAGE_SIZE);
+@@ -381,15 +476,22 @@
+   static_assert(OrderedContainer<decltype(LookupCache.CodePages)>, "Non-deterministic data source");
+   for (const auto& [PageIndex, Entrypoints] : LookupCache.CodePages) {
+     uint64_t PageAddr = (PageIndex << 12) - SourceBinary.FileStartVA;
+-    ::write(fd, &PageAddr, sizeof(PageAddr));
++    Write(fd, &PageAddr, sizeof(PageAddr));
+     uint64_t NumEntrypoints = Entrypoints.size();
+-    ::write(fd, &NumEntrypoints, sizeof(NumEntrypoints));
++    Write(fd, &NumEntrypoints, sizeof(NumEntrypoints));
+     for (uint64_t Entrypoint : Entrypoints) {
+       Entrypoint -= SourceBinary.FileStartVA;
+-      ::write(fd, &Entrypoint, sizeof(Entrypoint));
+-    }
+-  }
+-
++      Write(fd, &Entrypoint, sizeof(Entrypoint));
++    }
++  }
++
++  auto End = lseek(fd, 0, SEEK_CUR);
++  if (!IOOkay || End < static_cast<off_t>(sizeof(header)) || End > 128 * 1024 * 1024) return false;
++  header.padding = End; // Exact payload length, excluding mapped-page padding.
++  fextl::vector<std::byte> Payload(End - sizeof(header));
++  if (lseek(fd, sizeof(header), SEEK_SET) < 0 || ::read(fd, Payload.data(), Payload.size()) != static_cast<ssize_t>(Payload.size())) return false;
++  header.PayloadHash = XXH3_64bits(Payload.data(), Payload.size());
++  if (lseek(fd, 0, SEEK_SET) < 0 || ::write(fd, &header, sizeof(header)) != sizeof(header)) return false;
+   return true;
+ }
+ 
+@@ -511,6 +613,7 @@
+ bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> Code,
+                                      std::span<const FEXCore::CPU::Relocation> EntryRelocations, uint32_t RelocationOffset, bool ForStorage) {
+   CPU::Arm64Emitter Emitter(&CTX, Code.data(), Code.size_bytes());
++  Emitter.SetWriteOffset(ForStorage ? 0 : FEXCore::DualMap::WriteOffset);
+   for (size_t j = 0; j < EntryRelocations.size(); ++j) {
+     const FEXCore::CPU::Relocation& Reloc = EntryRelocations[j];
+     LOGMAN_THROW_A_FMT(Reloc.Header.Offset >= RelocationOffset, "Invalid relocation offset");
+@@ -564,7 +667,12 @@
+ 
+   // Read file header
+   CodeCacheHeader header {};
++  if (CacheFile.size() < sizeof(header)) return nullptr;
+   ::memcpy(&header, CacheFile.data(), sizeof(header));
++  if (!ValidateCacheLayout(CacheFile, header) || !header.SourceHash || header.SourceHash != SourceHash(FileInfo.Filename)) {
++    LogMan::Msg::IFmt("Cache rejected: layout, checksum or source changed");
++    return nullptr;
++  }
+ 
+   if (!std::ranges::equal(header.Magic, header.ExpectedMagic)) {
+     LogMan::Msg::EFmt("Invalid cache file header");
+@@ -613,8 +721,11 @@
+     return nullptr;
+   }
+   auto CodeBuffer = std::span {static_cast<std::byte*>(CodeBufferAllocation), header.CodeBufferSize};
++#elif defined(_M_ARM64EC)
++  auto Allocation = Allocator::VirtualAlloc(header.CodeBufferSize, true);
++  if (!Allocation) return nullptr;
++  auto CodeBuffer = std::span {reinterpret_cast<std::byte*>(Allocation), header.CodeBufferSize};
+ #else
+-  // TODO: Implement lazy mapping on Windows
+   auto CodeBuffer = CodeDataInFile;
+ #endif
+ 
+@@ -687,6 +798,16 @@
+     LogMan::Msg::IFmt("            lazy mapping: base={:#14x} -> host={}; cache_source={}", BinarySection.FileStartVA,
+                       fmt::ptr(Code.CodeBuffer.data()), fmt::ptr(Code.MappedFile.data()));
+   }
++#ifndef _WIN32
++  if (!EnableLazyCodeCaching || EnableCodeCacheValidation) {
++#else
++  // TODO: Implement lazy mapping on Windows
++  if (true) {
++#endif
++    auto Range = SelectCodeRangeToFinalize(Code, 0, Code.CodeBuffer.size_bytes() / Utils::FEX_PAGE_SIZE);
++    if (!Range.empty()) FinalizeCodePages(Code, Range);
++  }
++
+   // Register blocks to LookupCache.
+   // The host addresses will point into the protected code buffer, so that FEX
+   // can lazily apply relocations on first execution of each page.
+@@ -732,15 +853,6 @@
+     }
+   }
+ 
+-#ifndef _WIN32
+-  if (!EnableLazyCodeCaching || EnableCodeCacheValidation) {
+-#else
+-  // TODO: Implement lazy mapping on Windows
+-  if (true) {
+-#endif
+-    auto Range = SelectCodeRangeToFinalize(Code, 0, Code.CodeBuffer.size_bytes() / Utils::FEX_PAGE_SIZE);
+-    FinalizeCodePages(Code, Range);
+-  }
+ 
+   if (EnableCodeCacheValidation) {
+     fextl::set<uint64_t> GuestBlocks, HostBlocks;
+@@ -838,9 +950,7 @@
+ 
+   FEXCORE_PROFILE_SCOPED("FinalizeCodePages");
+ 
+-// Apple/iOS has no mremap(MREMAP_*); the persistent code cache isn't used on
+-// the iOS host anyway, so fall through to the direct in-place relocation path
+-// below (same as the Windows branch) rather than the mremap staging dance.
++// iOS copies into its dual-mapped executable pool; it cannot mremap code pages.
+ #if !defined(_WIN32) && !defined(__APPLE__)
+   // Atomicity is critical when making the finalized code data visible.
+   // We ensure this by remapping a temporary buffer onto the PROT_NONE
+@@ -885,15 +995,24 @@
+   // Release resident file pages that will no longer be needed. The VA range is left allocated to allow cleanup with a single VirtualFree.
+   Allocator::VirtualDontNeed(Code.CodeBufferInFile.data() + StartOffset, Size);
+ #else
+-  // TODO: Implement lazy mapping on Windows
++#ifdef _M_ARM64EC
++  memcpy(FEXCore::DualMap::WriteAddr(Code.CodeBuffer.data() + StartOffset),
++         Code.CodeBufferInFile.data() + StartOffset, Size);
++#endif
+   for (size_t i = StartPage; i < EndPage; ++i) {
+     auto PageRelocations = SpanPageRelocations(Code, i);
+-    (void)ApplyCodeRelocations(Code.GuestBase, Code.CodeBuffer, PageRelocations, 0, false);
++    if (!ApplyCodeRelocations(Code.GuestBase, Code.CodeBuffer, PageRelocations, 0, false)) {
++      ERROR_AND_DIE_FMT("Validated cache relocation failed");
++    }
+     Code.LoadedPages[i] = true;
+   }
+ #endif
+ 
++#if defined(FEX_IOS_HOST) && !defined(__APPLE__)
++  NtFlushInstructionCache(reinterpret_cast<void*>(~0ull), CodeRange.data(), Size);
++#else
+   ARMEmitter::Emitter::ClearICache(CodeRange.data(), Size);
++#endif
+ }
+ 
+ } // namespace FEXCore::Context
+--- a/FEX/FEXCore/include/FEXCore/Core/CodeCache.h
++++ b/FEX/FEXCore/include/FEXCore/Core/CodeCache.h
+@@ -19,6 +19,8 @@
+ #include <unistd.h>
+ 
+ namespace FEXCore {
++namespace Context { FEX_DEFAULT_VISIBILITY bool IsPersistentCacheCurrent(const char* Filename, const char* SourceFilename); }
++
+ 
+ namespace Core {
+   struct InternalThreadState;
+--- a/FEX/Source/Windows/Common/ImageTracker.cpp
++++ b/FEX/Source/Windows/Common/ImageTracker.cpp
+@@ -1,3 +1,4 @@
++#include <FEXCore/Config/CodeCacheIdentity.h>
+ // SPDX-License-Identifier: MIT
+ 
+ #include <array>
+@@ -35,6 +36,13 @@
+   return Res;
+ }
+ 
++static fextl::string NormalizeCacheFilename(std::string_view Path) {
++  // MemoryMappedFilenameInformation supplies NT paths. The offline compiler
++  // opens them with Win32/CRT APIs, which require a DOS path instead.
++  if (Path.starts_with("\\??\\")) Path.remove_prefix(4);
++  return ToLower(Path);
++}
++
+ FEXCore::CodeMapFileId ComputeCodeMapId(std::string_view FileName, uint32_t TimeDateStamp, uint32_t SizeOfImage) {
+   const auto Norm {ToLower(FileName)};
+   return XXH3_64bits(Norm.data(), Norm.size()) ^ (static_cast<uint64_t>(SizeOfImage) << 32 | TimeDateStamp);
+@@ -120,7 +128,7 @@
+ ImageTracker::MappedImageInfo::MappedImageInfo(std::string_view Path, uint64_t Address, ArchImageNtHeaders* Nt,
+                                                fextl::robin_map<uint32_t, FEXCore::GuestRelocationType> Relocations)
+   : Info {.FileId = ComputeCodeMapId(BaseName(Path), Nt->FileHeader.TimeDateStamp, Nt->OptionalHeader.SizeOfImage),
+-          .Filename = ToLower(Path), // Normalize path case as Windows paths are case-insensitive
++          .Filename = NormalizeCacheFilename(Path), // Stable Win32 path for offline compilation
+           .Relocations = std::move(Relocations)}
+   , SectionInfo {.FileInfo = Info, .FileStartVA = Address, .BeginVA = Address, .EndVA = Address + Nt->OptionalHeader.SizeOfImage} {}
+ 
+@@ -161,18 +169,24 @@
+         std::filesystem::create_directories(CodeMapDir, ec);
+       }
+       if (!ec) {
+-        ActiveCodeMapPath = fmt::format("{}{}.{}.bin", CodeMapDir, ID, Time.QuadPart);
+-
+-        auto Writer = fextl::make_unique<FEXCore::CodeMapWriter>(*this, false);
++        ActiveCodeMapPath = fmt::format("{}{}.{}.{}.bin", CodeMapDir, ID, Time.QuadPart, GetCurrentProcessId());
++
++        auto Writer = fextl::make_unique<FEXCore::CodeMapWriter>(*this, true);
+         Writer->AppendSetMainExecutable(ImageInfo->Info);
++        ActiveCodeMapWriter = Writer.get();
+         CTX.SetCodeMapWriter(std::move(Writer));
+       }
++    }
++    if (ActiveCodeMapWriter) {
++      // Cached blocks do not call AppendBlock. Retain executable/dependency
++      // filenames even when every block in that module came from disk.
++      ActiveCodeMapWriter->AppendLibraryLoad(ImageInfo->Info);
+       LoadAOTImages(*ImageInfo);
+     }
+ 
+-    auto AOTImage = AOTImages.find(ID);
+-    if (AOTImage != AOTImages.end()) {
+-      // TODO: CodeCache::EnableLoadedSection
++    auto AOTImage = AOTImages.find(fextl::fmt::format("{}@{:x}", ID, Address));
++    if (AOTImage != AOTImages.end() && AOTImage->second.CacheFile) {
++      CTX.GetCodeCache().EnableLoadedSection(nullptr, *AOTImage->second.CacheFile, ImageInfo->SectionInfo);
+     }
+   }
+ 
+@@ -220,77 +234,51 @@
+ }
+ 
+ void ImageTracker::LoadAOTImages(MappedImageInfo& ImageInfo) {
+-  const auto AnsiPath =
+-    fmt::format("\\??\\{}cache\\{}", FEX::Config::GetCacheDirectory(), FEXCore::CodeMap::GetBaseFilename(ImageInfo.Info, false));
+-
+-  // Iterate over all files in the given executable's cache directory, mapping them into memory for future use.
+-  // Each cache file name matches the unique ID (as returned by FEXCore::CodeMap::GetBaseFilename) of the image it corresponds to.
+-  ScopedUnicodeString NtPath(AnsiPath.c_str());
+-
+-  OBJECT_ATTRIBUTES DirAttr;
+-  InitializeObjectAttributes(&DirAttr, &*NtPath, OBJ_CASE_INSENSITIVE, NULL, NULL);
+-
+-  ScopedHandle DirHandle;
++  // Don't attempt cache loading for FEXOfflineCompiler itself
++  static bool IsFOC32 = ImageInfo.Info.Filename.ends_with("fexofflinecompiler32.exe");
++  static bool IsFOC64 = ImageInfo.Info.Filename.ends_with("fexofflinecompiler64.exe");
++  if (IsFOC32 || IsFOC64) {
++    return;
++  }
++
++  auto ID = FEXCore::CodeMap::GetBaseFilename(ImageInfo.Info, false);
++  const auto CacheKey = fextl::fmt::format("{}@{:x}", ID, ImageInfo.SectionInfo.FileStartVA);
++  if (AOTImages.contains(CacheKey)) return;
++  const uint64_t CodeCacheConfigId = FEXCore::CodeCacheConfigurationId();
++  const auto AnsiPath = fmt::format("\\??\\{}cache\\{}-{:016x}", FEX::Config::GetCacheDirectory(), ID, CodeCacheConfigId);
++
+   IO_STATUS_BLOCK IOSB;
+-  if (!NT_SUCCESS(NtOpenFile(&*DirHandle, FILE_LIST_DIRECTORY | SYNCHRONIZE, &DirAttr, &IOSB, FILE_SHARE_READ | FILE_SHARE_WRITE,
+-                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT))) {
+-    return;
+-  }
+-
+-  std::array<uint8_t, 0x1000> DirBuffer;
+-  bool FirstScan = true;
+-  auto QueryDir = [&]() {
+-    NTSTATUS Status = NtQueryDirectoryFile(*DirHandle, nullptr, nullptr, nullptr, &IOSB, DirBuffer.data(), DirBuffer.size(),
+-                                           FileBothDirectoryInformation, FALSE, nullptr, FirstScan);
+-    if (FirstScan) {
+-      FirstScan = false;
+-    }
+-    return NT_SUCCESS(Status);
+-  };
+-
+-  while (QueryDir()) {
+-    auto* Info = reinterpret_cast<PFILE_BOTH_DIRECTORY_INFORMATION>(DirBuffer.data());
+-
+-    while (true) {
+-      UNICODE_STRING CurrentFileName;
+-      CurrentFileName.Buffer = Info->FileName;
+-      CurrentFileName.Length = static_cast<USHORT>(Info->FileNameLength);
+-      CurrentFileName.MaximumLength = CurrentFileName.Length;
+-
+-      bool Skip = (Info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (Info->FileNameLength == 2 && Info->FileName[0] == '.') ||
+-                  (Info->FileNameLength == 4 && Info->FileName[0] == '.' && Info->FileName[1] == '.');
+-
+-      if (!Skip) {
+-        OBJECT_ATTRIBUTES FileAttr;
+-        InitializeObjectAttributes(&FileAttr, &CurrentFileName, OBJ_CASE_INSENSITIVE, *DirHandle, nullptr);
+-
+-        ScopedHandle FileHandle;
+-        if (NT_SUCCESS(NtOpenFile(&*FileHandle, GENERIC_READ | SYNCHRONIZE, &FileAttr, &IOSB, FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_NONALERT))) {
+-          ScopedHandle SectionHandle;
+-          if (NT_SUCCESS(NtCreateSection(&*SectionHandle, SECTION_MAP_EXECUTE | SECTION_MAP_READ, nullptr, nullptr, PAGE_EXECUTE_READ,
+-                                         SEC_COMMIT, *FileHandle))) {
+-            void* LoadAddress = nullptr;
+-            SIZE_T MappedSize = 0;
+-            if (NT_SUCCESS(NtMapViewOfSection(*SectionHandle, NtCurrentProcess(), &LoadAddress, 0, 0, nullptr, &MappedSize, ViewUnmap,
+-                                              MEM_RESERVE | MEM_TOP_DOWN, PAGE_EXECUTE_READ))) {
+-              fextl::string UniqueId;
+-              ULONG AnsiLength = 0;
+-              RtlUnicodeToMultiByteSize(&AnsiLength, Info->FileName, Info->FileNameLength);
+-              UniqueId.resize(AnsiLength);
+-              RtlUnicodeToMultiByteN(UniqueId.data(), AnsiLength, NULL, Info->FileName, Info->FileNameLength);
+-
+-              AOTImages[UniqueId] = {.Data = static_cast<std::byte*>(LoadAddress)};
+-              // TODO: CodeCache::LoadCache, CodeCache::RegisterMappedCodeBuffer
+-              LogMan::Msg::IFmt("Loaded cache: {}", UniqueId);
+-            }
+-          }
++  ScopedUnicodeString CurrentFileName(AnsiPath.c_str());
++
++  OBJECT_ATTRIBUTES FileAttr;
++  InitializeObjectAttributes(&FileAttr, &*CurrentFileName, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
++
++  ScopedHandle FileHandle;
++  if (NT_SUCCESS(NtOpenFile(&*FileHandle, GENERIC_READ | SYNCHRONIZE, &FileAttr, &IOSB, FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_NONALERT))) {
++    ScopedHandle SectionHandle;
++    if (NT_SUCCESS(NtCreateSection(&*SectionHandle, SECTION_MAP_READ, nullptr, nullptr, PAGE_READONLY, SEC_COMMIT,
++                                   *FileHandle))) {
++      void* LoadAddress = nullptr;
++      SIZE_T MappedSize = 0;
++      // TODO: Consider NtMapViewOfSectionEx with MEM_EXTENDED_PARAMETER_EC_CODE;
++      //       instead, we're eagerly copying all cache data to a dedicated buffer currently
++      // MEM_EXTENDED_PARAMETER ECParam {};
++      // ECParam.Type = MemExtendedParameterAttributeFlags;
++      // ECParam.ULong64 = MEM_EXTENDED_PARAMETER_EC_CODE;
++      if (NT_SUCCESS(NtMapViewOfSection(*SectionHandle, NtCurrentProcess(), &LoadAddress, 0, 0, nullptr, &MappedSize, ViewUnmap,
++                                        MEM_RESERVE | MEM_TOP_DOWN, PAGE_READONLY))) {
++
++        auto CacheSpan = std::span {static_cast<std::byte*>(LoadAddress), MappedSize};
++        auto MappedCache = CTX.GetCodeCache().LoadCache(CacheSpan, ImageInfo.Info, ImageInfo.SectionInfo.FileStartVA);
++        if (MappedCache) {
++          CTX.GetCodeCache().RegisterMappedCodeBuffer(*MappedCache);
++          AOTImages[CacheKey] = {.CacheFile = std::move(MappedCache)};
++          LogMan::Msg::IFmt("Loaded cache: {}", ID);
++        } else {
++          NtUnmapViewOfSection(NtCurrentProcess(), LoadAddress);
++          LogMan::Msg::EFmt("Failed to load cache: {}", ID);
+         }
+       }
+-
+-      if (Info->NextEntryOffset == 0) {
+-        break;
+-      }
+-      Info = reinterpret_cast<PFILE_BOTH_DIRECTORY_INFORMATION>(reinterpret_cast<uint8_t*>(Info) + Info->NextEntryOffset);
+     }
+   }
+ }
+--- a/FEX/Source/Windows/Common/ImageTracker.h
++++ b/FEX/Source/Windows/Common/ImageTracker.h
+@@ -47,6 +47,7 @@
+   int OpenCodeMapFile() override;
+ 
+ private:
++  FEXCore::CodeMapWriter* ActiveCodeMapWriter = nullptr; // Owned by CTX; protected by its invalidation mutex.
+   struct MappedImageInfo {
+     FEXCore::ExecutableFileInfo Info;
+     FEXCore::ExecutableFileSectionInfo SectionInfo;
+@@ -56,7 +57,7 @@
+   };
+ 
+   struct AOTImageInfo {
+-    std::byte* Data;
++    fextl::unique_ptr<FEXCore::MappedCodeCacheFile> CacheFile;
+   };
+ 
+   void LoadAOTImages(MappedImageInfo& Info);
+--- a/FEX/Source/Tools/FEXOfflineCompiler/Main.cpp
++++ b/FEX/Source/Tools/FEXOfflineCompiler/Main.cpp
+@@ -1,3 +1,4 @@
++#include <FEXCore/Config/CodeCacheIdentity.h>
+ // SPDX-License-Identifier: MIT
+ #ifndef _WIN32
+ #include "../FEXInterpreter/ELFCodeLoader.h"
+@@ -11,6 +12,11 @@
+ #include <FEXCore/Config/Config.h>
+ #include <FEXCore/Core/CodeCache.h>
+ #include <FEXCore/Core/Context.h>
++#include <FEXCore/Utils/DualMap.h>
++#if defined(FEX_IOS_HOST)
++namespace FEXCore::DualMap { int64_t WriteOffset = 0; }
++extern "C" { uint64_t IosFfsBypassLog[4] {}; }
++#endif
+ #include <FEXCore/Core/CoreState.h>
+ #include <FEXCore/Core/HostFeatures.h>
+ #include <FEXCore/Debug/InternalThreadState.h>
+@@ -164,6 +170,7 @@
+ 
+ static FEXCore::Core::InternalThreadState* SetupCompileThread(FEXCore::Context::Context& CTX, bool Is64Bit) {
+   auto Thread = CTX.CreateThread(0, 0);
++  if (!Thread) return nullptr;
+ 
+   auto Frame = Thread->CurrentFrame;
+   Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = &gdt[0];
+@@ -402,6 +409,9 @@
+   const bool Is64Bit = false;
+ #endif
+   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, Is64Bit ? "1" : "0");
++#ifdef _WIN32
++  CodeCacheConfigId = FEXCore::CodeCacheConfigurationId();
++#endif
+ 
+   // Load HostFeatures
+ #ifndef _WIN32
+@@ -429,7 +439,8 @@
+   }
+ 
+   // Register exception handler for OvercommitTracker
+-  AddVectoredExceptionHandler(1, ExceptionHandler);
++  auto ExceptionRegistration = AddVectoredExceptionHandler(1, ExceptionHandler);
++  struct ExceptionScope { void* Handle; ~ExceptionScope() { if (Handle) RemoveVectoredExceptionHandler(Handle); } } ExceptionOwner {ExceptionRegistration};
+ #else
+   Loader.CalculateHWCaps(CTX.get());
+ 
+@@ -470,6 +481,9 @@
+   }
+ 
+   Thread = SetupCompileThread(*CTX, Is64Bit);
++  if (!Thread) return std::nullopt;
++  auto ReleaseThread = [&](FEXCore::Core::InternalThreadState* Value) { CTX->DestroyThread(Value); Thread = nullptr; };
++  std::unique_ptr<FEXCore::Core::InternalThreadState, decltype(ReleaseThread)> ThreadOwner(Thread, ReleaseThread);
+ 
+ #ifndef _WIN32
+   {
+@@ -523,17 +537,24 @@
+ 
+     auto Filename = fmt::format("{}{}-{:016x}", OutDir, FEXCore::CodeMap::GetBaseFilename(Binary, false), CodeCacheConfigId);
+     auto FilenameNew = Filename + ".new";
+-    int fd = open(FilenameNew.c_str(), O_CREAT | O_WRONLY | O_BINARY, 0644);
++    int fd = open(FilenameNew.c_str(), O_CREAT | O_TRUNC | O_RDWR | O_BINARY, 0644);
++    if (fd < 0) return std::nullopt;
++    bool Saved = false;
+     {
+       auto Entry = SyscallHandler->LookupExecutableFileSection(Thread, SyscallHandler->VAFileStart).value();
+ #ifndef _WIN32
+-      CTX->GetCodeCache().SaveData(*Thread, fd, Entry, 0 /* TODO: Use static base address information if available */);
+-#else
+-      CTX->GetCodeCache().SaveData(*Thread, fd, Entry, SyscallHandler->VAFileStart);
++      Saved = CTX->GetCodeCache().SaveData(*Thread, fd, Entry, 0 /* TODO: Use static base address information if available */);
++#else
++      Saved = CTX->GetCodeCache().SaveData(*Thread, fd, Entry, SyscallHandler->VAFileStart);
+ #endif
+     }
+     close(fd);
++    if (!Saved) { std::filesystem::remove(FilenameNew); return std::nullopt; }
++#ifdef _WIN32
++    if (!MoveFileExW(std::filesystem::path(FilenameNew).c_str(), std::filesystem::path(Filename).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return std::nullopt;
++#else
+     std::filesystem::rename(FilenameNew.c_str(), Filename.c_str());
++#endif
+     return Filename;
+   }
+ }
+@@ -543,6 +564,7 @@
+ static int GenerateCache(int argc, const char** argv) {
+   optparse::OptionParser Parser {};
+   Parser.add_option("--outdir").set_default(FEX::Config::GetCacheDirectory() + "cache").help("Output directory for generated cache files");
++  Parser.add_option("--program").help("Main executable configuration for library compilation");
+   Parser.add_option("--fileid").help("Select binary to generate cache for");
+ 
+   optparse::Values Options = Parser.parse_args(argc, argv);
+@@ -604,12 +626,20 @@
+   std::filesystem::create_directories(OutDir);
+ 
+   const auto PortableInfo = FEX::ReadPortabilityInformation();
++#ifdef _WIN32
++  char** envp = _environ;
++#else
+   char* envp[] = {nullptr};
++#endif
+   FEXCore::Config::Shutdown();
+-  FEX::Config::LoadConfig("", envp, PortableInfo);
++  auto Program = (fextl::string)Options.get("program");
++  if (Program.empty()) Program = std::filesystem::path(ProgramName.Filename.c_str()).filename().string().c_str();
++  FEX::Config::LoadConfig(Program, envp, PortableInfo);
++  FEXCore::Config::ReloadMetaLayer();
+ 
+   auto NumBlocks = Data.at(ProgramName).size();
+-  auto GeneratedCache = GenerateSingleCache(ProgramName, 0 /* TODO: Config id */, Data.at(ProgramName), OutDir);
++  if (!NumBlocks) return 0; // Loaded-only native modules have no x86 blocks to compile.
++  auto GeneratedCache = GenerateSingleCache(ProgramName, 0 /* resolved from Windows options inside GenerateSingleCache */, Data.at(ProgramName), OutDir);
+   if (GeneratedCache) {
+     fmt::print("Successfully populated cache {} ({} blocks) via {}\n\n", GeneratedCache.value(), NumBlocks,
+                std::filesystem::path {CodeMapPath}.filename().string());
+@@ -756,6 +786,7 @@
+ 
+   // Import new code maps and aggregate them into ready code maps
+   std::filesystem::create_directories(ReadyCodeMapDirectory);
++  std::filesystem::create_directories(NewCodeMapDirectory);
+   AggregateCodeMaps(NewCodeMapDirectory, ReadyCodeMapDirectory);
+ 
+   // Generate caches
+@@ -775,8 +806,17 @@
+ 
+     fmt::println("\nChecking caches for executable {}", ExecutableIt->second.Filename);
+ 
+-    // TODO: Compute the cache config id from the active FEX configuration
++    // Resolve the same executable options as the runtime before naming caches.
++#ifdef _WIN32
++    auto Program = std::filesystem::path(ExecutableIt->second.Filename.c_str()).filename().string();
++    FEXCore::Config::Shutdown();
++    FEX::Config::LoadConfig(Program.c_str(), _environ, FEX::ReadPortabilityInformation());
++    FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
++    uint64_t CodeCacheConfigId = FEXCore::CodeCacheConfigurationId();
++#else
++    const std::string Program;
+     uint64_t CodeCacheConfigId = 0;
++#endif
+ 
+     auto GetCacheFilename = [&](const FEXCore::ExecutableFileInfo& File) {
+       return fmt::format("{}{}-{:016x}", OutDir, FEXCore::CodeMap::GetBaseFilename(File, false), CodeCacheConfigId);
+@@ -794,19 +834,20 @@
+         continue;
+       }
+ 
+-      if (std::filesystem::last_write_time(GetCacheFilename(File), ec) > LastCodeMapUpdate && !ec) {
++      if (std::filesystem::last_write_time(GetCacheFilename(File), ec) > LastCodeMapUpdate && !ec &&
++          FEXCore::Context::IsPersistentCacheCurrent(GetCacheFilename(File).c_str(), File.Filename.c_str())) {
+         fmt::println("  Cache up to date: {}", BinaryName);
+         continue;
+       }
+ 
+-      // TODO: Also check for matching FEX version from cache header
++      // IsPersistentCacheCurrent also checks source bytes, FEX version and payload integrity.
+ 
+       fmt::println("  {} cache: {}", ec ? "Generating" : "Updating outdated", BinaryName);
+ 
+       // Defer to GenerateCache
+       const auto FileIdArg = fmt::format("{:016x}", FileId);
+       std::vector<const char*> GenerateArgs {
+-        "generate", "--fileid", FileIdArg.c_str(), "--outdir", OutDir.c_str(), MergedCodeMapFilename.c_str(),
++        "generate", "--program", Program.c_str(), "--fileid", FileIdArg.c_str(), "--outdir", OutDir.c_str(), MergedCodeMapFilename.c_str(),
+       };
+       if (GenerateCache(GenerateArgs.size(), GenerateArgs.data()) != 0) {
+         fmt::println("ERROR: Cache generation failed for {}", BinaryName);
+@@ -823,6 +864,13 @@
+   LogMan::Msg::InstallHandler(MsgHandler);
+ #else
+   FEX::Windows::Logging::Init();
++#if defined(FEX_IOS_HOST)
++  auto RW = getenv("WINE_IOS_JIT_RW"), RX = getenv("WINE_IOS_JIT_RX");
++  if (!RW || !RX) return 2;
++  FEXCore::DualMap::WriteOffset = static_cast<int64_t>(strtoull(RW, nullptr, 16) - strtoull(RX, nullptr, 16));
++  if (!FEXCore::DualMap::WriteOffset) return 2;
++#endif
++  FEX::Config::LoadConfig("", _environ, FEX::ReadPortabilityInformation());
+ #endif
+ 
+   std::vector<const char*> Args {argv + 1, argv + argc};
+--- a/FEX/Source/Tools/FEXOfflineCompiler/CMakeLists.txt
++++ b/FEX/Source/Tools/FEXOfflineCompiler/CMakeLists.txt
+@@ -25,3 +25,12 @@
+ install(TARGETS FEXOfflineCompiler RUNTIME
+   DESTINATION bin
+   COMPONENT Runtime)
++
++if (MINGW AND FEX_IOS_HOST_BUILD)
++ target_link_options(FEXOfflineCompiler PRIVATE -static -nostdlib++)
++ target_link_libraries(FEXOfflineCompiler PRIVATE CommonWindowsRuntime)
++endif()
++
++if (MINGW AND FEX_IOS_HOST_BUILD)
++ target_sources(FEXOfflineCompiler PRIVATE ${CMAKE_SOURCE_DIR}/Source/Windows/ARM64EC/IosJitAlias.cpp)
++endif()
+--- /dev/null
++++ b/FEX/FEXCore/include/FEXCore/Config/CodeCacheIdentity.h
+@@ -0,0 +1,22 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#include <FEXCore/Config/Config.h>
++#include <xxhash.h>
++namespace FEXCore {
++inline uint64_t CodeCacheConfigurationId() {
++  auto State = XXH3_createState();
++  if (!State) return 0;
++  XXH3_64bits_reset(State);
++  auto Add = [&](std::string_view Key, std::string_view Value) {
++    if (Key == "APP_FILENAME" || Key == "APP_CONFIG_NAME" || Key == "OUTPUTLOG" || Key == "SERVERSOCKETPATH") return;
++    XXH3_64bits_update(State, Key.data(), Key.size());
++    uint64_t Size = Value.size(); XXH3_64bits_update(State, &Size, sizeof(Size));
++    XXH3_64bits_update(State, Value.data(), Value.size());
++  };
++#define OPT_BASE(type, group, name, json, default) { Config::Getter<Config::CONFIG_##name> V; Add(#name, fmt::format("{}", V())); }
++#define OPT_STR(group, name, json, default) { Config::Getter<Config::CONFIG_##name> V; Add(#name, V()); }
++#define OPT_STRARRAY(group, name, json, default) { Config::Getter<Config::CONFIG_##name> V; for (auto& E : V.All()) Add(#name, E); }
++#include <FEXCore/Config/ConfigValues.inl>
++  auto Hash = XXH3_64bits_digest(State); XXH3_freeState(State); return Hash;
++}
++}

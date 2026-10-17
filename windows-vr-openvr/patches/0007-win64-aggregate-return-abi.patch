@@ -1,0 +1,185 @@
+diff --git a/OpenOVR/Compositor/dx11compositor.cpp b/OpenOVR/Compositor/dx11compositor.cpp
+index 50d31ae..ea2ccc8 100644
+--- a/OpenOVR/Compositor/dx11compositor.cpp
++++ b/OpenOVR/Compositor/dx11compositor.cpp
+@@ -143,6 +143,12 @@ DX11Compositor::~DX11Compositor()
+ 
+ 	resolvedMSAATextures.clear();
+ 
++	if (quad_texture_view) {
++		quad_texture_view->Release();
++		quad_texture_view = nullptr;
++	}
++	cached_srv_source = nullptr;
++
+ 	context->Release();
+ 	device->Release();
+ }
+@@ -199,6 +205,12 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
+ 
+ 		resolvedMSAATextures.clear();
+ 
++		if (quad_texture_view) {
++			quad_texture_view->Release();
++			quad_texture_view = nullptr;
++		}
++		cached_srv_source = nullptr;
++
+ 		// Figure out what format we need to use
+ 		DxgiFormatInfo info = {};
+ 		if (!GetFormatInfo(srcDesc.Format, info)) {
+@@ -327,26 +339,26 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 
+ 	// Bounds describe an inverted image so copy texture using pixel shader inverting on copy
+ 	if (bounds && bounds->vMin > bounds->vMax && oovr_global_configuration.InvertUsingShaders() && !swapchain_rtvs.empty()) {
+-		auto* src = (ID3D11Texture2D*)texture->handle;
+-
+-		OOVR_FAILED_DX_ABORT(device->CreateShaderResourceView(src, nullptr, &quad_texture_view));
++		if (src != cached_srv_source || !quad_texture_view) {
++			if (quad_texture_view) {
++				quad_texture_view->Release();
++				quad_texture_view = nullptr;
++			}
++			OOVR_FAILED_DX_ABORT(device->CreateShaderResourceView(src, nullptr, &quad_texture_view));
++			cached_srv_source = src;
++		}
+ 
+-		float blend_factor[4] = { 1.f, 1.f, 1.f, 1.f };
+ 		context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+ 
+-		UINT numViewPorts;
+-		context->RSGetViewports(&numViewPorts, nullptr);
+-		std::vector<D3D11_VIEWPORT> viewports;
+-		viewports.resize(numViewPorts);
+-		context->RSGetViewports(&numViewPorts, viewports.data());
++		D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
++		UINT numViewPorts = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
++		context->RSGetViewports(&numViewPorts, viewports);
+ 
+-		UINT numScissors;
+-		context->RSGetScissorRects(&numScissors, nullptr);
+-		std::vector<D3D11_RECT> scissors;
+-		scissors.resize(numScissors);
+-		context->RSGetScissorRects(&numScissors, scissors.data());
++		D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
++		UINT numScissors = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
++		context->RSGetScissorRects(&numScissors, scissors);
+ 
+-		ID3D11RasterizerState* pRSState;
++		ID3D11RasterizerState* pRSState = nullptr;
+ 		context->RSGetState(&pRSState);
+ 		context->RSSetState(nullptr);
+ 
+@@ -361,8 +373,6 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 
+ 		// Set up for rendering
+ 		context->OMSetRenderTargets(1, &swapchain_rtvs[currentIndex], nullptr);
+-		float clear_colour[4] = { 0.f, 0.f, 0.f, 0.f };
+-		context->ClearRenderTargetView(swapchain_rtvs[currentIndex], clear_colour);
+ 
+ 		// Set the active shaders and constant buffers.
+ 		context->PSSetShaderResources(0, 1, &quad_texture_view);
+@@ -376,14 +386,15 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+ 		context->Draw(4, 0);
+ 		context->IASetPrimitiveTopology(currTopology);
+-		quad_texture_view->Release();
+ 
+ 		if (numViewPorts)
+-			context->RSSetViewports(numViewPorts, viewports.data());
++			context->RSSetViewports(numViewPorts, viewports);
+ 		if (numScissors)
+-			context->RSSetScissorRects(numScissors, scissors.data());
++			context->RSSetScissorRects(numScissors, scissors);
+ 
+ 		context->RSSetState(pRSState);
++		if (pRSState)
++			pRSState->Release();
+ 	} else {
+ 		// Apparently SteamVR supports apps just sending array textures without specifying what's what.
+ 		const int arrayIndex = (srcDesc.ArraySize > 1 && eye.has_value()) ? static_cast<int>(*eye) : 0;
+diff --git a/OpenOVR/Compositor/dx11compositor.h b/OpenOVR/Compositor/dx11compositor.h
+index 1f8fa64..88584c1 100644
+--- a/OpenOVR/Compositor/dx11compositor.h
++++ b/OpenOVR/Compositor/dx11compositor.h
+@@ -26,7 +26,8 @@ protected:
+ 	ID3D11Device* device = nullptr;
+ 	ID3D11DeviceContext* context = nullptr;
+ 
+-	ID3D11ShaderResourceView* quad_texture_view;
++	ID3D11ShaderResourceView* quad_texture_view = nullptr;
++	ID3D11Texture2D* cached_srv_source = nullptr;
+ 	ID3D11SamplerState* quad_sampleState;
+ 	ID3D11VertexShader* fs_vshader;
+ 	ID3D11PixelShader* fs_pshader;
+diff --git a/OpenOVR/Misc/Win64ReturnABI.h b/OpenOVR/Misc/Win64ReturnABI.h
+new file mode 100644
+index 0000000..98106b9
+--- /dev/null
++++ b/OpenOVR/Misc/Win64ReturnABI.h
+@@ -0,0 +1,21 @@
++#pragma once
++#include <array>
++#include <cstddef>
++#include <type_traits>
++
++// LLVM-MinGW uses Itanium C++ aggregate-return ordering: result, this, args.
++// Windows OpenVR clients built with MSVC use: this, result, args. Keep the
++// internal ABI unchanged and adapt only exported primary interface vtables.
++template<typename R, typename C, typename... A, typename F>
++void WVRPatchReturn(void*& slot, R(C::*)(A...), F thunk) {
++    if constexpr (std::is_class_v<R>) {
++        // OpenVR's value types are standard-layout, trivially-copyable PODs.
++        // Win64 returns 1/2/4/8-byte PODs in RAX and larger records indirectly.
++        static_assert(std::is_standard_layout_v<R> && std::is_trivially_copyable_v<R>,
++                      "Review non-POD OpenVR return ABI before exposing it");
++        if constexpr (sizeof(R) != 1 && sizeof(R) != 2 && sizeof(R) != 4 && sizeof(R) != 8) {
++            using Bridge = R*(*)(C*, R*, A...);
++            slot = reinterpret_cast<void*>(static_cast<Bridge>(thunk));
++        }
++    }
++}
+diff --git a/scripts/stubs/codegen.py b/scripts/stubs/codegen.py
+index 39cebd4..3a42fe7 100644
+--- a/scripts/stubs/codegen.py
++++ b/scripts/stubs/codegen.py
+@@ -76,11 +76,28 @@ std::shared_ptr<{cls}> GetCreate{getter_name}() {{
+         cname = ver.proxy_class_name()
+         namespace = ver.namespace()
+ 
++        fi.write('#include "Misc/Win64ReturnABI.h"\n')
+         fi.write(f"""
+ // Misc for {cname}:
+-{cname}::{cname}() : base(GetCreate{ver.getter_name()}()) {{}}
++{cname}::{cname}() : base(GetCreate{ver.getter_name()}()) {{
++#if defined(__MINGW32__) && defined(__x86_64__)
++    auto original = *reinterpret_cast<void***>(this);
++    static const auto table = [original] {{
++        // Preserve RTTI headers plus CVRCommon management/destructor entries.
++        std::array<void*, {len(ver.functions) + 6}> result;
++        for (size_t i = 0; i < result.size(); ++i) result[i] = original[ptrdiff_t(i) - 2];
++WVR_ABI_THUNKS
++        return result;
++    }}();
++    *reinterpret_cast<void***>(this) = const_cast<void**>(table.data() + 2);
++#endif
++}}
+ // Interface methods for {cname}:
+-""".lstrip())
++""".lstrip().replace("WVR_ABI_THUNKS", "\n".join(
++            f"        WVRPatchReturn(result[{index+2}], &{cname}::{f.name}, "
++            f"[]({cname}* self, auto* output{', ' if f.args_str() else ''}{f.args_str()}) {{ "
++            f"*output = self->{cname}::{f.name}({f.args_names()}); return output; }});"
++            for index, f in enumerate(ver.functions))))
+ 
+         # Write out all the functions
+         for f in ver.functions:
+@@ -128,7 +145,7 @@ def _build_fntable(fi, ver: InterfaceDef):
+ 
+     # Generate the stub functions
+     for func in ver.functions:
+-        call_stmt = f"return {inst_name}->{func.name}({func.args_names()});"
++        call_stmt = f"return {inst_name}->{cname}::{func.name}({func.args_names()});"
+ 
+         fi.write(
+             f"static {func.return_type} OPENVR_FNTABLE_CALLTYPE {func_name_template % func.name}({func.args_str()}) {{ {call_stmt} }}\n")

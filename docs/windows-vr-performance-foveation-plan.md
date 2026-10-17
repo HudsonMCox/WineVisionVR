@@ -1,5 +1,7 @@
 # Performance, foveation and DLSS compatibility plan
 
+The subsequent [Metal frame synthesis implementation](windows-vr-frame-synthesis.md) adds OpenVR depth forwarding and an experimental colour-only stereo-depth/optical-flow backend. The shadow-validation path described below remains separate; it is not the selectable display backend.
+
 Target: Vision Pro M2, visionOS 27; M5 is a later hardware target. This is a development plan, not a claim that temporal reconstruction, foveation or frame generation is implemented or physically validated.
 
 ## Current evidence and changes

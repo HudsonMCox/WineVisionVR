@@ -1,0 +1,14 @@
+--- a/src/dxmt/dxmt_command_queue.cpp
++++ b/src/dxmt/dxmt_command_queue.cpp
+@@ -118,9 +118,9 @@
+     progress.structSize = sizeof(progress);
+     progress.status = -1;
+     progress.operation = 5;
+-    progress.commandBuffer = event.handle;
++    progress.colorTexture = event.handle;
+     WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&progress));
+-    if (progress.status == 0 && progress.encoder) {
++    if (progress.status == 0 && progress.encoder && !(progress.encoder & 7u) && progress.token) {
+       event_progress_page_ = reinterpret_cast<const std::atomic<uint64_t> *>(progress.encoder);
+       event_progress_token_ = progress.token;
+     }

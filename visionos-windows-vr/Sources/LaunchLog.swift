@@ -25,7 +25,7 @@ enum LaunchDiagnostics {
 
 enum LaunchLogFile {
     private static let lock = NSLock()
-    private static let maxBytes = 512 * 1024
+    private static let maxBytes = 2 * 1024 * 1024
     private static let url: URL? = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
         .appendingPathComponent("launcher-log.txt")
     private static let formatter: DateFormatter = {
@@ -35,12 +35,21 @@ enum LaunchLogFile {
     }()
 
     static func append(_ level: String, _ message: String) {
-        guard LaunchDiagnostics.enabled, let url else { return }
+        guard LaunchDiagnostics.enabled || (level == "reconstruction" && UserDefaults.standard.bool(forKey: "WVRReconstructionValidation")), let url else { return }
         lock.lock(); defer { lock.unlock() }
         let line = "\(formatter.string(from: Date())) [\(level)] \(message)\n"
         let fm = FileManager.default
         if let size = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? Int, size > maxBytes {
-            try? fm.removeItem(at: url)
+            // Keep recent performance evidence when native thread tracing fills
+            // a chunk. A later game must not erase the preceding run's counters.
+            for index in stride(from: 3, through: 1, by: -1) {
+                let previous = url.deletingLastPathComponent().appendingPathComponent("launcher.previous-\(index).txt")
+                if index == 3 { try? fm.removeItem(at: previous) }
+                else if fm.fileExists(atPath: previous.path) {
+                    try? fm.moveItem(at: previous, to: url.deletingLastPathComponent().appendingPathComponent("launcher.previous-\(index + 1).txt"))
+                }
+            }
+            try? fm.moveItem(at: url, to: url.deletingLastPathComponent().appendingPathComponent("launcher.previous-1.txt"))
         }
         if !fm.fileExists(atPath: url.path) { fm.createFile(atPath: url.path, contents: nil) }
         guard let handle = try? FileHandle(forWritingTo: url) else { return }

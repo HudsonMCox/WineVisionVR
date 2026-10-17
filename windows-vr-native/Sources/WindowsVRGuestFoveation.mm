@@ -1,3 +1,6 @@
+#include "WindowsVRFrameState.h"
+#include "WindowsVRReconstruction.h"
+#include "WindowsVRTextureSliceCache.h"
 #include "WindowsVRGuestFoveation.h"
 #include "WindowsVRCompositorBridge.h"
 #import <Foundation/Foundation.h>
@@ -13,6 +16,7 @@
 #include <dlfcn.h>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 #if WVR_SOURCE_AIR_WRITER
 #include "../shader-compiler/WindowsVRAIRWriter.h"
@@ -23,6 +27,51 @@ using Dispatch = int (*)(void *);
 Dispatch previousDispatch = nullptr;
 std::atomic<bool> installed{false};
 std::mutex stateMutex;
+// GPU notifications publish monotonic event progress to a shared CPU page.
+// Guest GetData polls this page rather than crossing Wine's Unix boundary.
+static_assert(std::atomic<uint64_t>::is_always_lock_free &&
+              sizeof(std::atomic<uint64_t>) == 8);
+struct EventProgress {
+  std::atomic<uint64_t> value{0};
+  __strong id<MTLSharedEvent> event = nil;
+  bool cancelled = false; // protected by progressMutex
+};
+std::mutex progressMutex;
+std::unordered_map<uint64_t, std::shared_ptr<EventProgress>> progressPages;
+std::atomic<uint64_t> nextProgressToken{1}, progressNotifications{0};
+static void armProgress(std::shared_ptr<EventProgress> state) {
+  id<MTLSharedEvent> event;
+  uint64_t target;
+  {
+    std::lock_guard<std::mutex> lock(progressMutex);
+    if (state->cancelled)
+      return;
+    event = state->event;
+    target = state->value.load(std::memory_order_relaxed) + 1;
+  }
+  static MTLSharedEventListener *listener = [[MTLSharedEventListener alloc]
+      initWithDispatchQueue:dispatch_queue_create(
+                                "org.winevision.gpu-progress",
+                                dispatch_queue_attr_make_with_qos_class(
+                                    DISPATCH_QUEUE_SERIAL,
+                                    QOS_CLASS_USER_INTERACTIVE, 0))];
+  [event notifyListener:listener
+                atValue:target
+                  block:^(id<MTLSharedEvent> completed, uint64_t) {
+                    {
+                      std::lock_guard<std::mutex> lock(progressMutex);
+                      if (state->cancelled)
+                        return;
+                      // Only a real Metal event value can publish completion.
+                      // Command-buffer completion is not substituted for a
+                      // mid-buffer query signal.
+                      state->value.store(completed.signaledValue,
+                                         std::memory_order_release);
+                      ++progressNotifications;
+                    }
+                    armProgress(state);
+                  }];
+}
 struct EyeMap {
   __strong id<MTLRasterizationRateMap> map = nil;
   uint32_t layer = 0;
@@ -31,16 +80,20 @@ struct EyeMap {
 std::array<EyeMap, 2> eyeMaps;
 struct EyeTarget {
   __strong id<MTLTexture> root = nil;
-  uint32_t role = 0, slice = 0;
+  uint32_t role = 0, slice = 0, eyeWidth = 0, eyeHeight = 0;
+  bool atlas = false;
   __strong id<MTLTexture> scratchColor[8] = {}, scratchDepth = nil;
-  __strong id<MTLRasterizationRateMap> sourceMap = nil, adaptedMap = nil;
+  __strong id<MTLRasterizationRateMap> sourceMap = nil, adaptedMap = nil,
+                                       rightSourceMap = nil;
   __strong id<MTLBuffer> parameters = nil;
-  uint32_t mapLayer = 0;
+  uint32_t mapLayer = 0, rightMapLayer = 0;
 };
-std::array<EyeTarget, 12> targets;
+std::array<EyeTarget, 64> targets;
 size_t nextTarget = 0;
 std::atomic<uint64_t> sceneDraws{0}, logicalArea{0}, mappedArea{0},
-    unmatchedTargets{0}, staleMaps{0};
+    unmatchedTargets{0}, staleMaps{0}, atlasBegun{0}, bridgeCalls{0},
+    capabilities{0}, uniformBindings{0};
+std::atomic<uint64_t> sliceViewHits{0}, sliceViewCreates{0};
 std::atomic<uint64_t> begun{0}, resolved{0}, rejected{0}, nextToken{1},
     mapAdaptations{0}, mapAdaptNanoseconds{0};
 __strong id<MTLLibrary> resolveLibrary = nil;
@@ -68,10 +121,11 @@ id<MTLTexture> singleSlice(id<MTLTexture> texture, uint32_t slice) {
   if (texture.textureType != MTLTextureType2DArray ||
       slice >= texture.arrayLength)
     return nil;
-  return [texture newTextureViewWithPixelFormat:texture.pixelFormat
-                                    textureType:MTLTextureType2D
-                                         levels:NSMakeRange(0, 1)
-                                         slices:NSMakeRange(slice, 1)];
+  thread_local WVRTextureSliceCache cache;
+  bool hit = false;
+  auto view = cache.get(texture, slice, &hit);
+  if (view) (hit ? sliceViewHits : sliceViewCreates).fetch_add(1, std::memory_order_relaxed);
+  return view;
 }
 
 // Adapt the system's separable rate functions in normalized screen space.
@@ -143,53 +197,105 @@ vertex V wvr_fov_resolve_vertex(uint id [[vertex_id]]) {
     const float2 p[3]={float2(-1,-1),float2(3,-1),float2(-1,3)};
     return {float4(p[id],0,1)};
 }
-float2 sourceUV(float2 screen, constant rasterization_rate_map_data &data, uint2 size, uint2 physicalSize) {
+float2 sourceUV(float2 screen, constant rasterization_rate_map_data &data, uint2 size, uint4 physicalSize) {
     rasterization_rate_map_decoder decoder(data);
-    return clamp(decoder.map_screen_to_physical_coordinates(screen,0),float2(0.5),float2(physicalSize)-0.5)/float2(size);
+    float2 pixel = clamp(decoder.map_screen_to_physical_coordinates(screen,0),float2(0.5),float2(physicalSize.xy)-0.5);
+    if (physicalSize.z) pixel.x = screen.x < physicalSize.z ? min(pixel.x, float(physicalSize.w)-0.5) : max(pixel.x,float(physicalSize.w)+0.5);
+    return pixel/float2(size);
 }
 fragment float4 wvr_fov_resolve_color(V in [[stage_in]], texture2d<float> color [[texture(0)]],
-    sampler linearClamp [[sampler(0)]], constant rasterization_rate_map_data &map [[buffer(0)]],constant uint2 &physicalSize [[buffer(1)]]) {
+    sampler linearClamp [[sampler(0)]], constant rasterization_rate_map_data &map [[buffer(0)]],constant uint4 &physicalSize [[buffer(1)]]) {
     return color.sample(linearClamp,sourceUV(in.position.xy,map,uint2(color.get_width(),color.get_height()),physicalSize));
 }
 struct O { float4 color [[color(0)]]; float depth [[depth(any)]]; };
 fragment O wvr_fov_resolve_depth(V in [[stage_in]],texture2d<float> color [[texture(0)]],depth2d<float> depth [[texture(1)]],
-    sampler linearClamp [[sampler(0)]],sampler pointClamp [[sampler(1)]],constant rasterization_rate_map_data &map [[buffer(0)]],constant uint2 &physicalSize [[buffer(1)]]) {
+    sampler linearClamp [[sampler(0)]],sampler pointClamp [[sampler(1)]],constant rasterization_rate_map_data &map [[buffer(0)]],constant uint4 &physicalSize [[buffer(1)]]) {
     float2 uv=sourceUV(in.position.xy,map,uint2(color.get_width(),color.get_height()),physicalSize);
     float2 depthUV=sourceUV(in.position.xy,map,uint2(depth.get_width(),depth.get_height()),physicalSize);
     return {color.sample(linearClamp,uv),depth.sample(pointClamp,depthUV)};
 }
-float2 uniformUV(float2 physical, constant rasterization_rate_map_data &data, uint2 size) {
+float2 uniformUV(float2 physical, constant rasterization_rate_map_data &data, uint2 size, uint4 bounds) {
     rasterization_rate_map_decoder decoder(data);
-    return clamp(decoder.map_physical_to_screen_coordinates(physical,0),float2(0.5),float2(size)-0.5)/float2(size);
+    float2 pixel = clamp(decoder.map_physical_to_screen_coordinates(physical,0),float2(0.5),float2(size)-0.5);
+    if (bounds.z) pixel.x = physical.x < bounds.w ? min(pixel.x,float(bounds.z)-0.5) : max(pixel.x,float(bounds.z)+0.5);
+    return pixel/float2(size);
 }
 fragment float4 wvr_fov_load_color(V in [[stage_in]], texture2d<float> color [[texture(0)]],
-    sampler linearClamp [[sampler(0)]],constant rasterization_rate_map_data &map [[buffer(0)]]) {
-    return color.sample(linearClamp,uniformUV(in.position.xy,map,uint2(color.get_width(),color.get_height())));
+    sampler linearClamp [[sampler(0)]],constant rasterization_rate_map_data &map [[buffer(0)]],constant uint4 &bounds [[buffer(1)]]) {
+    return color.sample(linearClamp,uniformUV(in.position.xy,map,uint2(color.get_width(),color.get_height()),bounds));
 }
 fragment O wvr_fov_load_depth(V in [[stage_in]],texture2d<float> color [[texture(0)]],depth2d<float> depth [[texture(1)]],
-    sampler linearClamp [[sampler(0)]],sampler pointClamp [[sampler(1)]],constant rasterization_rate_map_data &map [[buffer(0)]]) {
-    return {color.sample(linearClamp,uniformUV(in.position.xy,map,uint2(color.get_width(),color.get_height()))),
-            depth.sample(pointClamp,uniformUV(in.position.xy,map,uint2(depth.get_width(),depth.get_height())))};
+    sampler linearClamp [[sampler(0)]],sampler pointClamp [[sampler(1)]],constant rasterization_rate_map_data &map [[buffer(0)]],constant uint4 &bounds [[buffer(1)]]) {
+    return {color.sample(linearClamp,uniformUV(in.position.xy,map,uint2(color.get_width(),color.get_height()),bounds)),
+            depth.sample(pointClamp,uniformUV(in.position.xy,map,uint2(depth.get_width(),depth.get_height()),bounds))};
 }
 struct S { float4 color [[color(0)]]; float depth [[depth(any)]]; uint stencil [[stencil]]; };
-fragment S wvr_fov_resolve_stencil(V in [[stage_in]],texture2d<float> color [[texture(0)]],depth2d<float> depth [[texture(1)]],texture2d<uint> stencil [[texture(2)]],sampler linearClamp [[sampler(0)]],sampler pointClamp [[sampler(1)]],constant rasterization_rate_map_data &map [[buffer(0)]],constant uint2 &physicalSize [[buffer(1)]]) {
+fragment S wvr_fov_resolve_stencil(V in [[stage_in]],texture2d<float> color [[texture(0)]],depth2d<float> depth [[texture(1)]],texture2d<uint> stencil [[texture(2)]],sampler linearClamp [[sampler(0)]],sampler pointClamp [[sampler(1)]],constant rasterization_rate_map_data &map [[buffer(0)]],constant uint4 &physicalSize [[buffer(1)]]) {
     rasterization_rate_map_decoder decoder(map);
-    uint2 pixel=uint2(clamp(decoder.map_screen_to_physical_coordinates(in.position.xy,0),float2(0),float2(physicalSize)-1));
+    uint2 pixel=uint2(sourceUV(in.position.xy,map,uint2(stencil.get_width(),stencil.get_height()),physicalSize)*float2(stencil.get_width(),stencil.get_height()));
     return {color.sample(linearClamp,sourceUV(in.position.xy,map,uint2(color.get_width(),color.get_height()),physicalSize)),depth.sample(pointClamp,sourceUV(in.position.xy,map,uint2(depth.get_width(),depth.get_height()),physicalSize)),stencil.read(pixel).r};
 }
-fragment S wvr_fov_load_stencil(V in [[stage_in]],texture2d<float> color [[texture(0)]],depth2d<float> depth [[texture(1)]],texture2d<uint> stencil [[texture(2)]],sampler linearClamp [[sampler(0)]],sampler pointClamp [[sampler(1)]],constant rasterization_rate_map_data &map [[buffer(0)]]) {
+fragment S wvr_fov_load_stencil(V in [[stage_in]],texture2d<float> color [[texture(0)]],depth2d<float> depth [[texture(1)]],texture2d<uint> stencil [[texture(2)]],sampler linearClamp [[sampler(0)]],sampler pointClamp [[sampler(1)]],constant rasterization_rate_map_data &map [[buffer(0)]],constant uint4 &bounds [[buffer(1)]]) {
     rasterization_rate_map_decoder decoder(map);
-    uint2 pixel=uint2(clamp(decoder.map_physical_to_screen_coordinates(in.position.xy,0),float2(0),float2(stencil.get_width()-1,stencil.get_height()-1)));
-    return {color.sample(linearClamp,uniformUV(in.position.xy,map,uint2(color.get_width(),color.get_height()))),depth.sample(pointClamp,uniformUV(in.position.xy,map,uint2(depth.get_width(),depth.get_height()))),stencil.read(pixel).r};
+    uint2 pixel=uint2(uniformUV(in.position.xy,map,uint2(stencil.get_width(),stencil.get_height()),bounds)*float2(stencil.get_width(),stencil.get_height()));
+    return {color.sample(linearClamp,uniformUV(in.position.xy,map,uint2(color.get_width(),color.get_height()),bounds)),depth.sample(pointClamp,uniformUV(in.position.xy,map,uint2(depth.get_width(),depth.get_height()),bounds)),stencil.read(pixel).r};
 }
 )MSL";
+
+// A side-by-side stereo atlas has one shared vertical rate function. Use the
+// maximum required by either eye at every row, and keep each eye's horizontal
+// rates independently. This is conservative for both system-supplied maps.
+static id<MTLRasterizationRateMap> adaptStereoAtlas(const EyeMap &left,
+                                                    const EyeMap &right,
+                                                    NSUInteger width,
+                                                    NSUInteger height) {
+  auto l = adaptMap(left.map, left.layer, width, height);
+  auto r = adaptMap(right.map, right.layer, width, height);
+  if (!l || !r)
+    return nil;
+  float x[64], y[32];
+  auto slope = [](id<MTLRasterizationRateMap> m, bool horizontal, unsigned cell,
+                  NSUInteger extent) {
+    float a = float(cell) * extent / 32, b = float(cell + 1) * extent / 32;
+    auto p =
+        [m mapScreenToPhysicalCoordinates:(MTLCoordinate2D){horizontal ? a : 0,
+                                                            horizontal ? 0 : a}
+                                 forLayer:0];
+    auto q =
+        [m mapScreenToPhysicalCoordinates:(MTLCoordinate2D){horizontal ? b : 0,
+                                                            horizontal ? 0 : b}
+                                 forLayer:0];
+    return std::clamp(
+        std::ceil(((horizontal ? q.x - p.x : q.y - p.y) / (b - a)) * 8) / 8,
+        0.125f, 1.0f);
+  };
+  for (unsigned i = 0; i < 32; ++i) {
+    x[i] = slope(l, true, i, width);
+    x[i + 32] = slope(r, true, i, width);
+    y[i] = std::max(slope(l, false, i, height), slope(r, false, i, height));
+  }
+  // Keep a full-rate filter guard at texture edges and the eye boundary.
+  // This prevents reconstruction footprints from straddling independently
+  // rasterized viewports or Metal's physical edge padding.
+  x[0] = x[31] = x[32] = x[63] = 1.0f;
+  y[0] = y[31] = 1.0f;
+  auto layer = [[MTLRasterizationRateLayerDescriptor alloc]
+      initWithSampleCount:MTLSizeMake(64, 32, 1)
+               horizontal:x
+                 vertical:y];
+  auto descriptor = [MTLRasterizationRateMapDescriptor
+      rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake(width * 2,
+                                                               height, 1)
+                                             layer:layer];
+  return [left.map.device newRasterizationRateMapWithDescriptor:descriptor];
+}
 
 struct Pass {
   __strong id<MTLCommandBuffer> commands;
   __strong id<MTLTexture> color[8] = {}, compressedColor[8] = {}, depth = nil,
                           compressedDepth = nil;
   __strong id<MTLTexture> stencilSource = nil, compressedStencil = nil;
-  bool stencil = false;
+  bool stencil = false, atlas = false;
   __strong id<MTLRenderCommandEncoder> encoder = nil;
   __strong id<MTLFence> chain = nil;
   __strong MTLRenderPassDescriptor *scene = nil;
@@ -274,9 +380,20 @@ id<MTLRenderPipelineState> pipelineFor(id<MTLDevice> device,
 }
 
 int bridgeDispatch(void *opaque) {
+  ++bridgeCalls;
   if (!opaque)
     return previousDispatch ? previousDispatch(opaque) : int(0xc0000141);
   auto request = *reinterpret_cast<WVRGuestFoveationPassV1 **>(opaque);
+  if (request && request->abiVersion == WVR_FRAME_STATE_ABI) {
+    auto frameState = reinterpret_cast<WVRFrameStateRequestV1 *>(request);
+    frameState->status = wvr_compositor_frame_state_v1(frameState);
+    return 0;
+  }
+  if (request && request->abiVersion == WVR_RECONSTRUCTION_ABI) {
+    auto frame = reinterpret_cast<WVRReconstructionSubmitV1*>(request);
+    frame->status = wvr_compositor_submit_reconstruction_v1(frame);
+    return 0;
+  }
   if (!request || request->abiVersion != WVR_GUEST_FOVEATION_ABI)
     return previousDispatch ? previousDispatch(opaque) : int(0xc0000141);
   wvr_guest_foveation_process_v1(request);
@@ -367,7 +484,7 @@ extern "C" void wvr_guest_foveation_register_eye_v1(uint32_t role, void *opaque,
                                                     uint32_t slice, uint32_t x,
                                                     uint32_t y, uint32_t width,
                                                     uint32_t height) {
-  if (role > 1 || !opaque || x || y)
+  if (role > 1 || !opaque || y)
     return;
   id<MTLTexture> texture = (__bridge id<MTLTexture>)opaque;
   NSUInteger absoluteSlice = slice;
@@ -375,12 +492,15 @@ extern "C" void wvr_guest_foveation_register_eye_v1(uint32_t role, void *opaque,
   if (!root ||
       (root.textureType != MTLTextureType2D &&
        root.textureType != MTLTextureType2DArray) ||
-      absoluteSlice >= root.arrayLength || texture.width != width ||
-      texture.height != height)
+      absoluteSlice >= root.arrayLength || !width || texture.height != height ||
+      !((x == 0 && texture.width == width) ||
+        (texture.width == uint64_t(width) * 2 && x == uint64_t(role) * width)))
     return;
   std::lock_guard<std::mutex> lock(stateMutex);
   for (auto &entry : targets)
-    if (entry.root == root && entry.slice == absoluteSlice) {
+    if (entry.root == root && entry.slice == absoluteSlice &&
+        entry.role == role && entry.eyeWidth == width &&
+        entry.eyeHeight == height) {
       entry.role = role;
       return;
     }
@@ -388,6 +508,9 @@ extern "C" void wvr_guest_foveation_register_eye_v1(uint32_t role, void *opaque,
   targets[nextTarget].root = root;
   targets[nextTarget].role = role;
   targets[nextTarget].slice = uint32_t(absoluteSlice);
+  targets[nextTarget].eyeWidth = width;
+  targets[nextTarget].eyeHeight = height;
+  targets[nextTarget].atlas = texture.width != width;
   nextTarget = (nextTarget + 1) % targets.size();
 }
 // The first preload encoder receives DXMT's original dependency waits. Later
@@ -437,7 +560,22 @@ static void encodeCopy(Pass &pass, id<MTLRenderCommandEncoder> encoder,
   [encoder setFragmentSamplerState:pointSampler atIndex:1];
   [encoder setFragmentBuffer:pass.parameters offset:0 atIndex:0];
   const auto physical = [pass.map physicalSizeForLayer:0];
-  uint32_t bounds[2] = {uint32_t(physical.width), uint32_t(physical.height)};
+  const auto seam = [pass.map
+      mapScreenToPhysicalCoordinates:(MTLCoordinate2D){
+                                         float(pass.request.width / 2), 0}
+                            forLayer:0];
+  const auto logicalEnd =
+      [pass.map mapScreenToPhysicalCoordinates:(MTLCoordinate2D){
+                                                   float(pass.request.width),
+                                                   float(pass.request.height)}
+                                      forLayer:0];
+  // physicalSizeForLayer includes tile padding that the scene never rasterizes.
+  // Clamp reconstruction to pixel centers actually covered by the logical
+  // image.
+  uint32_t bounds[4] = {uint32_t(std::round(logicalEnd.x)),
+                        uint32_t(std::round(logicalEnd.y)),
+                        pass.atlas ? pass.request.width / 2 : 0,
+                        pass.atlas ? uint32_t(std::round(seam.x)) : 0};
   [encoder setFragmentBytes:bounds length:sizeof(bounds) atIndex:1];
   [encoder setViewport:(MTLViewport){0, 0, double(pass.request.width),
                                      double(pass.request.height), 0, 1}];
@@ -450,6 +588,38 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
   const auto suppliedEncoder = r->encoder;
   r->status = -1;
   r->encoder = 0;
+  if (r->operation == 5) {
+    if (!installed.load() || !r->colorTexture)
+      return -1;
+    auto state = std::make_shared<EventProgress>();
+    state->event = (__bridge id<MTLSharedEvent>)(void *)r->colorTexture;
+    state->value.store(state->event.signaledValue, std::memory_order_release);
+    const uint64_t ticket = nextProgressToken.fetch_add(1);
+    {
+      std::lock_guard<std::mutex> lock(progressMutex);
+      progressPages.emplace(ticket, state);
+    }
+    armProgress(state);
+    r->encoder = (uint64_t)&state->value;
+    r->token = ticket;
+    r->status = 0;
+    return 0;
+  }
+  if (r->operation == 6) {
+    std::lock_guard<std::mutex> lock(progressMutex);
+    const uint64_t ticket =
+        r->token; // packed transport must not bind an aligned reference
+    auto entry = progressPages.find(ticket);
+    if (entry == progressPages.end())
+      return -1;
+    entry->second->cancelled = true;
+    // Break the event -> notification block -> state -> event ownership cycle,
+    // including cancellation before the next GPU signal ever occurs.
+    entry->second->event = nil;
+    progressPages.erase(entry);
+    r->status = 0;
+    return 0;
+  }
   if (r->operation == 3) {
     if (!suppliedEncoder || !identityParameters)
       return -1;
@@ -457,11 +627,16 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
         (__bridge id<MTLRenderCommandEncoder>)(void *)suppliedEncoder;
     [encoder setFragmentBuffer:identityParameters offset:0 atIndex:28];
     r->encoder = suppliedEncoder;
+    ++uniformBindings;
     r->status = 0;
     return 0;
   }
   if (!r->operation) {
-    r->status = installed.load() ? 0 : -1;
+    ++capabilities;
+    // Borrowed process-lifetime handle. The guest batches this binding with
+    // its existing encoder setup instead of dispatching operation 3 per pass.
+    r->encoder = (uint64_t)(__bridge void *)identityParameters;
+    r->status = installed.load() && identityParameters ? 0 : -1;
     return r->status;
   }
   if (r->operation == 4) {
@@ -644,6 +819,55 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
       break;
     }
   if (!entry) {
+    uint32_t matchedEyeWidth = 0, matchedEyeHeight = 0;
+    bool matchedAtlas = false;
+    for (const auto &existing : targets) {
+      if (!existing.root || existing.eyeWidth < 512 || existing.eyeHeight < 512)
+        continue;
+      if (existing.atlas && absoluteSlice == 0 &&
+          r->width == 2 * existing.eyeWidth &&
+          r->height == existing.eyeHeight) {
+        matchedEyeWidth = existing.eyeWidth;
+        matchedEyeHeight = existing.eyeHeight;
+        matchedAtlas = true;
+        break;
+      }
+      if (!existing.atlas && firstRoot.arrayLength >= 2 && absoluteSlice < 2 &&
+          r->width == existing.eyeWidth && r->height == existing.eyeHeight) {
+        matchedEyeWidth = existing.eyeWidth;
+        matchedEyeHeight = existing.eyeHeight;
+        matchedAtlas = false;
+        break;
+      }
+    }
+    if (matchedEyeWidth && matchedEyeHeight) {
+      if (matchedAtlas) {
+        for (uint32_t role : {0u, 1u}) {
+          auto &slot = targets[nextTarget++ % targets.size()];
+          slot = EyeTarget{};
+          slot.root = firstRoot;
+          slot.role = role;
+          slot.slice = 0;
+          slot.eyeWidth = matchedEyeWidth;
+          slot.eyeHeight = matchedEyeHeight;
+          slot.atlas = true;
+          if (role == 0)
+            entry = &slot;
+        }
+      } else {
+        auto &slot = targets[nextTarget++ % targets.size()];
+        slot = EyeTarget{};
+        slot.root = firstRoot;
+        slot.role = uint32_t(absoluteSlice);
+        slot.slice = uint32_t(absoluteSlice);
+        slot.eyeWidth = matchedEyeWidth;
+        slot.eyeHeight = matchedEyeHeight;
+        slot.atlas = false;
+        entry = &slot;
+      }
+    }
+  }
+  if (!entry) {
     ++unmatchedTargets;
     ++rejected;
     return -1;
@@ -655,12 +879,36 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
     return -1;
   }
   const auto &eye = eyeMaps[entry->role];
-  if (entry->sourceMap != eye.map || entry->mapLayer != eye.layer ||
+  const auto &right = eyeMaps[1];
+  if (entry->atlas) {
+    bool paired = false;
+    for (const auto &other : targets)
+      paired |= other.root == firstRoot && other.slice == absoluteSlice &&
+                other.atlas && other.role != entry->role &&
+                other.eyeWidth == entry->eyeWidth &&
+                other.eyeHeight == entry->eyeHeight;
+    if (!paired || r->width != 2 * entry->eyeWidth ||
+        r->height != entry->eyeHeight || !eyeMaps[0].map || !right.map ||
+        CACurrentMediaTime() - eyeMaps[0].published > 0.025 ||
+        CACurrentMediaTime() - right.published > 0.025) {
+      ++rejected;
+      return -1;
+    }
+  }
+  const auto &left = entry->atlas ? eyeMaps[0] : eye;
+  if (entry->sourceMap != left.map || entry->mapLayer != left.layer ||
+      (entry->atlas && (entry->rightSourceMap != right.map ||
+                        entry->rightMapLayer != right.layer)) ||
       entry->adaptedMap.screenSize.width != r->width ||
       entry->adaptedMap.screenSize.height != r->height) {
-    entry->adaptedMap = adaptMap(eye.map, eye.layer, r->width, r->height);
-    entry->sourceMap = eye.map;
-    entry->mapLayer = eye.layer;
+    entry->adaptedMap =
+        entry->atlas
+            ? adaptStereoAtlas(left, right, entry->eyeWidth, entry->eyeHeight)
+            : adaptMap(left.map, left.layer, r->width, r->height);
+    entry->sourceMap = left.map;
+    entry->mapLayer = left.layer;
+    entry->rightSourceMap = entry->atlas ? right.map : nil;
+    entry->rightMapLayer = right.layer;
     entry->parameters =
         entry->adaptedMap
             ? [commands.device
@@ -671,6 +919,7 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
     if (entry->parameters)
       [entry->adaptedMap copyParameterDataToBuffer:entry->parameters offset:0];
   }
+  pass->atlas = entry->atlas;
   pass->map = entry->adaptedMap;
   pass->parameters = entry->parameters;
   if (!pass->map || !pass->parameters) {
@@ -792,6 +1041,8 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
   r->status = 0;
   activePass = std::move(pass);
   ++begun;
+  if (entry->atlas)
+    ++atlasBegun;
   sceneDraws.fetch_add(r->drawCalls);
   logicalArea.fetch_add(uint64_t(r->width) * r->height);
   mappedArea.fetch_add(uint64_t(size.width) * size.height);
@@ -807,7 +1058,9 @@ extern "C" int wvr_guest_foveation_copy_stats_v1(char *buffer,
       buffer, capacity,
       "guestFoveation begun=%llu resolved=%llu rejected=%llu draws=%llu "
       "unmatchedTargets=%llu staleMaps=%llu mapAreaRatio=%.3f "
-      "systemMaps=per-eye maxAgeMs=25 adaptations=%llu meanAdaptCPUms=%.3f",
+      "systemMaps=per-eye maxAgeMs=25 adaptations=%llu meanAdaptCPUms=%.3f "
+      "atlas=%llu bridgeCalls=%llu capabilities=%llu uniform=%llu "
+      "eventNotifications=%llu sliceViewHits=%llu sliceViewCreates=%llu",
       (unsigned long long)begun.load(), (unsigned long long)resolved.load(),
       (unsigned long long)rejected.load(),
       (unsigned long long)sceneDraws.load(),
@@ -817,6 +1070,13 @@ extern "C" int wvr_guest_foveation_copy_stats_v1(char *buffer,
       (unsigned long long)adaptations,
       adaptations
           ? double(mapAdaptNanoseconds.load()) / double(adaptations) / 1e6
-          : 0.0);
+          : 0.0,
+      (unsigned long long)atlasBegun.load(),
+      (unsigned long long)bridgeCalls.load(),
+      (unsigned long long)capabilities.load(),
+      (unsigned long long)uniformBindings.load(),
+      (unsigned long long)progressNotifications.load(),
+      (unsigned long long)sliceViewHits.load(std::memory_order_relaxed),
+      (unsigned long long)sliceViewCreates.load(std::memory_order_relaxed));
   return 1;
 }

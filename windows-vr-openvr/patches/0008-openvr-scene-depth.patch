@@ -1,0 +1,440 @@
+diff --git a/OpenOVR/Compositor/compositor.h b/OpenOVR/Compositor/compositor.h
+--- a/OpenOVR/Compositor/compositor.h
++++ b/OpenOVR/Compositor/compositor.h
+@@ -29,6 +29,8 @@
+ 	virtual void InvokeCubemap(const vr::Texture_t* textures) = 0;
+ 	virtual bool SupportsCubemap() { return false; }
+ 
++	const XrFovf& GetDepthFov() const { return depthFov; }
++	const XrCompositionLayerDepthInfoKHR* GetDepthInfo() const { return depthValid ? &depthInfo : nullptr; }
+ 	virtual XrSwapchain GetSwapChain() { return chain; };
+ 
+ 	virtual XrExtent2Di GetSrcSize() { return { static_cast<int32_t>(createInfo.width), static_cast<int32_t>(createInfo.height) }; }
+@@ -41,6 +43,10 @@
+ 	virtual void ResetSubmitContext() {};
+ 
+ protected:
++	virtual void CopyDepth(const vr::Texture_t*, const vr::VRTextureBounds_t*, std::optional<XruEye>, vr::EVRSubmitFlags) {}
++	XrCompositionLayerDepthInfoKHR depthInfo{XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR};
++	bool depthValid = false;
++	XrFovf depthFov{};
+ 	virtual void CopyToSwapchain(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, std::optional<XruEye> eye, vr::EVRSubmitFlags submitFlags) = 0;
+ 
+ 	XrSwapchain chain = XR_NULL_HANDLE;
+diff --git a/OpenOVR/Compositor/compositor.cpp b/OpenOVR/Compositor/compositor.cpp
+--- a/OpenOVR/Compositor/compositor.cpp
++++ b/OpenOVR/Compositor/compositor.cpp
+@@ -13,6 +13,8 @@
+ 
+ void Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, XrSwapchainSubImage& subImage, std::optional<XruEye> eye, vr::EVRSubmitFlags submitFlags)
+ {
++	depthValid = false;
++	const auto* originalBounds = bounds;
+ 	bool invertInCompositor = oovr_global_configuration.InvertUsingShaders();
+ 	if (bounds && bounds->vMin == 0.0f && bounds->vMax == 1.0f && bounds->uMin == 0.0f && bounds->uMax == 1.0f)
+ 		bounds = nullptr;
+@@ -21,6 +23,7 @@
+ 	subImage.imageArrayIndex = 0; // This is *not* the swapchain index
+ 	XrExtent2Di src = GetSrcSize();
+ 	CalculateViewport(invertInCompositor ? nullptr : bounds, src.width, src.height, true, subImage.imageRect);
++	CopyDepth(texture, originalBounds, eye, submitFlags);
+ }
+ 
+ bool Compositor::CalculateViewport(const vr::VRTextureBounds_t* ptrBounds, int32_t width, int32_t height, bool supportsInvert, XrRect2Di& viewport)
+diff --git a/OpenOVR/Compositor/dx11compositor.h b/OpenOVR/Compositor/dx11compositor.h
+--- a/OpenOVR/Compositor/dx11compositor.h
++++ b/OpenOVR/Compositor/dx11compositor.h
+@@ -17,6 +17,9 @@
+ 	ID3D11Device* GetDevice() { return device; }
+ 
+ protected:
++	void CopyDepth(const vr::Texture_t*, const vr::VRTextureBounds_t*, std::optional<XruEye>, vr::EVRSubmitFlags) override;
++	struct DepthResources;
++	std::unique_ptr<DepthResources> depthResources;
+ 	void CheckCreateSwapChain(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, bool cube);
+ 
+ 	void ThrowIfFailed(HRESULT test);
+diff --git a/OpenOVR/Compositor/dx11compositor.cpp b/OpenOVR/Compositor/dx11compositor.cpp
+--- a/OpenOVR/Compositor/dx11compositor.cpp
++++ b/OpenOVR/Compositor/dx11compositor.cpp
+@@ -7,6 +7,8 @@
+ #include "../Misc/Config.h"
+ #include "../Misc/xr_ext.h"
+ 
++#include <cmath>
++#include "WindowsVRDepthProjection.h"
+ #include <d3dcompiler.h> // For compiling shaders! D3DCompile
+ 
+ #pragma comment(lib, "d3dcompiler.lib")
+@@ -98,6 +100,253 @@
+ 	OOVR_FAILED_DX_ABORT(d3d_device->CreateRenderTargetView(d3d_swapchain_img.texture, &target_desc, &result));
+ 
+ 	return result;
++}
++
++// Optional OpenVR depth is converted on a deferred context. Executing with
++// RestoreContextState=TRUE preserves every game graphics binding, including MRTs.
++struct DX11Compositor::DepthResources {
++	XrSwapchain chain = XR_NULL_HANDLE;
++	UINT width = 0, height = 0;
++	ComPtr<ID3D11DeviceContext> deferred;
++	ComPtr<ID3D11VertexShader> vs;
++	ComPtr<ID3D11PixelShader> ps[2];
++	ComPtr<ID3D11Buffer> constants;
++	ComPtr<ID3D11Texture2D> sampleSource;
++	ComPtr<ID3D11ShaderResourceView> sampleView;
++	ComPtr<ID3D11DepthStencilState> depthState;
++	std::vector<XrSwapchainImageD3D11KHR> images;
++	std::vector<ComPtr<ID3D11DepthStencilView>> views;
++	~DepthResources()
++	{
++		if (chain)
++			xrDestroySwapchain(chain);
++	}
++};
++
++void DX11Compositor::CopyDepth(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds,
++    std::optional<XruEye> eye, vr::EVRSubmitFlags flags)
++{
++	if (!(flags & vr::Submit_TextureWithDepth) || !xr_ext->compositionDepthAvailable())
++		return;
++	const auto& input = (flags & vr::Submit_TextureWithPose)
++	    ? static_cast<const vr::VRTextureWithPoseAndDepth_t*>(texture)->depth
++	    : static_cast<const vr::VRTextureWithDepth_t*>(texture)->depth;
++	if (!input.handle)
++		return;
++	const auto& m = input.mProjection.m;
++	const vr::VRTextureBounds_t b = bounds ? *bounds : vr::VRTextureBounds_t{ 0, 0, 1, 1 };
++	const float crop[] = { b.uMin, b.vMin, b.uMax, b.vMax };
++	WVRDepthProjection decoded{};
++	if (!WVRDecodeDepthProjection(m, crop, input.vRange.v[0], input.vRange.v[1], decoded))
++		return;
++	const float nearZ = decoded.nearZ, farZ = decoded.farZ;
++	auto* source = static_cast<ID3D11Texture2D*>(input.handle);
++	D3D11_TEXTURE2D_DESC desc{};
++	source->GetDesc(&desc);
++	ComPtr<ID3D11Device> sourceDevice;
++	source->GetDevice(&sourceDevice);
++	if (sourceDevice.Get() != device || !desc.Width || !desc.Height || !desc.MipLevels)
++		return;
++	DXGI_FORMAT sampleFormat = DXGI_FORMAT_UNKNOWN, aliasFormat = DXGI_FORMAT_UNKNOWN;
++	switch (desc.Format) {
++	case DXGI_FORMAT_D32_FLOAT:
++	case DXGI_FORMAT_R32_TYPELESS:
++	case DXGI_FORMAT_R32_FLOAT:
++		sampleFormat = DXGI_FORMAT_R32_FLOAT;
++		aliasFormat = DXGI_FORMAT_R32_TYPELESS;
++		break;
++	case DXGI_FORMAT_D24_UNORM_S8_UINT:
++	case DXGI_FORMAT_R24G8_TYPELESS:
++	case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
++		sampleFormat = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
++		aliasFormat = DXGI_FORMAT_R24G8_TYPELESS;
++		break;
++	case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
++	case DXGI_FORMAT_R32G8X24_TYPELESS:
++	case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
++		sampleFormat = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
++		aliasFormat = DXGI_FORMAT_R32G8X24_TYPELESS;
++		break;
++	case DXGI_FORMAT_D16_UNORM:
++	case DXGI_FORMAT_R16_TYPELESS:
++	case DXGI_FORMAT_R16_UNORM:
++		sampleFormat = DXGI_FORMAT_R16_UNORM;
++		aliasFormat = DXGI_FORMAT_R16_TYPELESS;
++		break;
++	default:
++		return;
++	}
++	const UINT slice = desc.ArraySize > 1 && eye ? static_cast<UINT>(*eye) : 0;
++	if (slice >= desc.ArraySize)
++		return;
++	if (!depthResources)
++		depthResources = std::make_unique<DepthResources>();
++	auto& d = *depthResources;
++	const bool direct = desc.SampleDesc.Count == 1 && aliasFormat == DXGI_FORMAT_R32_TYPELESS;
++	if (!direct && !d.deferred) {
++		if (FAILED(device->CreateDeferredContext(0, &d.deferred)))
++			return;
++		static const char code[] = R"hlsl(
++cbuffer Params:register(b0){float4 bounds; uint2 size; uint reversed; uint pad;};
++#ifdef MSAA
++Texture2DMS<float> src:register(t0);
++#else
++Texture2D<float> src:register(t0);
++#endif
++struct Out {float4 pos:SV_POSITION;float2 uv:TEXCOORD0;};
++Out vs(uint i:SV_VERTEXID){Out o;float2 p=float2((i<<1)&2,i&2);o.pos=float4(p*float2(2,-2)+float2(-1,1),0,1);o.uv=p;return o;}
++float ps(Out i):SV_Depth {
++ int2 p=clamp(int2(lerp(bounds.xy,bounds.zw,i.uv)*size),int2(0,0),int2(size)-1);
++#ifdef MSAA
++ uint w,h,n;src.GetDimensions(w,h,n);float z=reversed?0:1;
++ for(uint s=0;s<n;s++){float v=src.Load(p,s);z=reversed?max(z,v):min(z,v);}return z;
++#else
++ return src.Load(int3(p,0));
++#endif
++})hlsl";
++		auto compile = [](const char* text, const char* entry, const char* profile, ComPtr<ID3DBlob>& blob) {ComPtr<ID3DBlob>errors;return SUCCEEDED(D3DCompile(text,strlen(text),nullptr,nullptr,nullptr,entry,profile,D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&blob,&errors)); };
++		ComPtr<ID3DBlob> v;
++		if (!compile(code, "vs", "vs_5_0", v))
++			return;
++		if (FAILED(device->CreateVertexShader(v->GetBufferPointer(), v->GetBufferSize(), nullptr, &d.vs)))
++			return;
++		for (int i = 0; i < 2; i++) {
++			std::string text = (i ? "#define MSAA\n" : "") + std::string(code);
++			ComPtr<ID3DBlob> p;
++			if (!compile(text.c_str(), "ps", "ps_5_0", p))
++				return;
++			if (FAILED(device->CreatePixelShader(p->GetBufferPointer(), p->GetBufferSize(), nullptr, &d.ps[i])))
++				return;
++		}
++		D3D11_BUFFER_DESC cb{};
++		cb.ByteWidth = 32;
++		cb.Usage = D3D11_USAGE_DEFAULT;
++		cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++		if (FAILED(device->CreateBuffer(&cb, nullptr, &d.constants)))
++			return;
++		D3D11_DEPTH_STENCIL_DESC state{};
++		state.DepthEnable = TRUE;
++		state.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
++		state.DepthFunc = D3D11_COMPARISON_ALWAYS;
++		if (FAILED(device->CreateDepthStencilState(&state, &d.depthState)))
++			return;
++	}
++	if (!direct && (!d.vs || !d.ps[0] || !d.ps[1] || !d.constants || !d.depthState))
++		return;
++	// Keep the full source geometry. The depth subimage names the same normalized
++	// crop as colour; vertically inverted colour is rejected until orientation can match.
++	if (d.chain && (d.width != desc.Width || d.height != desc.Height)) {
++		d.views.clear();
++		d.images.clear();
++		xrDestroySwapchain(d.chain);
++		d.chain = XR_NULL_HANDLE;
++	}
++	if (!d.chain) {
++		XrSwapchainCreateInfo ci{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
++		ci.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
++		ci.format = DXGI_FORMAT_D32_FLOAT;
++		ci.sampleCount = 1;
++		ci.width = desc.Width;
++		ci.height = desc.Height;
++		ci.faceCount = ci.arraySize = ci.mipCount = 1;
++		if (XR_FAILED(xrCreateSwapchain(xr_session.get(), &ci, &d.chain))) {
++			d.chain = XR_NULL_HANDLE;
++			return;
++		}
++		d.width = ci.width;
++		d.height = ci.height;
++		uint32_t count = 0;
++		if (XR_FAILED(xrEnumerateSwapchainImages(d.chain, 0, &count, nullptr)))
++			return;
++		d.images.resize(count, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
++		if (XR_FAILED(xrEnumerateSwapchainImages(d.chain, count, &count, reinterpret_cast<XrSwapchainImageBaseHeader*>(d.images.data()))))
++			return;
++		d.views.resize(count);
++		for (uint32_t i = 0; i < count; i++)
++			if (FAILED(device->CreateDepthStencilView(d.images[i].texture, nullptr, &d.views[i])))
++				return;
++	}
++	if (d.views.empty())
++		return;
++	for (auto& v : d.views)
++		if (!v)
++			return;
++	ComPtr<ID3D11ShaderResourceView> inputView;
++	if (!direct) {
++		D3D11_TEXTURE2D_DESC alias = desc;
++		alias.Format = aliasFormat;
++		alias.ArraySize = alias.MipLevels = 1;
++		alias.Usage = D3D11_USAGE_DEFAULT;
++		alias.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++		alias.CPUAccessFlags = alias.MiscFlags = 0;
++		D3D11_TEXTURE2D_DESC old{};
++		if (d.sampleSource)
++			d.sampleSource->GetDesc(&old);
++		if (!d.sampleSource || old.Width != alias.Width || old.Height != alias.Height || old.Format != alias.Format || old.SampleDesc.Count != alias.SampleDesc.Count || old.SampleDesc.Quality != alias.SampleDesc.Quality) {
++			d.sampleView.Reset();
++			d.sampleSource.Reset();
++			if (FAILED(device->CreateTexture2D(&alias, nullptr, &d.sampleSource)))
++				return;
++		}
++		context->CopySubresourceRegion(d.sampleSource.Get(), 0, 0, 0, 0, source, D3D11CalcSubresource(0, slice, desc.MipLevels), nullptr);
++		D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
++		srv.Format = sampleFormat;
++		if (desc.SampleDesc.Count > 1) {
++			srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
++		} else {
++			srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
++			srv.Texture2D.MipLevels = 1;
++		}
++		if (!d.sampleView && FAILED(device->CreateShaderResourceView(d.sampleSource.Get(), &srv, &d.sampleView)))
++			return;
++		inputView = d.sampleView;
++	}
++	uint32_t index = 0;
++	XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
++	if (XR_FAILED(xrAcquireSwapchainImage(d.chain, &ai, &index)))
++		return;
++	XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
++	wi.timeout = XR_INFINITE_DURATION;
++	if (XR_FAILED(xrWaitSwapchainImage(d.chain, &wi)))
++		return;
++	HRESULT result = S_OK;
++	if (direct)
++		context->CopySubresourceRegion(d.images[index].texture, 0, 0, 0, 0, source, D3D11CalcSubresource(0, slice, desc.MipLevels), nullptr);
++	else {
++		struct Constants {
++			float bounds[4];
++			uint32_t size[2], reversed, pad;
++		} values{ { 0, 0, 1, 1 }, { desc.Width, desc.Height }, nearZ > farZ, 0 };
++		d.deferred->UpdateSubresource(d.constants.Get(), 0, nullptr, &values, 0, 0);
++		d.deferred->OMSetRenderTargets(0, nullptr, d.views[index].Get());
++		d.deferred->OMSetDepthStencilState(d.depthState.Get(), 0);
++		D3D11_VIEWPORT vp{ 0, 0, float(desc.Width), float(desc.Height), 0, 1 };
++		d.deferred->RSSetViewports(1, &vp);
++		d.deferred->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++		d.deferred->VSSetShader(d.vs.Get(), nullptr, 0);
++		d.deferred->PSSetShader(d.ps[desc.SampleDesc.Count > 1].Get(), nullptr, 0);
++		auto* cb = d.constants.Get();
++		auto* resource = inputView.Get();
++		d.deferred->PSSetConstantBuffers(0, 1, &cb);
++		d.deferred->PSSetShaderResources(0, 1, &resource);
++		d.deferred->Draw(3, 0);
++		ComPtr<ID3D11CommandList> list;
++		result = d.deferred->FinishCommandList(FALSE, &list);
++		if (SUCCEEDED(result))
++			context->ExecuteCommandList(list.Get(), TRUE);
++	}
++	XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
++	if (XR_FAILED(xrReleaseSwapchainImage(d.chain, &ri)) || FAILED(result))
++		return;
++	depthInfo = { XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR };
++	depthInfo.subImage.swapchain = d.chain;
++	CalculateViewport(bounds, desc.Width, desc.Height, false, depthInfo.subImage.imageRect);
++	depthInfo.minDepth = input.vRange.v[0];
++	depthInfo.maxDepth = input.vRange.v[1];
++	depthInfo.nearZ = nearZ;
++	depthInfo.farZ = farZ;
++	depthFov = { decoded.left, decoded.right, decoded.up, decoded.down };
++	depthValid = true;
+ }
+ 
+ DX11Compositor::DX11Compositor(ID3D11Texture2D* initial)
+diff --git a/DrvOpenXR/XrBackend.cpp b/DrvOpenXR/XrBackend.cpp
+--- a/DrvOpenXR/XrBackend.cpp
++++ b/DrvOpenXR/XrBackend.cpp
+@@ -467,8 +467,20 @@
+ 	Compositor& comp = *compPtr;
+ 
+ 	// If the session is inactive, we may be unable to write to the surface
+-	if (sessionActive && renderingFrame)
++	layer.next = nullptr; // A colour-only frame must never inherit the previous depth.
++	if (sessionActive && renderingFrame) {
+ 		comp.Invoke(texture, bounds, layer.subImage, (XruEye)eye, submitFlags);
++		layer.next = comp.GetDepthInfo();
++		if (layer.next) {
++            layer.fov = comp.GetDepthFov();
++            if (submitFlags & vr::Submit_TextureWithPose) {
++                const auto* posed = static_cast<const vr::VRTextureWithPose_t*>(texture);
++                const glm::mat4 originFromEye = S2G_m34(posed->mDeviceToAbsoluteTracking) * S2G_m34(GetUnsafeBaseSystem()->GetEyeToHeadTransform(eye));
++                layer.pose.position = G2X_v3f(glm::vec3(originFromEye[3]));
++                layer.pose.orientation = G2X_quat(glm::normalize(glm::quat_cast(originFromEye)));
++            }
++        }
++	}
+ 
+ 	submittedEyeTextures = true;
+ 
+diff --git a/DrvOpenXR/DrvOpenXR.cpp b/DrvOpenXR/DrvOpenXR.cpp
+--- a/DrvOpenXR/DrvOpenXR.cpp
++++ b/DrvOpenXR/DrvOpenXR.cpp
+@@ -218,6 +218,9 @@
+ #endif
+ 	if (availableExtensions.count(XR_EXT_DEBUG_UTILS_EXTENSION_NAME))
+ 		extensions.push_back(XR_EXT_DEBUG_UTILS_EXTENSION_NAME);
++
++	if (availableExtensions.count(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME))
++		extensions.push_back(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
+ 
+ 	// If the visibility mask is available use it, otherwise no big deal
+ 	if (availableExtensions.count(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME))
+diff --git a/OpenOVR/Misc/xrutil.cpp b/OpenOVR/Misc/xrutil.cpp
+--- a/OpenOVR/Misc/xrutil.cpp
++++ b/OpenOVR/Misc/xrutil.cpp
+@@ -31,6 +31,8 @@
+ 	bool hasHandTracking = false;
+ 	bool xdevSpace = false;
+ 	for (const char* ext : extensions) {
++		if (strcmp(ext, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) == 0)
++			supportsCompositionDepth = true;
+ 		if (strcmp(ext, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0)
+ 			hasVisMask = true;
+ 		if (strcmp(ext, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0)
+diff --git a/OpenOVR/Misc/xr_ext.h b/OpenOVR/Misc/xr_ext.h
+--- a/OpenOVR/Misc/xr_ext.h
++++ b/OpenOVR/Misc/xr_ext.h
+@@ -65,6 +65,7 @@
+ public:
+ 	XrExt(XrGraphicsApiSupportedFlags apis, const std::vector<const char*>& extensions);
+ 
++	bool compositionDepthAvailable() const { return supportsCompositionDepth; }
+ 	bool G2Controller_Available() { return supportsG2Controller; }
+ 	bool xrGetVisibilityMaskKHR_Available() { return pfnXrGetVisibilityMaskKHR != nullptr; }
+ 	bool xrMndxXdevSpace_Available() { return pfnxrCreateXDevSpaceMNDX != nullptr; }
+@@ -220,6 +221,7 @@
+ 	PFN_xrDestroyXDevListMNDX pfnxrDestroyXDevListMNDX = nullptr;
+ 	PFN_xrCreateXDevSpaceMNDX pfnxrCreateXDevSpaceMNDX = nullptr;
+ 
++	bool supportsCompositionDepth = false;
+ 	bool supportsG2Controller = false;
+ 
+ #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+diff --git a/OpenOVR/Compositor/WindowsVRDepthProjection.h b/OpenOVR/Compositor/WindowsVRDepthProjection.h
+new file mode 100644
+--- /dev/null
++++ b/OpenOVR/Compositor/WindowsVRDepthProjection.h
+@@ -0,0 +1,44 @@
++#pragma once
++#include <cmath>
++#include <limits>
++// OpenVR's rectilinear right-handed D3D projection maps depth into [0,1].
++// OpenXR nearZ/farZ are distances corresponding to minDepth/maxDepth, and may
++// be reversed or infinite. Preserve that convention instead of sorting them.
++struct WVRDepthProjection {
++  float nearZ, farZ;
++  float left, right, up, down;
++};
++inline bool WVRDecodeDepthProjection(const float m[4][4], const float bounds[4],
++                                     float minDepth, float maxDepth,
++                                     WVRDepthProjection &out) {
++  for (unsigned y = 0; y < 4; y++)
++    for (unsigned x = 0; x < 4; x++)
++      if (!std::isfinite(m[y][x]))
++        return false;
++  for (unsigned i = 0; i < 4; i++)
++    if (!std::isfinite(bounds[i]))
++      return false;
++  if (bounds[0] < 0 || bounds[1] < 0 || bounds[2] > 1 || bounds[3] > 1 ||
++      bounds[0] >= bounds[2] || bounds[1] >= bounds[3] ||
++      !std::isfinite(minDepth) || !std::isfinite(maxDepth) || minDepth < 0 ||
++      maxDepth > 1 || minDepth >= maxDepth || m[0][0] <= 0 || m[1][1] <= 0 ||
++      std::fabs(m[3][2] + 1.f) > .0001f ||
++      std::fabs(m[0][1]) + std::fabs(m[0][3]) + std::fabs(m[1][0]) +
++              std::fabs(m[1][3]) + std::fabs(m[2][0]) + std::fabs(m[2][1]) +
++              std::fabs(m[3][0]) + std::fabs(m[3][1]) + std::fabs(m[3][3]) >
++          .0001f)
++    return false;
++  const float infinity = std::numeric_limits<float>::infinity();
++  out.nearZ = m[2][2] == 0 ? infinity : m[2][3] / m[2][2];
++  out.farZ = m[2][2] + 1.f == 0 ? infinity : m[2][3] / (m[2][2] + 1.f);
++  if (std::isnan(out.nearZ) || std::isnan(out.farZ) || out.nearZ <= 0 ||
++      out.farZ <= 0 || out.nearZ == out.farZ)
++    return false;
++  // Bounds select the eye's rectangle within a texture/atlas. They do not
++  // narrow the eye projection: side-by-side eyes commonly submit half an atlas.
++  out.left = std::atan((-1 + m[0][2]) / m[0][0]);
++  out.right = std::atan((1 + m[0][2]) / m[0][0]);
++  out.up = std::atan((1 + m[1][2]) / m[1][1]);
++  out.down = std::atan((-1 + m[1][2]) / m[1][1]);
++  return out.left < out.right && out.down < out.up;
++}

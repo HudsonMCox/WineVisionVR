@@ -2,7 +2,7 @@
 
 ## Target
 
-Latest user target: work toward consistent **120 real FPS in Moss 2 without changing resolution** (8.33 ms per frame), superseding the earlier 80–90 FPS objective. This is a research target, not an achieved or guaranteed rate. Apple's [M2 specifications](https://support.apple.com/en-la/117810) list 90/96/100 Hz; M2 cannot display 120 distinct frames per second. Pursue the lower frame-time budget as headroom, while pacing delivery to the actual compositor. Do not unlock the producer to waste GPU work above the display cadence.
+Latest user target: work toward **90 real FPS without changing resolution**, superseding the earlier 120 FPS research target. The frame budget is **11.11 ms**. This is not an achieved or guaranteed rate. Continue pacing delivery to the actual compositor and distinguish CPU translation, GPU work and display cadence. The October 16 translation pass is documented in [the translation reduction report](windows-vr-translation-reduction.md).
 
 Keep real guest simulation/render FPS, generated frames, and compositor presentation FPS separate. No generated frames are implemented or counted as game frames. Existing physical captures below concern **Moss**, not an established Moss 2 baseline. Headset pairing has been restored. The new build still needs a physical Moss 2 run to establish performance, thermal stability and frame-time percentiles.
 

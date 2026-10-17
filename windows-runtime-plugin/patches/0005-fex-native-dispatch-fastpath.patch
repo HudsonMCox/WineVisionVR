@@ -1,0 +1,194 @@
+--- a/FEX/Source/Windows/ARM64EC/Module.S
++++ b/FEX/Source/Windows/ARM64EC/Module.S
+@@ -124,14 +124,17 @@
+   // reverse-translate the target through IosAliasEntries BEFORE consulting it.
+   // x4/x9 are spilled to free loop registers; restored on every exit path.
+   // (Native EC callers keep sp 16-aligned at call boundaries per AAPCS.)
+-  stp x4, x9, [sp, #-16]!
+-  // ml1116: last-hit entry first, then the table newest-first.
+-  adrp x16, IosAliasLast
+-  ldr x16, [x16, #:lo12:IosAliasLast]
++  stp x4, x9, [sp, #-32]!
++  str x17, [sp, #16] // preserve the original executable alias through bitmap validation
++  adrp x16, IosAliasReverseCache
++  add x16, x16, #:lo12:IosAliasReverseCache
++  eor x9, x17, x17, lsr #12
++  ubfx x9, x9, #16, #8
++  ldr x16, [x16, x9, lsl #3]
+   cbz x16, ios_ffs_xlate_walk
+-  ldr x4, [x16, #8]      // Entry.JitBase
++  ldr x4, [x16, #8]
+   sub x4, x17, x4
+-  ldr x23, [x16, #16]    // Entry.Size
++  ldr x23, [x16, #16]
+   cmp x4, x23
+   b.lo ios_ffs_xlate_hit
+ ios_ffs_xlate_walk:
+@@ -151,8 +154,11 @@
+   b.lo ios_ffs_xlate_hit_walk
+   b ios_ffs_xlate_loop
+ ios_ffs_xlate_hit_walk:
+-  adrp x23, IosAliasLast
+-  str x16, [x23, #:lo12:IosAliasLast]
++  adrp x23, IosAliasReverseCache
++  add x23, x23, #:lo12:IosAliasReverseCache
++  eor x9, x17, x17, lsr #12
++  ubfx x9, x9, #16, #8
++  str x16, [x23, x9, lsl #3]
+ ios_ffs_xlate_hit:
+   ldr x23, [x16]         // Entry.PeBase
+   add x17, x23, x4       // target in PE space
+@@ -166,20 +172,64 @@
+   lsr x23, x17, #12
+   lsr x16, x16, x23
+   tbz x16, #0, ios_ffs_reject
+-  ldp x4, x9, [sp], #16
++  // The EC bitmap above still validates the original PE target. Once valid,
++  // execute its registered alias directly, rather than faulting on the PE VA.
++ios_ffs_native_select:
++  ldr x16, [sp, #16]
++  cmp x17, x16
++  b.ne ios_ffs_native_original
++  adrp x16, IosAliasForwardCache
++  add x16, x16, #:lo12:IosAliasForwardCache
++  eor x9, x17, x17, lsr #12
++  ubfx x9, x9, #16, #8
++  ldr x16, [x16, x9, lsl #3]
++  cbz x16, ios_ffs_native_walk
++  ldr x4, [x16]
++  sub x4, x17, x4
++  ldr x23, [x16, #16]
++  cmp x4, x23
++  b.lo ios_ffs_native_hit
++ios_ffs_native_walk:
++  adrp x9, IosAliasCount
++  ldr w9, [x9, #:lo12:IosAliasCount]
++  adrp x16, IosAliasEntries
++  add x16, x16, #:lo12:IosAliasEntries
++  add x16, x16, x9, lsl #5
++ios_ffs_native_loop:
++  cbz w9, ios_ffs_native_done
++  sub x16, x16, #32
++  sub w9, w9, #1
++  ldr x4, [x16]
++  sub x4, x17, x4
++  ldr x23, [x16, #16]
++  cmp x4, x23
++  b.hs ios_ffs_native_loop
++  adrp x23, IosAliasForwardCache
++  add x23, x23, #:lo12:IosAliasForwardCache
++  eor x9, x17, x17, lsr #12
++  ubfx x9, x9, #16, #8
++  str x16, [x23, x9, lsl #3]
++ios_ffs_native_hit:
++  ldr x23, [x16, #8]
++  add x17, x23, x4
++  b ios_ffs_native_done
++ios_ffs_native_original:
++  mov x17, x16
++ios_ffs_native_done:
++  ldp x4, x9, [sp], #32
+   adrp x16, IosFfsBypassLog
+   add x16, x16, #:lo12:IosFfsBypassLog
+   ldr x23, [x16]
+   add x23, x23, #1
+   str x23, [x16]         // [0] = bypass count (diagnostic, read by Core.cpp reporter)
+   str x17, [x16, #8]     // [1] = last EC target taken natively
+-  br x17                 // PE VA; the Mach exec-fault redirect maps it to the pool copy
++  br x17                 // registered executable alias, preserving native call arguments
+ ios_ffs_reject:
+   // Pattern matched but the (PE-space) target is not EC per the bitmap: fall
+   // through to normal emulation -- correct for genuine x64 jmp targets -- but
+   // COUNT it, so a run with zero bypasses is distinguishable from one where the
+   // probe never fired at all (ml316's silent miss must not repeat).
+-  ldp x4, x9, [sp], #16
++  ldp x4, x9, [sp], #32
+   adrp x16, IosFfsBypassLog
+   add x16, x16, #:lo12:IosFfsBypassLog
+   ldr x23, [x16, #16]
+@@ -329,7 +379,8 @@
+   // evict one shared last-hit pointer on every crossing.
+   adrp x16, IosAliasReverseCache
+   add x16, x16, #:lo12:IosAliasReverseCache
+-  ubfx x17, x9, #16, #8
++  eor x17, x9, x9, lsr #12
++  ubfx x17, x17, #16, #8
+   ldr x16, [x16, x17, lsl #3]
+   cbz x16, ios_ec_xlate_forward_cache
+   ldr x23, [x16, #8]
+@@ -340,7 +391,8 @@
+ ios_ec_xlate_forward_cache:
+   adrp x16, IosAliasForwardCache
+   add x16, x16, #:lo12:IosAliasForwardCache
+-  ubfx x17, x9, #16, #8
++  eor x17, x9, x9, lsr #12
++  ubfx x17, x17, #16, #8
+   ldr x16, [x16, x17, lsl #3]
+   cbz x16, ios_ec_xlate_walk
+   ldr x23, [x16]
+@@ -367,7 +419,8 @@
+ ios_ec_xlate_hit_walk:
+   adrp x4, IosAliasForwardCache
+   add x4, x4, #:lo12:IosAliasForwardCache
+-  ubfx x17, x9, #16, #8
++  eor x17, x9, x9, lsr #12
++  ubfx x17, x17, #16, #8
+   str x16, [x4, x17, lsl #3]
+ ios_ec_xlate_hit:
+   ldr x4, [x16, #8]     // Entry.JitBase
+@@ -394,7 +447,8 @@
+ ios_ec_reverse_hit:
+   adrp x4, IosAliasReverseCache
+   add x4, x4, #:lo12:IosAliasReverseCache
+-  ubfx x17, x9, #16, #8
++  eor x17, x9, x9, lsr #12
++  ubfx x17, x17, #16, #8
+   str x16, [x4, x17, lsl #3]
+ ios_ec_xlate_done:
+ #endif
+--- a/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp
++++ b/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp
+@@ -428,25 +428,31 @@
+   g_EntryCount = count + 1;
+ }
+ 
++// The assembly and native helpers share a mixed page hash and validate every
++// cached pointer against the live entry, so retirement/slot reuse still misses.
+ uint64_t IosJitTranslate(uint64_t Addr) {
+-  int count = g_EntryCount;
+-  for (int i = 0; i < count; i++) {
+-    uint64_t pb = g_Entries[i].PeBase;
+-    uint64_t sz = g_Entries[i].Size;
+-    if (Addr >= pb && Addr < pb + sz) {
+-      return g_Entries[i].JitBase + (Addr - pb);
++  const unsigned Index = ((Addr >> 16) ^ (Addr >> 28)) & 255;
++  auto Entry = __atomic_load_n(&IosAliasForwardCache[Index], __ATOMIC_RELAXED);
++  if (Entry && Addr - Entry->PeBase < Entry->Size) return Entry->JitBase + (Addr - Entry->PeBase);
++  for (int I = g_EntryCount; I-- > 0;) {
++    auto* Candidate = &g_Entries[I];
++    if (Addr - Candidate->PeBase < Candidate->Size) {
++      __atomic_store_n(&IosAliasForwardCache[Index], Candidate, __ATOMIC_RELAXED);
++      return Candidate->JitBase + (Addr - Candidate->PeBase);
+     }
+   }
+   return Addr;
+ }
+ 
+ uint64_t IosJitReverseTranslate(uint64_t Addr) {
+-  int count = g_EntryCount;
+-  for (int i = 0; i < count; i++) {
+-    uint64_t jb = g_Entries[i].JitBase;
+-    uint64_t sz = g_Entries[i].Size;
+-    if (Addr >= jb && Addr < jb + sz) {
+-      return g_Entries[i].PeBase + (Addr - jb);
++  const unsigned Index = ((Addr >> 16) ^ (Addr >> 28)) & 255;
++  auto Entry = __atomic_load_n(&IosAliasReverseCache[Index], __ATOMIC_RELAXED);
++  if (Entry && Addr - Entry->JitBase < Entry->Size) return Entry->PeBase + (Addr - Entry->JitBase);
++  for (int I = g_EntryCount; I-- > 0;) {
++    auto* Candidate = &g_Entries[I];
++    if (Addr - Candidate->JitBase < Candidate->Size) {
++      __atomic_store_n(&IosAliasReverseCache[Index], Candidate, __ATOMIC_RELAXED);
++      return Candidate->PeBase + (Addr - Candidate->JitBase);
+     }
+   }
+   return Addr;

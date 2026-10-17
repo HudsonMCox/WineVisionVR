@@ -14,8 +14,9 @@ typedef struct WVRGuestFoveationAttachmentV1 {
 typedef struct WVRGuestFoveationPassV1 {
   uint32_t abiVersion, structSize;
   int32_t status;
-  uint32_t operation; // 0 capabilities, 1 begin scene, 2 resolve, 3 bind
-                      // uniform identity map, 4 finish preload
+  uint32_t operation; // 0 capabilities (encoder=borrowed identity buffer), 1 begin scene, 2 resolve, 3 bind
+                      // uniform identity map, 4 finish preload; 5 register event progress,
+                      // 6 cancel event progress (colorTexture=event; encoder=page; token=lease)
   uint32_t flags, width, height, colorLoad, depthLoad;
   uint64_t commandBuffer, colorTexture, depthTexture;
   double clearColor[4];

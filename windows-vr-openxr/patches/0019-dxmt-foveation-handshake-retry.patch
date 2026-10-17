@@ -1,0 +1,30 @@
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -977,12 +977,24 @@
+         const auto &attachment=render_pass_info.colors[i];
+         eligible &= !attachment.resolve_texture && !attachment.level && !attachment.depth_plane;
+       }
+-      static const bool foveationPeer = [] {
++      // A failed early probe must not disable the bridge for the process lifetime.
++      // Retry boundedly until the host companion becomes ready.
++      static thread_local bool foveationPeer = false;
++      static thread_local uint32_t capabilityRetry = 0;
++      if (!foveationPeer && capabilityRetry++ % 256 == 0) {
+         WVRGuestFoveationPassV1 caps{}; caps.abiVersion=WVR_GUEST_FOVEATION_ABI;
+         caps.structSize=sizeof(caps); caps.status=-1;
+         WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&caps));
+-        return caps.status==0;
+-      }();
++        foveationPeer = caps.status==0;
++        WARN("wvr-foveation capability status=",caps.status," size=",sizeof(caps));
++      }
++      static thread_local uint64_t passes=0, safePasses=0, eligiblePasses=0;
++      ++passes; safePasses += data->foveation_safe; eligiblePasses += eligible;
++      if (passes==1 || (passes>=1024 && (passes&(passes-1))==0))
++        WARN("wvr-foveation passes=",passes," safe=",safePasses," eligible=",eligiblePasses,
++             " peer=",foveationPeer," draws=",data->foveation_draw_calls," pso=",bool(data->last_pso),
++             " visibility=",data->use_visibility_result," samples=",render_pass_info.default_raster_sample_count,
++             " array=",render_pass_info.render_target_array_length," colors=",unsigned(data->render_target_count));
+       if (eligible && foveationPeer) {
+         foveation.colorCount=data->render_target_count;
+         for (unsigned i=1;i<data->render_target_count;++i) {

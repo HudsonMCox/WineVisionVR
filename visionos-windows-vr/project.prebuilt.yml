@@ -17,6 +17,7 @@ targets:
       - package: WindowsVRMetal
         embed: true
       - target: WindowsVRNativeBridge
+      - target: WindowsVRLaunchAdapter
       # Unmodified copy of the working JIT runtime; generated AIR is corrected
       # by the separately built source writer in WindowsVRNativeBridge.
       - framework: ../dist/windows-vr-preserved-runtime/WindowsRuntimePlugin.framework
@@ -51,6 +52,7 @@ targets:
         UIFileSharingEnabled: true
         # Writes the launcher log and the compositor bridge trace to Documents. Off in release builds.
         WVRDiagnostics: true
+        WVRRuntimePluginFramework: WindowsVRLaunchAdapter.framework
         LSSupportsOpeningDocumentsInPlace: true
         GCSupportsControllerUserInteraction: true
         GCSupportedGameControllers:
@@ -146,3 +148,29 @@ targets:
         EXPORTED_SYMBOLS_FILE: $(SRCROOT)/../windows-vr-native/shader-compiler/NativeBridge.exports
         HEADER_SEARCH_PATHS: $(SRCROOT)/../windows-vr-native/include
         CODE_SIGN_STYLE: Automatic
+
+  WindowsVRLaunchAdapter:
+    type: framework
+    platform: visionOS
+    dependencies:
+      - target: WindowsVRNativeBridge
+        embed: false
+      - framework: ../dist/windows-vr-preserved-runtime/WindowsRuntimePlugin.framework
+        embed: false
+    sources:
+      - path: ../windows-runtime-plugin/WindowsVRRuntimePlugin.mm
+      - path: ../windows-vr/include/WindowsVRRuntimePlugin.h
+        headerVisibility: public
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.avpplay.windows-vr.launch-adapter
+        GENERATE_INFOPLIST_FILE: YES
+        CLANG_ENABLE_OBJC_ARC: YES
+        CLANG_CXX_LANGUAGE_STANDARD: c++20
+        GCC_SYMBOLS_PRIVATE_EXTERN: YES
+        HEADER_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/../windows-vr/include
+          - $(SRCROOT)/../windows-vr-native/include
+          - $(SRCROOT)/../third-party/madeira/app/Madeira
+        FRAMEWORK_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/../dist/windows-vr-preserved-runtime"]

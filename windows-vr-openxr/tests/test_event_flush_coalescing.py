@@ -12,12 +12,14 @@ c=(a.source/'src/d3d11/d3d11_context_imm.cpp').read_text()
 start=c.index('  HRESULT\n  STDMETHODCALLTYPE\n  GetData(');brace=c.index('{',start);end=brace+1;depth=1
 while depth:
  depth+=(c[end]=='{')-(c[end]=='}');end+=1
-get_data=c[start:end].replace(" override", "")
+get_data=c[start:end].replace(" override", "").replace("std::this_thread::yield();", "++yieldCalls;")
 code=r'''
 #include <cstdint>
 #include <cstddef>
 #include <cassert>
 #include <cstdio>
+#include <thread>
+static uint64_t yieldCalls=0;
 using UINT=unsigned;using UINT64=uint64_t;using BOOL=int;using HRESULT=int;
 #define STDMETHODCALLTYPE
 #define WARN(...) ((void)0)
@@ -50,6 +52,7 @@ int main(){
  // The actual GetData body must still read exact GPU progress on every poll.
  for(unsigned n=0;n<250000;++n)assert(c.GetData(&q,nullptr,0,0)==S_FALSE);
  assert(c.cmd_queue.reads==250000);
+ assert(yieldCalls==(BASELINE?0:7811));
  const uint64_t expected=BASELINE?250000:1;assert(c.flushes==expected);
  std::printf("pending polls=250000 exact GPU reads=%llu Flush calls=%llu\n",(unsigned long long)c.cmd_queue.reads,(unsigned long long)c.flushes);
  // Signal is observable before the containing command chunk completes.

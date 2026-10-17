@@ -8,6 +8,7 @@ import Security
 /// It never accepts a plugin path from a game manifest or other caller-controlled input.
 public final class NativePluginWindowsRuntime: WindowsRuntime, @unchecked Sendable {
     private typealias LaunchFunction = @convention(c) (UnsafePointer<CChar>?) -> Int32
+    private typealias GuestArchitectureFunction = @convention(c) () -> UnsafePointer<CChar>?
     private typealias StopFunction = @convention(c) () -> Int32
     private typealias StatusFunction = @convention(c) () -> Int32
     private typealias GraphicsCapabilitiesFunction = @convention(c) () -> UInt32
@@ -18,9 +19,15 @@ public final class NativePluginWindowsRuntime: WindowsRuntime, @unchecked Sendab
     private var launchFunction: LaunchFunction?
     private var preflightFunction: LaunchFunction?
     private var graphicsCapabilitiesFunction: GraphicsCapabilitiesFunction?
+    private var guestArchitectureFunction: GuestArchitectureFunction?
     private var stopFunction: StopFunction?
     private var statusFunction: StatusFunction?
     private var lastErrorFunction: LastErrorFunction?
+
+    public var guestRuntimeArchitecture: String? {
+        guard let value = guestArchitectureFunction?() else { return nil }
+        return String(cString: value)
+    }
 
     /// `frameworkName` is a bundle resource name such as `WindowsRuntimePlugin.framework`.
     /// The framework is resolved only from the app bundle's `Frameworks` directory.
@@ -55,6 +62,9 @@ public final class NativePluginWindowsRuntime: WindowsRuntime, @unchecked Sendab
             return
         }
 
+        if let address = dlsym(handle, "windows_vr_guest_architecture_v1") {
+            guestArchitectureFunction = unsafeBitCast(address, to: GuestArchitectureFunction.self)
+        }
         libraryHandle = handle
         launchFunction = unsafeBitCast(launchAddress, to: LaunchFunction.self)
         if let preflightAddress = dlsym(handle, "windows_vr_preflight_v1") {

@@ -1,0 +1,64 @@
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -984,12 +984,14 @@
+       // A failed early probe must not disable the bridge for the process lifetime.
+       // Retry boundedly until the host companion becomes ready.
+       static thread_local bool foveationPeer = false;
++      static thread_local obj_handle_t uniformFoveationBuffer = 0;
+       static thread_local uint32_t capabilityRetry = 0;
+       if (!foveationPeer && capabilityRetry++ % 256 == 0) {
+         WVRGuestFoveationPassV1 caps{}; caps.abiVersion=WVR_GUEST_FOVEATION_ABI;
+         caps.structSize=sizeof(caps); caps.status=-1;
+         WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&caps));
+         foveationPeer = caps.status==0;
++        uniformFoveationBuffer = foveationPeer ? caps.encoder : 0;
+         WARN("wvr-foveation capability status=",caps.status," size=",sizeof(caps));
+       }
+       static thread_local uint64_t passes=0, safePasses=0, eligiblePasses=0;
+@@ -1031,8 +1033,11 @@
+       WMT::RenderCommandEncoder encoder{};
+       if (foveation.status == 0 && foveation.encoder) encoder.handle = foveation.encoder;
+       else encoder = cmdbuf.renderCommandEncoder(render_pass_info);
+-      if (foveationPeer && foveation.status != 0 && data->foveation_draw_calls > 0 &&
+-          render_pass_info.render_target_width >= 256 && render_pass_info.render_target_height >= 256) {
++      // Legacy companions need operation 3. New companions expose their
++      // process-lifetime identity buffer during capability negotiation.
++      // Small/unsafe uniform passes still need it for transformed SV_Position.
++      const bool uniformPass = foveationPeer && foveation.status != 0;
++      if (uniformPass && !uniformFoveationBuffer) {
+         WVRGuestFoveationPassV1 uniform{};
+         uniform.abiVersion=WVR_GUEST_FOVEATION_ABI; uniform.structSize=sizeof(uniform);
+         uniform.operation=3; uniform.encoder=encoder.handle;
+@@ -1048,13 +1053,26 @@
+         WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1 *>(&foveation));
+         encoder.handle=foveation.encoder;
+       }
+-      encoder.setVertexBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_VERTEX_BUFFER);
+-      encoder.setVertexBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_CONSTANT_BUFFER);
+-      encoder.setVertexBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_ARGUMENT_TABLE);
++      // One existing Winemetal command-list dispatch for all base bindings,
++      // including the uniform map. No additional uniform-map Unix call.
++      std::array<wmtcmd_render_setbuffer, 7> setup{};
++      unsigned setupCount = 0;
++      auto bind = [&](WMTRenderCommandType type, obj_handle_t buffer, uint8_t index) {
++        auto &cmd = setup[setupCount++];
++        cmd.type = type; cmd.buffer = buffer; cmd.offset = 0; cmd.index = index;
++        cmd.next.set(nullptr);
++        if (setupCount > 1) setup[setupCount - 2].next.set(&cmd);
++      };
++      bind(WMTRenderCommandSetVertexBuffer, gpu_buffer_, SM50_BINDING_INDEX_VERTEX_BUFFER);
++      bind(WMTRenderCommandSetVertexBuffer, gpu_buffer_, SM50_BINDING_INDEX_CONSTANT_BUFFER);
++      bind(WMTRenderCommandSetVertexBuffer, gpu_buffer_, SM50_BINDING_INDEX_ARGUMENT_TABLE);
+       if (data->use_emulated_so)
+-        encoder.setVertexBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_STREAM_OUTPUT0);
+-      encoder.setFragmentBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_CONSTANT_BUFFER);
+-      encoder.setFragmentBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_ARGUMENT_TABLE);
++        bind(WMTRenderCommandSetVertexBuffer, gpu_buffer_, SM50_BINDING_INDEX_STREAM_OUTPUT0);
++      bind(WMTRenderCommandSetFragmentBuffer, gpu_buffer_, SM50_BINDING_INDEX_CONSTANT_BUFFER);
++      bind(WMTRenderCommandSetFragmentBuffer, gpu_buffer_, SM50_BINDING_INDEX_ARGUMENT_TABLE);
++      if (uniformPass && uniformFoveationBuffer)
++        bind(WMTRenderCommandSetFragmentBuffer, uniformFoveationBuffer, 28);
++      encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(setup.data()));
+       if (data->use_geometry || data->use_tessellation) {
+         encoder.setObjectBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_VERTEX_BUFFER);
+         encoder.setObjectBuffer(gpu_buffer_, 0, SM50_BINDING_INDEX_DRAW_ARGUMENTS);

@@ -4,6 +4,12 @@
 #import <os/lock.h>
 
 #include "WindowsVRCompositorBridge.h"
+#include "WindowsVRFrameState.h"
+#include "WindowsVRReconstruction.h"
+#import <simd/simd.h>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
 
 #include <algorithm>
 #include <array>
@@ -16,7 +22,28 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+@interface WVRReconstructionResources : NSObject
+@property(nonatomic,strong) id<MTLTexture> leftDepth;
+@property(nonatomic,strong) id<MTLTexture> rightDepth;
+@property(nonatomic,assign) WVRReconstructionSubmitV1 metadata;
+@end
+@implementation WVRReconstructionResources
+@end
+
 namespace {
+
+// Publishers never acquire this mutex while holding BridgeState::lock.
+// The wait side holds it across snapshot+sleep, closing the lost-wakeup race.
+std::mutex frameSignalMutex;
+std::condition_variable frameSignal;
+std::atomic<uint32_t> frameWaiters{0};
+struct FrameStateChanged {
+    ~FrameStateChanged() {
+        if (!frameWaiters.load(std::memory_order_acquire)) return;
+        { std::lock_guard<std::mutex> guard(frameSignalMutex); }
+        frameSignal.notify_all();
+    }
+};
 
 /// Which bridge calls the guest runtime actually makes, bounded so a render loop cannot flood the file:
 /// the first few calls of each kind and then every power of two. Lines go to Documents/launcher-log.txt
@@ -88,6 +115,7 @@ struct QueuedFrame {
     __strong id<MTLSharedEvent> readyEvent = nil;
     uint64_t readyValue = 0;
     WVRFrameTrackingV1 renderTracking{};
+    __strong WVRReconstructionResources *reconstruction = nil;
     uint32_t leftSlice = 0, leftX = 0, leftY = 0, leftWidth = 0, leftHeight = 0;
     uint32_t rightSlice = 0, rightX = 0, rightY = 0, rightWidth = 0, rightHeight = 0;
 };
@@ -125,6 +153,10 @@ public:
     std::array<WVRFrameTrackingV1, 512> trackingHistory{};
     size_t trackingHistoryNext = 0;
     size_t trackingHistoryCount = 0;
+    uint64_t lastDisplayPublishTimestamp = 0;
+    uint64_t displayPeriodNanoseconds = 11111111;
+    std::array<uint64_t, 8> displayPeriods{};
+    size_t displayPeriodCount = 0, displayPeriodNext = 0;
     WVRCompositorStatsV1 stats = {
         WVR_COMPOSITOR_ABI_VERSION,
         sizeof(WVRCompositorStatsV1),
@@ -155,7 +187,11 @@ int newestReadyOffsetLocked(const BridgeState &bridge) {
 WVRFrameTrackingV1 trackingForTimestampLocked(const BridgeState &bridge, uint64_t timestamp) {
     WVRFrameTrackingV1 result{};
     uint64_t closest = 2'000'001; // Allow timestamp rounding, never substitute the current pose.
-    for (size_t index = 0; index < bridge.trackingHistoryCount; ++index) {
+    // Frames normally reference one of the most recent display predictions.
+    // Traverse the ring in publication order instead of scanning its oldest
+    // physical slot first; still examine all entries when no exact match exists.
+    for (size_t offset = 1; offset <= bridge.trackingHistoryCount; ++offset) {
+        const size_t index = (bridge.trackingHistoryNext + bridge.trackingHistory.size() - offset) % bridge.trackingHistory.size();
         const auto &sample = bridge.trackingHistory[index];
         if (!(sample.flags & WVRDevicePoseTracked) || !sample.timestampNanoseconds) continue;
         const auto delta = timestamp >= sample.timestampNanoseconds ? timestamp - sample.timestampNanoseconds : sample.timestampNanoseconds - timestamp;
@@ -255,6 +291,10 @@ void clearTrackingLocked(BridgeState &bridge) {
     bridge.trackingHistory = {};
     bridge.trackingHistoryNext = 0;
     bridge.trackingHistoryCount = 0;
+    bridge.lastDisplayPublishTimestamp = 0;
+    bridge.displayPeriodNanoseconds = 11111111;
+    bridge.displayPeriods = {};
+    bridge.displayPeriodCount = bridge.displayPeriodNext = 0;
     bridge.tracking.flags = 0;
     bridge.tracking.timestampNanoseconds = 0;
     std::fill_n(bridge.tracking.originFromDevice, 16, 0.0f);
@@ -340,6 +380,7 @@ int32_t submitStereoFrame(const WVRSubmitStereoFrameV1 *frame,
     slot.producerFrameID = frame->producerFrameID;
     slot.producerTimestampNanoseconds = frame->producerTimestampNanoseconds;
     slot.renderTracking = trackingForTimestampLocked(bridge, frame->producerTimestampNanoseconds);
+    slot.reconstruction = nil;
     slot.left = left;
     slot.right = right;
     slot.readyEvent = readyEvent;
@@ -359,6 +400,7 @@ int32_t submitStereoFrame(const WVRSubmitStereoFrameV1 *frame,
 } // namespace
 
 @interface WVRFrameLease : NSObject
+@property(nonatomic,strong) WVRReconstructionResources *reconstruction;
 @property(nonatomic) uint64_t ticket;
 @property(nonatomic) uint64_t producerFrameID;
 @property(nonatomic) uint64_t producerTimestampNanoseconds;
@@ -374,6 +416,7 @@ int32_t submitStereoFrame(const WVRSubmitStereoFrameV1 *frame,
 @end
 
 extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_bind_metal_device_v1(void *opaqueDevice) {
+    FrameStateChanged notifyWaiters;
     traceBridgeCall(CallBind, opaqueDevice ? "device" : "null device");
     if (!opaqueDevice) return WVRCompositorStatusInvalidArgument;
     id<MTLDevice> device = (__bridge id<MTLDevice>)opaqueDevice;
@@ -421,6 +464,7 @@ extern "C" WVR_COMPOSITOR_EXPORT void *wvr_compositor_copy_consumer_event_v1(voi
 }
 
 extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_set_render_scale_v1(float scale) {
+    FrameStateChanged notifyWaiters;
     if (!std::isfinite(scale) || scale <= 0.0f || scale > 1.0f) {
         return WVRCompositorStatusInvalidArgument;
     }
@@ -438,6 +482,7 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_set_render_scale_v1(floa
 }
 
 extern "C" WVR_COMPOSITOR_EXPORT void wvr_compositor_request_session_exit_v1(void) {
+    FrameStateChanged notifyWaiters;
     BridgeState &bridge = state();
     os_unfair_lock_lock(&bridge.lock);
     bridge.sessionExitRequested = true;
@@ -445,6 +490,7 @@ extern "C" WVR_COMPOSITOR_EXPORT void wvr_compositor_request_session_exit_v1(voi
 }
 
 extern "C" WVR_COMPOSITOR_EXPORT void wvr_compositor_reset_session_exit_v1(void) {
+    FrameStateChanged notifyWaiters;
     BridgeState &bridge = state();
     os_unfair_lock_lock(&bridge.lock);
     bridge.sessionExitRequested = false;
@@ -452,6 +498,7 @@ extern "C" WVR_COMPOSITOR_EXPORT void wvr_compositor_reset_session_exit_v1(void)
 }
 
 extern "C" WVR_COMPOSITOR_EXPORT void wvr_compositor_pause_v1(void) {
+    FrameStateChanged notifyWaiters;
     BridgeState &bridge = state();
     os_unfair_lock_lock(&bridge.lock);
     invalidateTargetsLocked(bridge);
@@ -462,6 +509,7 @@ extern "C" WVR_COMPOSITOR_EXPORT void wvr_compositor_pause_v1(void) {
 extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_publish_targets_v1(
     uint32_t leftWidth, uint32_t leftHeight, uint32_t leftPixelFormat,
     uint32_t rightWidth, uint32_t rightHeight, uint32_t rightPixelFormat) {
+    FrameStateChanged notifyWaiters;
     {
         traceBridgeCallf(CallPublishTargets, "left=%ux%u fmt=%u right=%ux%u fmt=%u",
                       leftWidth, leftHeight, leftPixelFormat, rightWidth, rightHeight, rightPixelFormat);
@@ -541,16 +589,16 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_submit_stereo_frame_for_
     return submitStereoFrame(frame, targetGeneration, true, outCompositorTicket);
 }
 
-static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket);
+static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket, WVRReconstructionResources *reconstruction);
 
-extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_submit_stereo_frame_v2(
-    const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket) {
-    const int32_t status = submitStereoFrameV2Impl(frame, outCompositorTicket);
+static int32_t submitStereoFrame(
+    const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket, WVRReconstructionResources *reconstruction) {
+    const int32_t status = submitStereoFrameV2Impl(frame, outCompositorTicket,reconstruction);
     traceBridgeCallf(CallSubmitV2, "status=%d", status);
     return status;
 }
 
-static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket) {
+static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint64_t *outCompositorTicket, WVRReconstructionResources *reconstruction) {
     if (!frame || !outCompositorTicket || frame->abiVersion != WVR_COMPOSITOR_ABI_VERSION_V2 ||
         frame->structSize < sizeof(WVRSubmitStereoFrameV2) || !frame->leftTexture ||
         !frame->rightTexture || !frame->producerReadyEvent || frame->targetGeneration == 0) {
@@ -622,6 +670,7 @@ static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint
     slot.producerFrameID = frame->producerFrameID;
     slot.producerTimestampNanoseconds = frame->producerTimestampNanoseconds;
     slot.renderTracking = trackingForTimestampLocked(bridge, frame->producerTimestampNanoseconds);
+    slot.reconstruction = reconstruction;
     slot.left = left; slot.right = right; slot.readyEvent = readyEvent;
     slot.readyValue = frame->producerReadyValue;
     slot.leftSlice = frame->leftSlice; slot.leftX = frame->leftX; slot.leftY = frame->leftY;
@@ -633,6 +682,52 @@ static int32_t submitStereoFrameV2Impl(const WVRSubmitStereoFrameV2 *frame, uint
     bridge.stats.queuedFrames = static_cast<uint32_t>(bridge.count);
     os_unfair_lock_unlock(&bridge.lock);
     return WVRCompositorStatusOK;
+}
+
+extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_submit_stereo_frame_v2(
+    const WVRSubmitStereoFrameV2 *frame, uint64_t *ticket) {
+    return submitStereoFrame(frame,ticket,nil);
+}
+
+static std::atomic<uint64_t> reconstructionRejections{0};
+static int32_t submitReconstructionImpl(WVRReconstructionSubmitV1 *r) {
+    if (!r || r->abiVersion!=WVR_RECONSTRUCTION_ABI || r->structSize!=sizeof(*r)) return WVRCompositorStatusUnsupportedABI;
+    r->status=WVRCompositorStatusInvalidArgument; r->compositorTicket=0; r->consumerEvent=0;
+    if (r->reserved || !r->frameID || !r->timestampNanoseconds) return r->status;
+    auto resources=[WVRReconstructionResources new];
+    for(unsigned eye=0;eye<2;++eye) {
+        const auto &e=r->eyes[eye];
+        auto color=(__bridge id<MTLTexture>)(void*)e.colorTexture;
+        auto depth=(__bridge id<MTLTexture>)(void*)e.depthTexture;
+        if (!color || !depth || color.device!=depth.device || depth.pixelFormat!=MTLPixelFormatDepth32Float ||
+            (depth.textureType!=MTLTextureType2D && depth.textureType!=MTLTextureType2DArray) || depth.sampleCount!=1 ||
+            e.depthSlice>=depth.arrayLength || !e.width || !e.height || !e.depthWidth || !e.depthHeight || e.depthX>depth.width || e.depthY>depth.height ||
+            e.depthWidth>depth.width-e.depthX || e.depthHeight>depth.height-e.depthY ||
+            !std::isfinite(e.minDepth) || !std::isfinite(e.maxDepth) || e.minDepth<0 || e.maxDepth>1 || e.minDepth>=e.maxDepth) return r->status;
+        for(unsigned i=0;i<16;++i) if(!std::isfinite(e.originFromEye[i]) || !std::isfinite(e.projection[i]))return r->status;
+        simd_float4x4 origin,projection;std::memcpy(&origin,e.originFromEye,sizeof(origin));std::memcpy(&projection,e.projection,sizeof(projection));
+        if(!std::isfinite(simd_determinant(origin)) || !std::isfinite(simd_determinant(projection)) || simd_determinant(origin)==0 || simd_determinant(projection)==0)return r->status;
+        if(eye==0)resources.leftDepth=depth;else resources.rightDepth=depth;
+    }
+    resources.metadata=*r;
+    WVRSubmitStereoFrameV2 frame{};frame.abiVersion=WVR_COMPOSITOR_ABI_VERSION_V2;frame.structSize=sizeof(frame);
+    frame.producerFrameID=r->frameID;frame.producerTimestampNanoseconds=r->timestampNanoseconds;frame.targetGeneration=r->targetGeneration;
+    frame.leftTexture=(void*)r->eyes[0].colorTexture;frame.rightTexture=(void*)r->eyes[1].colorTexture;
+    frame.producerReadyEvent=(void*)r->producerEvent;frame.producerReadyValue=r->producerValue;
+    frame.leftSlice=r->eyes[0].colorSlice;frame.leftX=r->eyes[0].colorX;frame.leftY=r->eyes[0].colorY;frame.leftWidth=r->eyes[0].width;frame.leftHeight=r->eyes[0].height;
+    frame.rightSlice=r->eyes[1].colorSlice;frame.rightX=r->eyes[1].colorX;frame.rightY=r->eyes[1].colorY;frame.rightWidth=r->eyes[1].width;frame.rightHeight=r->eyes[1].height;
+    r->status=submitStereoFrame(&frame,&r->compositorTicket,resources);
+    if(r->status==0)r->consumerEvent=(uint64_t)wvr_compositor_copy_consumer_event_v1();
+    return r->status;
+}
+
+extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_submit_reconstruction_v1(WVRReconstructionSubmitV1 *r) {
+    const int32_t status=submitReconstructionImpl(r);
+    if(status!=0)reconstructionRejections.fetch_add(1,std::memory_order_relaxed);
+    return status;
+}
+extern "C" WVR_COMPOSITOR_EXPORT uint64_t wvr_reconstruction_transport_rejections_v1(void) {
+    return reconstructionRejections.load(std::memory_order_relaxed);
 }
 
 extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_acquire_latest_stereo_frame_v1(
@@ -671,6 +766,7 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_acquire_latest_stereo_fr
     lease.readyEvent = slot.readyEvent;
     lease.readyValue = slot.readyValue;
     lease.renderTracking = slot.renderTracking;
+    lease.reconstruction = slot.reconstruction;
     lease.leftSlice = slot.leftSlice; lease.leftX = slot.leftX; lease.leftY = slot.leftY;
     lease.leftWidth = slot.leftWidth; lease.leftHeight = slot.leftHeight;
     lease.rightSlice = slot.rightSlice; lease.rightX = slot.rightX; lease.rightY = slot.rightY;
@@ -720,6 +816,7 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_acquire_latest_stereo_fr
     lease.left = slot.left; lease.right = slot.right;
     lease.readyEvent = slot.readyEvent; lease.readyValue = slot.readyValue;
     lease.renderTracking = slot.renderTracking;
+    lease.reconstruction = slot.reconstruction;
     lease.leftSlice = slot.leftSlice; lease.leftX = slot.leftX; lease.leftY = slot.leftY;
     lease.leftWidth = slot.leftWidth; lease.leftHeight = slot.leftHeight;
     lease.rightSlice = slot.rightSlice; lease.rightX = slot.rightX; lease.rightY = slot.rightY;
@@ -755,6 +852,16 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_copy_lease_tracking_v1(
     return (outTracking->flags & WVRDevicePoseTracked) ? WVRCompositorStatusOK : WVRCompositorStatusNoFrameAvailable;
 }
 
+extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_copy_reconstruction_v1(void *opaque, WVRReconstructionSubmitV1 *out) {
+    if(!opaque || !out || out->abiVersion!=WVR_RECONSTRUCTION_ABI || out->structSize!=sizeof(*out))return WVRCompositorStatusInvalidArgument;
+    auto lease=(__bridge WVRFrameLease*)opaque;
+    if(!lease.reconstruction)return WVRCompositorStatusNoFrameAvailable;
+    *out=lease.reconstruction.metadata;
+    out->eyes[0].colorTexture=(uint64_t)(__bridge void*)lease.left;out->eyes[1].colorTexture=(uint64_t)(__bridge void*)lease.right;
+    out->eyes[0].depthTexture=(uint64_t)(__bridge void*)lease.reconstruction.leftDepth;out->eyes[1].depthTexture=(uint64_t)(__bridge void*)lease.reconstruction.rightDepth;
+    out->compositorTicket=lease.ticket;out->status=0;return 0;
+}
+
 extern "C" WVR_COMPOSITOR_EXPORT void wvr_compositor_release_acquired_frame_v1(void *opaqueLease) {
     if (!opaqueLease) return;
     WVRFrameLease *lease = (__bridge_transfer WVRFrameLease *)opaqueLease;
@@ -769,6 +876,7 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_publish_frame_tracking_v
     uint64_t timestampNanoseconds, uint32_t flags,
     const float *originFromDevice16, const float *deviceFromEye32,
     const float *projection32, const float *frustumTangents8, const float *depthRange2) {
+    FrameStateChanged notifyWaiters;
     traceBridgeCall(CallPublishTracking, "");
     if (!originFromDevice16 || !deviceFromEye32 || !projection32 ||
         !frustumTangents8 || !depthRange2) {
@@ -795,12 +903,60 @@ extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_publish_frame_tracking_v
     }
     std::copy(depthRange2, depthRange2 + 2, bridge.tracking.depthRange);
     if ((flags & WVRDevicePoseTracked) && timestampNanoseconds) {
+        // SDK display timestamps advance independently of guest frame arrival.
+        // Reject missed ticks and use a bounded median to resist scheduling jitter.
+        if (timestampNanoseconds > bridge.lastDisplayPublishTimestamp && bridge.lastDisplayPublishTimestamp) {
+            const uint64_t interval = timestampNanoseconds - bridge.lastDisplayPublishTimestamp;
+            if (interval >= 7000000 && interval <= 14000000) {
+                bridge.displayPeriods[bridge.displayPeriodNext] = interval;
+                bridge.displayPeriodNext = (bridge.displayPeriodNext + 1) % bridge.displayPeriods.size();
+                bridge.displayPeriodCount = std::min(bridge.displayPeriodCount + 1, bridge.displayPeriods.size());
+                auto periods = bridge.displayPeriods;
+                std::sort(periods.begin(), periods.begin() + bridge.displayPeriodCount);
+                bridge.displayPeriodNanoseconds = periods[bridge.displayPeriodCount / 2];
+            }
+        }
+        bridge.lastDisplayPublishTimestamp = timestampNanoseconds;
         bridge.trackingHistory[bridge.trackingHistoryNext] = bridge.tracking;
         bridge.trackingHistoryNext = (bridge.trackingHistoryNext + 1) % bridge.trackingHistory.size();
         bridge.trackingHistoryCount = std::min(bridge.trackingHistoryCount + 1, bridge.trackingHistory.size());
     }
     os_unfair_lock_unlock(&bridge.lock);
     return WVRCompositorStatusOK;
+}
+
+extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_frame_state_v1(WVRFrameStateRequestV1 *request) {
+    if (!request || request->abiVersion != WVR_FRAME_STATE_ABI || request->structSize != sizeof(*request))
+        return WVRCompositorStatusUnsupportedABI;
+    request->status = WVRCompositorStatusInvalidArgument;
+    if (request->operation != 1 && request->operation != 2) return request->status;
+    BridgeState &bridge = state();
+    auto snapshot = [&] {
+        os_unfair_lock_lock(&bridge.lock);
+        request->tracking = bridge.tracking;
+        request->targets = bridge.targets;
+        request->displayPeriodNanoseconds = bridge.displayPeriodNanoseconds;
+        for (uint32_t role = 0; role < WVR_COMPOSITOR_VIEW_COUNT; ++role) request->controllers[role] = bridge.controllers[role];
+        if (bridge.sessionExitRequested) request->tracking.flags |= WVRDevicePoseSessionExitRequested;
+        const bool ready = bridge.compositorPaused || bridge.sessionExitRequested ||
+            (request->expectedTargetGeneration && bridge.targets.generation != request->expectedTargetGeneration) ||
+            ((request->tracking.flags & WVRDevicePoseTracked) && request->tracking.timestampNanoseconds > request->afterTimestampNanoseconds);
+        os_unfair_lock_unlock(&bridge.lock);
+        return ready;
+    };
+    if (request->operation == 1) { snapshot(); request->status = 0; return 0; }
+    const uint64_t suppliedTimeout = request->timeoutNanoseconds;
+    const uint64_t timeout = std::min<uint64_t>(suppliedTimeout, 100000000);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout);
+    std::unique_lock<std::mutex> waitLock(frameSignalMutex);
+    frameWaiters.fetch_add(1, std::memory_order_release);
+    struct WaiterScope { ~WaiterScope() { frameWaiters.fetch_sub(1, std::memory_order_release); } } waiterScope;
+    while (!snapshot()) {
+        if (frameSignal.wait_until(waitLock, deadline) == std::cv_status::timeout) { snapshot(); break; }
+    }
+    // A timeout returns the actual latest state, never a synthetic display pose.
+    request->status = 0;
+    return 0;
 }
 
 extern "C" WVR_COMPOSITOR_EXPORT int32_t wvr_compositor_copy_frame_tracking_v1(

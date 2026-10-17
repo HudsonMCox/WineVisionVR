@@ -83,6 +83,14 @@ int main(int argc, char **argv) {
     auto dispatch = (int (*)(void *))dxmt_winemetal_unix_call_funcs[146];
     require(dispatch(&ptr) == 37 && forwarded == 1,
             "existing ABI forwarded unchanged");
+    WVRGuestFoveationPassV1 capabilities{};
+    capabilities.abiVersion = WVR_GUEST_FOVEATION_ABI;
+    capabilities.structSize = sizeof(capabilities);
+    require(wvr_guest_foveation_process_v1(&capabilities) == 0 && capabilities.encoder,
+            "capability handshake returns the borrowed identity buffer");
+    auto identity = (__bridge id<MTLBuffer>)(void *)capabilities.encoder;
+    require(identity.device == d && identity.length > 0,
+            "identity buffer belongs to the compositor device");
     auto q = [d newCommandQueue];
     auto m = map(d, false);
     auto shifted = map(d, true);

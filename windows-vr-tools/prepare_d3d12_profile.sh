@@ -76,6 +76,10 @@ patches=[
  "windows-vr-openxr/patches/0016-dxmt-event-query-flush-coalescing.patch",
  "windows-vr-openxr/patches/0017-dxmt-completed-event-result.patch",
  "windows-vr-openxr/patches/0018-dxmt-eye-tracked-guest-foveation.patch",
+ "windows-vr-openxr/patches/0019-dxmt-foveation-handshake-retry.patch",
+ "windows-vr-openxr/patches/0020-dxmt-cooperative-query-polling.patch",
+ "windows-vr-openxr/patches/0021-dxmt-notified-query-progress.patch", "windows-vr-openxr/patches/0022-dxmt-batched-uniform-bindings.patch", "windows-vr-openxr/patches/0023-dxmt-progress-retry-contract.patch",
+ "windows-vr-openxr/patches/0024-dxmt-explicit-scene-depth.patch",
 ]
 subprocess.run(["git","init","--quiet"],cwd=dest,check=True)
 for rel in patches:
@@ -86,6 +90,9 @@ wine_patch="windows-runtime-plugin/d3d12/0001-embedded-dxmt-dispatch.patch"
 subprocess.run(["git","init","--quiet"],cwd=work,check=True)
 subprocess.run(["git","apply",str(root/wine_patch)],cwd=work,check=True)
 headers=[
+ ("windows-vr-native/include/WindowsVRReconstruction.h","src/d3d11/WindowsVRReconstruction.h"),
+ ("windows-vr-native/include/WindowsVRReconstruction.h","src/d3d12/WindowsVRReconstruction.h"),
+ ("windows-vr-native/include/WindowsVRReconstruction.h","src/dxmt/WindowsVRReconstruction.h"),
  ("windows-vr-openxr/include/WindowsVRD3D11ContextExt.h","src/d3d11/WindowsVRD3D11ContextExt.h"),
  ("windows-vr-openxr/include/WindowsVRD3D12CommandQueueExt.h","src/d3d12/WindowsVRD3D12CommandQueueExt.h"),
  ("windows-vr-openxr/include/WindowsVRD3D11ContextExt.h","src/d3d12/WindowsVRD3D11ContextExt.h"),

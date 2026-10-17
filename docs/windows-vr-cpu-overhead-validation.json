@@ -1,0 +1,62 @@
+{
+  "signedVisionOSDeviceBuildSucceeded": true,
+  "signatureVerified": true,
+  "productionBundleVerified": true,
+  "gameLaunched": false,
+  "installedOnHeadset": false,
+  "headsetFPSMeasured": false,
+  "resolutionChanged": false,
+  "artifacts": {
+    "WindowsVR/Guest/arm64ec/wvr_openxr.dll": {
+      "sha256": "59784c2e6a986a133391dfa4525fb7bbfc7b48cfcd226d9d0237dcd45be0ccf9",
+      "source": ".build-performance-next/openxr-arm64ec/stage/WindowsVR/Guest/arm64ec/wvr_openxr.dll",
+      "packagedCopyMatches": true
+    },
+    "WindowsVR/Guest/x64/wvr_openxr.dll": {
+      "sha256": "470f376d74d9e87b601d8d97e37428687ea0520bda06ebd66cc97b3f91607f38",
+      "source": ".build-translation-pass/openxr-x64/stage/WindowsVR/Guest/x64/wvr_openxr.dll",
+      "packagedCopyMatches": true
+    }
+  },
+  "preservedJITExecutableTextSha256": "3df46aed87b830943c883ed7d68818a272ceb245304d1d4e2ead2609c417f77a",
+  "sourceSha256": {
+    "windows-vr-openxr/src/WindowsVROpenXR.cpp": "6d1034f80c5418508a5df33291f4928485b5ff3160bc93307c4511be2ffb1a30",
+    "windows-vr-openxr/include/WindowsVRActionPlan.h": "a7f2b022d14eb368299f1b43ea51e2daa9e1ddbb956a45484a94394decf1fc90",
+    "windows-vr-openxr/tests/test_input_contract.py": "eaca4ea1d4f3aea1f90f177a50117d809dd0ea67cede8fe9e3567fac26bba5fe",
+    "windows-vr-openxr/tests/test_cpu_hotpaths.py": "40b41edeeb30bc5c26f6044e7f38e0eb11b6c5e272b9bc593d6ad866762de373"
+  },
+  "localEvidence": {
+    "app-build.log": {
+      "localPath": ".build-cpu-pass/app-build.log",
+      "sha256": "e695c5dbacacd5520b6fca4c0763ea7cdbde369f4a3a7d857007f0ca9e2c12fa"
+    },
+    "final-bundle-check.log": {
+      "localPath": ".build-cpu-pass/final-bundle-check.log",
+      "sha256": "52cfa68f122003a49ec4589d90ccb8b2a9b145c0dcfa9870e1d7280c25001042"
+    },
+    "frame-regression.log": {
+      "localPath": ".build-cpu-pass/frame-regression.log",
+      "sha256": "c2177f63c81a3696f1f35848d6522ed442d2065c4e81587e3fd251be5bfcaec7"
+    },
+    "hotpaths-test.log": {
+      "localPath": ".build-cpu-pass/hotpaths-test.log",
+      "sha256": "6b80e70da8d0f618fbd9a50a9190f8b8cad090e99fe5d7c6311de53590d4af90"
+    },
+    "input-test.log": {
+      "localPath": ".build-cpu-pass/input-test.log",
+      "sha256": "cf881f91da262b0f287311cc2122c7eee670064772286594897b26bd6ee8ea66"
+    },
+    "openxr-arm64ec-build.log": {
+      "localPath": ".build-cpu-pass/openxr-arm64ec-build.log",
+      "sha256": "2bb047bc2c35ece9762cf5abc4d1c7cada2d4e6390cc1b7bbde0e20da464ef26"
+    },
+    "openxr-x64-build.log": {
+      "localPath": ".build-cpu-pass/openxr-x64-build.log",
+      "sha256": "e4720d6e0946cef88c0472bf5add633be1f8fbde9b690812c35db90e4b7a9eef"
+    },
+    "stage.log": {
+      "localPath": ".build-cpu-pass/stage.log",
+      "sha256": "a46ddf2bc8eb00c81aeef42dcef3dabf9696c8ff91a5766f4efd8ac4c733081c"
+    }
+  }
+}

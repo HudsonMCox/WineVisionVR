@@ -1,0 +1,157 @@
+{
+  "artifacts": {
+    "d3d11.dll": {
+      "baselineSha256": "ec9c4e385ed51ff4402d3052187e07e7dcd00b2f6d1399889a210a8f0f223565",
+      "sha256": "cdc96a50d3b020d5fb3dc440acf2fff96565757ff3bff9d0bda3ff42a236ada4",
+      "exportsUnchanged": true
+    },
+    "dxgi.dll": {
+      "baselineSha256": "3f8bec1e6a26413d146a1619f64b8deabfbe3cb1b9f4edbeafa411ecf6c3c935",
+      "sha256": "4d3836d5850fabf2cc12161286c5b1272e1dd4ba9702939cd6ee46a1be8cc9f9",
+      "exportsUnchanged": true
+    }
+  },
+  "patchesSha256": {
+    "windows-vr-openxr/patches/0022-dxmt-batched-uniform-bindings.patch": "acd602d2c0991bcb6fa4f2846d5d2b8e923ef0fddf73a2a5fc2fb0aed076df8f",
+    "windows-vr-openxr/patches/0023-dxmt-progress-retry-contract.patch": "c525e04f9560a4a01e5501632cf4370d5fee886585a911e1cd1f7b6788506f34"
+  },
+  "gameLaunched": false,
+  "headsetFPSMeasured": false,
+  "evidence": {
+    "bindings-test.log": {
+      "sha256": "4c84470f83cab34a020c1339c2584c47a780531da94b04c9a79171ec0be3824b",
+      "localPath": ".build-performance-next/bindings-test.log"
+    },
+    "progress-test.log": {
+      "sha256": "0b2bcb63130884b9bb823462ea546baa90b9816b1a82a7b6abbd44d6b7e91f92",
+      "localPath": ".build-performance-next/progress-test.log"
+    },
+    "environment-test.log": {
+      "sha256": "169aaa3a36534b9311e34d6ff6494cf0a339eafc0e569bd00f081c95c2aa101d",
+      "localPath": ".build-performance-next/environment-test.log"
+    },
+    "foveation-gpu-tests.log": {
+      "sha256": "ad74933ec5b8c362a4174eea380797aad5ad751953679f439ba966bf3bd35186",
+      "localPath": ".build-performance-next/foveation-gpu-tests.log"
+    },
+    "regression.log": {
+      "sha256": "086430d575c93dd231e79239c0567329b8b24f05ff5700e8ccd4415ed813dff4",
+      "localPath": ".build-performance-next/regression.log"
+    },
+    "gate-tests.log": {
+      "sha256": "d056a0d0330d1508a0ad86b39cf36fba30c13e9f00f06da7e84131578b02ed56",
+      "localPath": ".build-performance-next/gate-tests.log"
+    },
+    "package-tests.log": {
+      "sha256": "1cfa9ca2d91a8f060b7a8be9ebd2ec9f7784e164b6ac6250b3388f21713245df",
+      "localPath": ".build-performance-next/package-tests.log"
+    },
+    "arm64ec-validation.log": {
+      "sha256": "288851b19e00a89453bc4a916f38aa3f4d2d75ceace61ce2e44d82acc8a10b4c",
+      "localPath": ".build-performance-next/arm64ec-validation.log"
+    },
+    "arm64ec-build.log": {
+      "sha256": "43f8bfe3e0147ca2a7574271180491215c5681bb263c1c94f75fe48b9aad36dc",
+      "localPath": ".build-performance-next/arm64ec-build.log"
+    },
+    "openxr-arm64ec-build.log": {
+      "sha256": "4ff764a97dcee29f74eca27660336794b8c5f538c67faeb862b9c2084ff457c3",
+      "localPath": ".build-performance-next/openxr-arm64ec-build.log"
+    },
+    "orchestrator-configure.log": {
+      "sha256": "1cfd663dc1a60d72916027e1017101612fca82c5f837067af88db42644dd136f",
+      "localPath": ".build-performance-next/orchestrator-configure.log"
+    },
+    "app-build.log": {
+      "localPath": ".build-performance-next/app-build.log",
+      "sha256": "1ffddc256855cde43127b775995fd93f811fa299c6d2d5aa4414041a11f4bd7d"
+    },
+    "final-bundle-check.log": {
+      "localPath": ".build-performance-next/final-bundle-check.log",
+      "sha256": "852f226bb46b0a45ca8dccfdba7c83cfff932d699ef0b3346733707a2c9d7a60"
+    },
+    "adapter-build.log": {
+      "localPath": ".build-performance-next/adapter-build.log",
+      "sha256": "ce09587988822dcd06bb4361180bbaaba0b8b33c3da7dc964f230f2c6e61ac7e"
+    },
+    "native-selection-test.log": {
+      "localPath": ".build-performance-next/native-selection-test.log",
+      "sha256": "bd4f6231f01f930646c789dffd61ad5516ad6027c3008a843b295003bba1adc0"
+    },
+    "registration-test.log": {
+      "localPath": ".build-performance-next/registration-test.log",
+      "sha256": "34eddbbe55ea07581bf3c099d4bb273fef21aa61103b8a3ff846395cdbe8db94"
+    },
+    "integrated-bundle-check.log": {
+      "localPath": ".build-performance-next/integrated-bundle-check.log",
+      "sha256": "80a17b6efb1e221772cab953e7dc3eca6591baf56b9c4ec5a0c1a8207eaf8910"
+    },
+    "fex-cache-test.log": {
+      "sha256": "7fc3a2e7c38d1a0b0bf94376c7f3a5e910bc8310fd08c180def429baa1f80276",
+      "localPath": ".build-fex-cache/cache-test.log"
+    },
+    "fex-patch-test.log": {
+      "sha256": "e84ce29c297bb041b6ad9874d5ed86dc889c55c943ae78621ded05321eabe02a",
+      "localPath": ".build-fex-cache/patch-test.log"
+    },
+    "fex-package-test.log": {
+      "sha256": "bd4f6231f01f930646c789dffd61ad5516ad6027c3008a843b295003bba1adc0",
+      "localPath": ".build-fex-cache/package-test.log"
+    },
+    "fex-build.log": {
+      "sha256": "c37b33210fe6b48ae1b74ddf9f54665ef70a406e1a3e981cf90d7a9fd8daeb30",
+      "localPath": ".build-fex-cache/build.log"
+    },
+    "fex-app-build.log": {
+      "sha256": "882e0ce4c33f5fdaeb4ee29576014a7b315af1e9c6e8aa687e3ecbb466e5a264",
+      "localPath": ".build-fex-cache/app-build.log"
+    },
+    "fex-packaging-test.log": {
+      "sha256": "e4171851ade8bf3d728a37d94d5ee0b938696d345b88f613f069df597c6d17c6",
+      "localPath": ".build-fex-cache/packaging-test.log"
+    },
+    "fex-environment-test.log": {
+      "sha256": "b7e0cd32bd74dc442f341545eec4bdbab60065b408859ae97d627da702b19814",
+      "localPath": ".build-fex-cache/environment-test.log"
+    },
+    "fex-bundle-test.log": {
+      "sha256": "52cfa68f122003a49ec4589d90ccb8b2a9b145c0dcfa9870e1d7280c25001042",
+      "localPath": ".build-fex-cache/bundle-test.log"
+    }
+  },
+  "resolutionChanged": false,
+  "experimentalARM64ECEnabledForGames": true,
+  "experimentalARM64EC": {
+    "openvr": {
+      "path": ".build-performance-next/opencomposite-arm64ec/bin/vrclient_x64.dll",
+      "sha256": "ec4c49b63469410c3cf3943bce5b0b5a044eaf3665b8c37acdeb0dd4e15bf97d",
+      "gameTested": false
+    },
+    "openxr": {
+      "path": ".build-performance-next/openxr-arm64ec/stage/WindowsVR/Guest/arm64ec/wvr_openxr.dll",
+      "sha256": "20dd88a972fc16e8b3ab6fc1ead2cda7039139c91a911c6bce51022d3e1869a8",
+      "gameTested": false
+    }
+  },
+  "signedVisionOSBuildSucceeded": true,
+  "nativeGuestRuntimePackaged": true,
+  "persistentFEXMachineCodeCacheImplemented": true,
+  "launchAdapter": "WindowsVRLaunchAdapter.framework",
+  "preservedJITExecutableTextSha256": "3df46aed87b830943c883ed7d68818a272ceb245304d1d4e2ead2609c417f77a",
+  "persistentFEXMachineCodeCacheEnabled": true,
+  "persistentFEXMachineCodeCacheHeadsetVerified": false,
+  "fexCache": {
+    "cacheFormat": 3,
+    "mode": "eager",
+    "translatorSha256": "987299c170b1374ba5cd3d91efa07c9aa6629ea4e18215089c02ef56ca6e5602",
+    "compilerSha256": "9df3b2f97d11beff97a9e647ad36b4889bb1bbc84d69f2ce17091708b953107d",
+    "launcherSha256": "1f5a6fbfd0295e848bc946500f717ad8b4217d3f836db2cd0a7a5e7f8d178919",
+    "patchSha256": "e2c255f28e77296687392777335b960b80094f794325c1544434e02458c7959a",
+    "gameLaunched": false,
+    "headsetFPSMeasured": false,
+    "sanitizer": "UBSan/bounds; Apple ASan initializer deadlocked before main on this Mac",
+    "signedAppBuildSucceeded": true,
+    "packagedCopiesVerified": true,
+    "preservedNativeJITTextUnchanged": true
+  }
+}

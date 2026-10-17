@@ -16,6 +16,7 @@ def function(signature):
     return source[start:end]
 preamble = r'''
 #include <openxr/openxr.h>
+#include "WindowsVRActionPlan.h"
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -31,7 +32,7 @@ constexpr uint32_t kControllerLeft=0,kControllerRight=1;
 struct Instance;struct Action;
 struct ActionValue {bool boolean=false;float scalar=0;XrVector2f vector{};XrTime lastChangeTime=0;bool changed=false;};
 struct ActionSet {Instance* instance;};
-struct Action {std::string name;ActionSet* set;XrActionType type;std::vector<XrPath> subactionPaths,bindingPaths;std::unordered_map<uint32_t,ActionValue> values;};
+struct Action {std::string name;ActionSet* set;XrActionType type;std::vector<XrPath> subactionPaths,bindingPaths,plannedBindingPaths;WVRActionRolePlan rolePlans[2];std::unordered_map<uint32_t,ActionValue> values;};
 struct Instance {std::mutex mutex;std::unordered_map<std::string,XrPath> paths;std::unordered_map<XrPath,std::string> pathStrings;std::vector<std::unique_ptr<Action>> actions;std::unordered_map<XrPath,XrPath> interactionProfiles;std::unordered_map<XrPath,XrAction> bindings;std::unordered_map<XrPath,std::vector<XrActionSuggestedBinding>> profileBindings;XrPath selectedProfile=XR_NULL_PATH;int selectedProfilePriority=-1;bool bindingsAttached=false;uint64_t nextPath=1;};
 struct WVRDXMTControllerV1 {uint64_t buttons=0,timestampNanoseconds=0;uint32_t flags=7;float trigger=0,grip=0,thumbstickX=0,thumbstickY=0;};
 struct ControllerSample {WVRDXMTControllerV1 left{},right{};};
@@ -48,7 +49,7 @@ uint64_t ButtonForBinding(const std::string&);
 '''
 functions = [function(x) for x in [
     'bool AnalogBinding(', 'uint32_t RoleForPath(', 'XrPath UserPathForRole(', 'bool ActionAllowsRole(',
-    'bool ActionHasBindingForRole(', 'uint64_t ButtonForBinding(const std::string &binding) {',
+    'void CompileActionBindings(', 'bool ActionHasBindingForRole(', 'uint64_t ButtonForBinding(const std::string &binding) {',
     'ActionValue SampleAction(', 'void UpdateActionSnapshot(', 'bool ControllerConnected(', 'bool ActionSetIsActive(', 'XrResult GetActionSnapshot(',
     'XrResult XRAPI_CALL SuggestInteractionProfileBindings(',
     'XrResult XRAPI_CALL ApplyHapticFeedback(', 'XrResult XRAPI_CALL StopHapticFeedback(']]
@@ -141,5 +142,5 @@ with tempfile.TemporaryDirectory(prefix='wvr-input-') as work:
     cpp = Path(work)/'test.cpp'
     cpp.write_text(preamble+'\n'.join(functions)+tests)
     exe = Path(work)/'test'
-    subprocess.run(['clang++','-std=c++20','-I',str(root/'third-party/openxr/include'),str(cpp),'-o',str(exe)],check=True)
+    subprocess.run(['clang++','-std=c++20','-O2','-fsanitize=undefined,bounds','-I',str(root/'windows-vr-openxr/include'),'-I',str(root/'third-party/openxr/include'),str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)

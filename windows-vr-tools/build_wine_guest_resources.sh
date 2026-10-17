@@ -124,6 +124,7 @@ cp "$wine_aarch64_build/$aarch64_winedevice_target" \
     "$runtime_root/app/Madeira/aarch64-windows/winedevice.exe"
 # Madeira's documented ARM64EC FEX PE translator is part of the guest DLL farm.
 bash "$runtime_root/build/fex-arm64ec/build.sh"
+cmake --build "$runtime_root/FEX/build-arm64ec-avp" --target FEXOfflineCompiler -j"${AVPPLAY_BUILD_JOBS:-4}"
 # FEX is linked against the pinned ARM64EC libc++ and libunwind DLLs. Ship
 # those exact target runtimes beside the translator, never host or x64 variants.
 for runtime_dll in libc++.dll libunwind.dll; do

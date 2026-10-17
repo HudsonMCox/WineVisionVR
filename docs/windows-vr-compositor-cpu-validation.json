@@ -1,0 +1,54 @@
+{
+  "signedVisionOSDeviceBuildSucceeded": true,
+  "signatureVerified": true,
+  "productionBundleVerified": true,
+  "gameLaunched": false,
+  "installedOnHeadset": false,
+  "headsetCPUUtilizationMeasured": false,
+  "headsetFPSMeasured": false,
+  "resolutionChanged": false,
+  "preservedJITExecutableTextSha256": "3df46aed87b830943c883ed7d68818a272ceb245304d1d4e2ead2609c417f77a",
+  "sourceSha256": {
+    "windows-vr-native/include/WindowsVRTextureSliceCache.h": "f4684ff1228e4cca4e34fc4091c35aaaa3be1eb4b088d388ba9176eaf2bef3f7",
+    "windows-vr-native/Sources/WindowsVRGuestFoveation.mm": "8bb7bd23f9496ceac171e08a56855bccd20b576f31a084a93e845ad925399ad7",
+    "windows-vr-native/Tests/TextureSliceCacheProbe.mm": "12fc1fb21192f64af72c6bea1a9f96576cbfd0adeb61ed8d98a9c4644b48e69a",
+    "visionos-windows-vr/Sources/Rendering/WindowsVRCompositorScene.swift": "5bf2311d02399db3db6e8e8bba605bcc7982ec7557012552b5d131c2d3b613eb",
+    "visionos-windows-vr/Sources/Rendering/WindowsVRPresentationMath.swift": "29b4ca8896112cb29d77427bb5766ea72b7a2256a461ffb0798594e0d07b54ac",
+    "visionos-windows-vr/Tests/PresentationGroupingTests.swift": "1a09dc6be5d4b96ff012d893c9482462b5da4dac3a3389765ee3117234c4652b"
+  },
+  "artifactSha256": {
+    "WineVision VR": "ddc78465ab93acff87d43b28e5cffae13e3cce33b7d601e5bed5c0a3dddc5d80",
+    "Frameworks/WindowsVRNativeBridge.framework/WindowsVRNativeBridge": "32797fc09ecae9bad0d1c277a0f96567c2f4c060132b2097d759cbee218f97bc"
+  },
+  "isolatedHostNanosecondsPerSliceView": {
+    "create": 851.79,
+    "liveCacheHit": 39.97,
+    "gameFPSSpeedupEstablished": false
+  },
+  "localEvidence": {
+    "app-build.log": {
+      "localPath": ".build-compositor-cpu-pass/app-build.log",
+      "sha256": "057f721f14c04ec984f80ff333d38d55b674b960a9907000db6864796deeec4a"
+    },
+    "final-bundle-check.log": {
+      "localPath": ".build-compositor-cpu-pass/final-bundle-check.log",
+      "sha256": "52cfa68f122003a49ec4589d90ccb8b2a9b145c0dcfa9870e1d7280c25001042"
+    },
+    "foveation-gpu-test.log": {
+      "localPath": ".build-compositor-cpu-pass/foveation-gpu-test.log",
+      "sha256": "cf91001e63c6a106f8c16dcd4a1d6d4b5c35326ea637568cc20cabb1b81c1faf"
+    },
+    "grouping-test.log": {
+      "localPath": ".build-compositor-cpu-pass/grouping-test.log",
+      "sha256": "6300686a20dcb3f13a7eca1efc5d6f355c846083a1e0a3eb93d3f5603ff402ea"
+    },
+    "regression.log": {
+      "localPath": ".build-compositor-cpu-pass/regression.log",
+      "sha256": "086430d575c93dd231e79239c0567329b8b24f05ff5700e8ccd4415ed813dff4"
+    },
+    "texture-cache-test.log": {
+      "localPath": ".build-compositor-cpu-pass/texture-cache-test.log",
+      "sha256": "672ef708d77c190da6bf04d28eee04e6073f8c9489c25d73041285f5826e7779"
+    }
+  }
+}

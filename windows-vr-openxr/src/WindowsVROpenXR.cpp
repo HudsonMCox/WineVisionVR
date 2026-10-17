@@ -13,6 +13,8 @@
 #include <openxr/openxr_loader_negotiation.h>
 #include <WindowsVRD3D11ContextExt.h>
 #include <WindowsVRD3D12CommandQueueExt.h>
+#include <WindowsVRFrameState.h>
+#include <WindowsVRActionPlan.h>
 
 #include <algorithm>
 #include <atomic>
@@ -98,6 +100,7 @@ struct Instance {
   XrInstanceProperties properties{XR_TYPE_INSTANCE_PROPERTIES};
   XrSystemId system = 1;
   bool graphicsRequirementsQueried = false;
+  bool depthEnabled = false;
   bool d3d11Enabled = false;
   bool d3d12Enabled = false;
   bool d3d12BackendAvailable = false;
@@ -129,10 +132,16 @@ struct Session {
   ID3D11DeviceContext *context = nullptr;
   IMTLD3D11ContextExt2 *dxmt = nullptr;
   IMTLD3D11ContextExt3 *dxmtExt3 = nullptr;
+  IMTLD3D11ContextExt4 *dxmtExt4 = nullptr;
   ID3D12Device *device12 = nullptr;
   ID3D12CommandQueue *queue12 = nullptr;
   IMTLD3D12CommandQueueExt *dxmtQueue12 = nullptr;
   bool d3d12 = false;
+  std::once_flag frameBridgeOnce;
+  using FrameBridgeFunction = int32_t (*)(void *);
+  FrameBridgeFunction frameBridge = nullptr;
+  std::atomic<bool> frameBridgeUnsupported{false};
+  std::atomic<bool> frameBridgeAnnounced{false};
   std::atomic<bool> begun{false};
   std::mutex frameMutex;
   std::condition_variable frameCondition;
@@ -162,6 +171,49 @@ struct Session {
   bool interactionProfileChanged = false;
   std::vector<Swapchain *> swapchains;
 };
+
+void TraceLine(const char *line);
+
+bool GetSessionFrameState(Session *session, WVRFrameStateRequestV1 &request, uint64_t after = 0, uint64_t timeout = 0) {
+  if (session->frameBridgeUnsupported.load(std::memory_order_relaxed)) return false;
+  std::call_once(session->frameBridgeOnce, [&] {
+    auto module = GetModuleHandleW(L"winemetal.dll");
+    if (module) session->frameBridge = reinterpret_cast<Session::FrameBridgeFunction>(GetProcAddress(module, "WMTWindowsVRBridgeCallV1"));
+  });
+  if (!session->frameBridge) return false;
+  request = {};
+  request.abiVersion = WVR_FRAME_STATE_ABI; request.structSize = sizeof(request);
+  request.status = WVRCompositorStatusUnsupportedABI;
+  request.operation = timeout ? 2 : 1;
+  request.afterTimestampNanoseconds = after; request.timeoutNanoseconds = timeout;
+  request.expectedTargetGeneration = session->instance ? session->instance->targets.generation : 0;
+  // The carrier's return value belongs to the legacy record; this extension
+  // uses its own versioned status field.
+  session->frameBridge(&request);
+  if (request.status == WVRCompositorStatusUnsupportedABI) session->frameBridgeUnsupported.store(true, std::memory_order_relaxed);
+  if (request.status == WVRCompositorStatusOK && !session->frameBridgeAnnounced.exchange(true, std::memory_order_relaxed))
+    TraceLine("[WVR OpenXR] native-frame-state enabled: notification wait and batched tracking/targets/controllers\n");
+  return request.status == WVRCompositorStatusOK;
+}
+
+void CopyFrameTracking(const WVRFrameTrackingV1 &source, WVRDXMTTrackingV1 &target) {
+  target.flags = source.flags; target.timestampNanoseconds = source.timestampNanoseconds;
+  std::memcpy(target.originFromDevice, source.originFromDevice, sizeof(target.originFromDevice));
+  std::memcpy(target.deviceFromEye, source.deviceFromEye, sizeof(target.deviceFromEye));
+  std::memcpy(target.frustumTangents, source.frustumTangents, sizeof(target.frustumTangents));
+}
+void CopyFrameTargets(const WVRRenderTargetInfoV1 &source, WVRDXMTTargetInfoV1 &target) {
+  target.generation = source.generation;
+  for (unsigned eye = 0; eye < kViewCount; ++eye) {
+    target.width[eye] = source.width[eye]; target.height[eye] = source.height[eye]; target.pixelFormat[eye] = source.pixelFormat[eye];
+  }
+}
+void CopyFrameController(const WVRControllerStateV1 &source, WVRDXMTControllerV1 &target) {
+  target.role = source.role; target.flags = source.flags; target.timestampNanoseconds = source.timestampNanoseconds;
+  std::memcpy(target.originFromController, source.originFromController, sizeof(target.originFromController));
+  target.buttons = source.buttons; target.trigger = source.trigger; target.grip = source.grip;
+  target.thumbstickX = source.thumbstickX; target.thumbstickY = source.thumbstickY;
+}
 
 HRESULT GetSessionTargets(Session *session, WVRDXMTTargetInfoV1 *targets) {
   return session->d3d12 ? session->dxmtQueue12->GetWindowsVRTargets(targets)
@@ -227,6 +279,8 @@ struct Action {
   XrActionType type = XR_ACTION_TYPE_BOOLEAN_INPUT;
   std::vector<XrPath> subactionPaths;
   std::vector<XrPath> bindingPaths;
+  std::vector<XrPath> plannedBindingPaths;
+  WVRActionRolePlan rolePlans[2];
   std::unordered_map<uint32_t, ActionValue> values;
 };
 std::mutex g_mutex;
@@ -358,21 +412,46 @@ bool ActionAllowsRole(Action *action, uint32_t role) {
           [&](XrPath path) { return RoleForPath(action->set->instance, path) == role; });
 }
 
-bool ActionHasBindingForRole(Action *action, uint32_t role) {
-  if (!action || !action->set || !action->set->instance) return false;
-  Instance *instance=action->set->instance;
-  for(XrPath path:action->bindingPaths){
-    if(RoleForPath(instance,path)!=role)continue;
-    auto found=instance->pathStrings.find(path);if(found==instance->pathStrings.end())continue;
-    const std::string&name=found->second;
-    if(action->type==XR_ACTION_TYPE_BOOLEAN_INPUT&&(ButtonForBinding(name)!=0||AnalogBinding(name,"trigger")||AnalogBinding(name,"squeeze")||AnalogBinding(name,"grip")))return true;
-    if(action->type==XR_ACTION_TYPE_FLOAT_INPUT&&
-        (AnalogBinding(name,"trigger")||AnalogBinding(name,"squeeze")||AnalogBinding(name,"grip")||name.find("/input/thumbstick/x")!=std::string::npos||name.find("/input/thumbstick/y")!=std::string::npos||ButtonForBinding(name)!=0))return true;
-    if(action->type==XR_ACTION_TYPE_VECTOR2F_INPUT&&name.find("/input/thumbstick")!=std::string::npos)return true;
-    if(action->type==XR_ACTION_TYPE_POSE_INPUT&&name.find("/pose")!=std::string::npos)return true;
-    if(action->type==XR_ACTION_TYPE_VIBRATION_OUTPUT&&name.find("/output/haptic")!=std::string::npos)return true;
+void CompileActionBindings(Action *action) {
+  // Also handles a replacement with the same number of bindings. These numeric
+  // comparisons are allocation-free; path strings are decoded only on change.
+  if (action->plannedBindingPaths == action->bindingPaths) return;
+  WVRActionRolePlan plans[2];
+  Instance *instance = action->set->instance;
+  for (XrPath path : action->bindingPaths) {
+    const uint32_t role = RoleForPath(instance, path);
+    auto found = instance->pathStrings.find(path);
+    if (role >= 2 || found == instance->pathStrings.end()) continue;
+    auto &plan = plans[role]; const auto &name = found->second;
+    const uint64_t button = ButtonForBinding(name);
+    const bool trigger = AnalogBinding(name,"trigger");
+    const bool grip = AnalogBinding(name,"squeeze") || AnalogBinding(name,"grip");
+    if (action->type == XR_ACTION_TYPE_BOOLEAN_INPUT) {
+      if (button) plan.buttons |= button;
+      else { plan.trigger |= trigger; plan.grip |= grip; }
+      plan.supported |= button || trigger || grip;
+    } else if (action->type == XR_ACTION_TYPE_FLOAT_INPUT) {
+      using P = WVRActionRolePlan;
+      if (trigger) plan.scalars.push_back({P::Trigger,0});
+      else if (grip) plan.scalars.push_back({P::Grip,0});
+      else if (name.find("/input/thumbstick/x") != std::string::npos) plan.scalars.push_back({P::StickX,0});
+      else if (name.find("/input/thumbstick/y") != std::string::npos) plan.scalars.push_back({P::StickY,0});
+      else if (button) plan.scalars.push_back({P::Button,button});
+      plan.supported = !plan.scalars.empty();
+    } else if (action->type == XR_ACTION_TYPE_VECTOR2F_INPUT) {
+      plan.vector |= name.find("/input/thumbstick") != std::string::npos;
+      plan.supported = plan.vector;
+    } else if (action->type == XR_ACTION_TYPE_POSE_INPUT) plan.supported |= name.find("/pose") != std::string::npos;
+    else if (action->type == XR_ACTION_TYPE_VIBRATION_OUTPUT) plan.supported |= name.find("/output/haptic") != std::string::npos;
   }
-  return false;
+  action->rolePlans[0] = std::move(plans[0]); action->rolePlans[1] = std::move(plans[1]);
+  action->plannedBindingPaths = action->bindingPaths;
+}
+
+bool ActionHasBindingForRole(Action *action, uint32_t role) {
+  if (!action || !action->set || !action->set->instance || role >= 2) return false;
+  CompileActionBindings(action);
+  return action->rolePlans[role].supported;
 }
 
 uint32_t ActionRole(Action *action) {
@@ -414,33 +493,28 @@ ActionValue SampleAction(Action *action,uint32_t role,const WVRDXMTControllerV1 
   ActionValue value{};
   value.lastChangeTime=static_cast<XrTime>(controller.timestampNanoseconds);
   if(action->type==XR_ACTION_TYPE_POSE_INPUT){value.boolean=(controller.flags&5u)==5u;return value;}
-  Instance*instance=action->set->instance;
-  bool hasFloatValue=false,hasVectorValue=false;
-  for(XrPath bindingPath:action->bindingPaths){
-    if(RoleForPath(instance,bindingPath)!=role)continue;
-    auto path=instance->pathStrings.find(bindingPath);if(path==instance->pathStrings.end())continue;
-    const std::string&name=path->second;
-    if(action->type==XR_ACTION_TYPE_BOOLEAN_INPUT){
-      const uint64_t bit=ButtonForBinding(name);
-      if(bit)value.boolean=value.boolean||((controller.buttons&bit)!=0);
-      else if(AnalogBinding(name,"trigger"))value.boolean=value.boolean||controller.trigger>=0.5f;
-      else if(AnalogBinding(name,"squeeze")||AnalogBinding(name,"grip"))value.boolean=value.boolean||controller.grip>=0.5f;
-    } else if(action->type==XR_ACTION_TYPE_FLOAT_INPUT){
-      float candidate=0.0f;
-      if(AnalogBinding(name,"trigger"))candidate=controller.trigger;
-      else if(AnalogBinding(name,"squeeze")||AnalogBinding(name,"grip"))candidate=controller.grip;
-      else if(name.find("/input/thumbstick/x")!=std::string::npos)candidate=controller.thumbstickX;
-      else if(name.find("/input/thumbstick/y")!=std::string::npos)candidate=controller.thumbstickY;
-      else {const uint64_t bit=ButtonForBinding(name);if(bit)candidate=(controller.buttons&bit)?1.0f:0.0f;else continue;}
-      if(!hasFloatValue||std::fabs(candidate)>std::fabs(value.scalar))value.scalar=candidate;
-      hasFloatValue=true;
-    } else if(action->type==XR_ACTION_TYPE_VECTOR2F_INPUT&&name.find("/input/thumbstick")!=std::string::npos){
-      const float magnitude=controller.thumbstickX*controller.thumbstickX+controller.thumbstickY*controller.thumbstickY;
-      const float current=value.vector.x*value.vector.x+value.vector.y*value.vector.y;
-      if(!hasVectorValue||magnitude>current)value.vector={controller.thumbstickX,controller.thumbstickY};
-      hasVectorValue=true;
+  if (role >= 2) return value;
+  CompileActionBindings(action);
+  const auto &plan = action->rolePlans[role];
+  if (action->type == XR_ACTION_TYPE_BOOLEAN_INPUT) {
+    value.boolean = (controller.buttons & plan.buttons) != 0 ||
+        (plan.trigger && controller.trigger >= .5f) || (plan.grip && controller.grip >= .5f);
+  } else if (action->type == XR_ACTION_TYPE_FLOAT_INPUT) {
+    bool haveValue = false;
+    for (const auto &source : plan.scalars) {
+      float candidate = 0;
+      switch (source.source) {
+        case WVRActionRolePlan::Trigger: candidate=controller.trigger; break;
+        case WVRActionRolePlan::Grip: candidate=controller.grip; break;
+        case WVRActionRolePlan::StickX: candidate=controller.thumbstickX; break;
+        case WVRActionRolePlan::StickY: candidate=controller.thumbstickY; break;
+        case WVRActionRolePlan::Button: candidate=(controller.buttons & source.button) ? 1.f : 0.f; break;
+      }
+      if (!haveValue || std::fabs(candidate) > std::fabs(value.scalar)) value.scalar=candidate;
+      haveValue=true;
     }
-  }
+  } else if (action->type == XR_ACTION_TYPE_VECTOR2F_INPUT && plan.vector)
+    value.vector={controller.thumbstickX,controller.thumbstickY};
   return value;
 }
 
@@ -475,10 +549,16 @@ void QueueSessionState(Session *session, XrSessionState state, XrTime time = 0) 
   session->events.push_back({state, time ? time : MonotonicTimeNanoseconds()});
 }
 
-bool ObserveSessionExitRequest(Session *session) {
+bool ObserveSessionExitRequest(Session *session, WVRDXMTTrackingV1 *outTracking = nullptr, WVRDXMTTargetInfoV1 *outTargets = nullptr, bool *outTargetsValid = nullptr, const WVRFrameStateRequestV1 *providedState = nullptr) {
+  if (outTargetsValid) *outTargetsValid = false;
   if (!session || (!session->dxmt && !session->dxmtQueue12)) return false;
+  WVRFrameStateRequestV1 snapshot{};
+  const bool haveSnapshot = providedState || GetSessionFrameState(session, snapshot);
+  const auto &frameState = providedState ? *providedState : snapshot;
   WVRDXMTTrackingV1 tracking{};
-  if (FAILED(GetSessionTracking(session, &tracking))) return false;
+  if (haveSnapshot) CopyFrameTracking(frameState.tracking, tracking);
+  else if (FAILED(GetSessionTracking(session, &tracking))) return false;
+  if (outTracking) *outTracking = tracking;
   if ((tracking.flags & WVRDXMTDevicePoseSessionExitRequested) != 0) {
     if (!session->exitRequested) {
       session->exitRequested = true;
@@ -490,7 +570,11 @@ bool ObserveSessionExitRequest(Session *session) {
   }
   if (!session->begun || session->exitRequested || session->state == XR_SESSION_STATE_LOSS_PENDING) return session->exitRequested;
   WVRDXMTTargetInfoV1 targets{};
-  const bool visible = SUCCEEDED(GetSessionTargets(session, &targets)) &&
+  if (haveSnapshot) CopyFrameTargets(frameState.targets, targets);
+  const bool targetsOk = haveSnapshot || SUCCEEDED(GetSessionTargets(session, &targets));
+  if (targetsOk && outTargets) *outTargets = targets;
+  if (outTargetsValid) *outTargetsValid = targetsOk;
+  const bool visible = targetsOk &&
       targets.width[0] != 0 && targets.width[1] != 0 && targets.height[0] != 0 && targets.height[1] != 0;
   const bool focused = visible && (tracking.flags & 1u) != 0;
   if (!focused && session->state == XR_SESSION_STATE_FOCUSED) QueueSessionState(session, XR_SESSION_STATE_VISIBLE);
@@ -648,11 +732,46 @@ void InvertRigid(const float *m,float *out) {
   for(int r=0;r<3;r++)out[12+r]=-(out[r]*m[12]+out[4+r]*m[13]+out[8+r]*m[14]);
 }
 
+// OpenXR poses use unit quaternions. Keep the matrix path for malformed/non-unit
+// inputs so this optimization does not change their existing behavior.
+bool IsUnitRotation(const XrQuaternionf &q) {
+  const float norm=q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w;
+  return std::fabs(norm-1.f)<.00001f;
+}
+XrQuaternionf MultiplyRotation(const XrQuaternionf &a,const XrQuaternionf &b) {
+  XrQuaternionf result{a.w*b.x+a.x*b.w+a.y*b.z-a.z*b.y,
+          a.w*b.y-a.x*b.z+a.y*b.w+a.z*b.x,
+          a.w*b.z+a.x*b.y-a.y*b.x+a.z*b.w,
+          a.w*b.w-a.x*b.x-a.y*b.y-a.z*b.z};
+  // Composition is repeated along controller/reference-space chains. Prevent
+  // rounding error from accumulating into a non-unit OpenXR orientation.
+  const float inverseNorm=1.f/std::sqrt(result.x*result.x+result.y*result.y+result.z*result.z+result.w*result.w);
+  result.x*=inverseNorm;result.y*=inverseNorm;result.z*=inverseNorm;result.w*=inverseNorm;
+  return result;
+}
+XrVector3f RotatePosition(const XrQuaternionf &q,const XrVector3f &v) {
+  const XrVector3f t{2*(q.y*v.z-q.z*v.y),2*(q.z*v.x-q.x*v.z),2*(q.x*v.y-q.y*v.x)};
+  return {v.x+q.w*t.x+q.y*t.z-q.z*t.y,
+          v.y+q.w*t.y+q.z*t.x-q.x*t.z,
+          v.z+q.w*t.z+q.x*t.y-q.y*t.x};
+}
 XrPosef ComposePose(const XrPosef &a,const XrPosef &b) {
+  if (IsUnitRotation(a.orientation) && IsUnitRotation(b.orientation)) {
+    auto position=RotatePosition(a.orientation,b.position);
+    position.x+=a.position.x; position.y+=a.position.y; position.z+=a.position.z;
+    return {MultiplyRotation(a.orientation,b.orientation),position};
+  }
   float am[16],bm[16],result[16];MatrixFromPose(a,am);MatrixFromPose(b,bm);MultiplyColumnMajor(am,bm,result);return PoseFromMatrix(result);
 }
 
 XrPosef RelativePose(const XrPosef &originFromSpace,const XrPosef &originFromBase) {
+  if (IsUnitRotation(originFromSpace.orientation) && IsUnitRotation(originFromBase.orientation)) {
+    const auto &q=originFromBase.orientation;
+    const XrQuaternionf inverse{-q.x,-q.y,-q.z,q.w};
+    const XrVector3f delta{originFromSpace.position.x-originFromBase.position.x,
+        originFromSpace.position.y-originFromBase.position.y,originFromSpace.position.z-originFromBase.position.z};
+    return {MultiplyRotation(inverse,originFromSpace.orientation),RotatePosition(inverse,delta)};
+  }
   float base[16],space[16],inverse[16],relative[16];MatrixFromPose(originFromBase,base);MatrixFromPose(originFromSpace,space);InvertRigid(base,inverse);MultiplyColumnMajor(inverse,space,relative);return PoseFromMatrix(relative);
 }
 
@@ -680,8 +799,13 @@ bool OriginFromSpace(Session *session,Space *space,const WVRDXMTTrackingV1 &trac
     if(role==UINT32_MAX||!ActionAllowsRole(action,role)||!ActionHasBindingForRole(action,role)||!ActionSetIsActive(session,action->set))return false;
     auto activePath=session->activeSetSubactions.find(reinterpret_cast<XrActionSet>(action->set));
     if(activePath!=session->activeSetSubactions.end()&&activePath->second!=XR_NULL_PATH&&RoleForPath(session->instance,activePath->second)!=role)return false;
+    const WVRDXMTControllerV1 &cached = role == kControllerLeft ? session->controllers.left : session->controllers.right;
     WVRDXMTControllerV1 controller{};
-    if(FAILED(GetSessionController(session, role, &controller))||(controller.flags&5u)!=5u)return false;
+    if (session->activeFrame && cached.timestampNanoseconds != 0 && (cached.flags & 5u) == 5u) {
+      controller = cached;
+    } else if (FAILED(GetSessionController(session, role, &controller)) || (controller.flags & 5u) != 5u) {
+      return false;
+    }
     pose=ComposePose(PoseFromMatrix(controller.originFromController),space->poseInActionSpace);
   } else {
     if((tracking.flags&1u)==0)return false;
@@ -707,12 +831,12 @@ XrResult XRAPI_CALL EnumerateInstanceExtensionProperties(const char *layerName, 
   WVRDXMTTargetInfoV1 targets{};
   bool d3d12Available=false;
   (void)QueryTargets(targets,d3d12Available);
-  const uint32_t extensionCount=d3d12Available?2u:1u;
+  const uint32_t extensionCount=d3d12Available?3u:2u;
   *count=extensionCount;
   if (cap==0) { TraceResult(TraceExtensions, XR_SUCCESS, extensionCount); return XR_SUCCESS; }
   if (!out) return XR_ERROR_VALIDATION_FAILURE;
-  const char *names[2]={XR_KHR_D3D11_ENABLE_EXTENSION_NAME,XR_KHR_D3D12_ENABLE_EXTENSION_NAME};
-  const uint32_t versions[2]={XR_KHR_D3D11_enable_SPEC_VERSION,XR_KHR_D3D12_enable_SPEC_VERSION};
+  const char *names[3]={XR_KHR_D3D11_ENABLE_EXTENSION_NAME,XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,XR_KHR_D3D12_ENABLE_EXTENSION_NAME};
+  const uint32_t versions[3]={XR_KHR_D3D11_enable_SPEC_VERSION,XR_KHR_composition_layer_depth_SPEC_VERSION,XR_KHR_D3D12_enable_SPEC_VERSION};
   const uint32_t written=std::min(cap,extensionCount);
   for(uint32_t n=0;n<written;n++) {
     if(out[n].type!=XR_TYPE_EXTENSION_PROPERTIES) return XR_ERROR_VALIDATION_FAILURE;
@@ -731,13 +855,16 @@ XrResult XRAPI_CALL CreateInstance(const XrInstanceCreateInfo *info, XrInstance 
     {TraceResult(TraceInstance,XR_ERROR_API_VERSION_UNSUPPORTED);return XR_ERROR_API_VERSION_UNSUPPORTED;}
   bool d3d11Enabled = false;
   bool d3d12Enabled = false;
+  bool depthEnabled = false;
   for (uint32_t i=0;i<info->enabledExtensionCount;i++) {
     if (!info->enabledExtensionNames || !info->enabledExtensionNames[i]) {TraceResult(TraceInstance,XR_ERROR_VALIDATION_FAILURE);return XR_ERROR_VALIDATION_FAILURE;}
     if (std::strcmp(info->enabledExtensionNames[i], XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0) d3d11Enabled = true;
     else if (std::strcmp(info->enabledExtensionNames[i], XR_KHR_D3D12_ENABLE_EXTENSION_NAME) == 0) d3d12Enabled = true;
+    else if (std::strcmp(info->enabledExtensionNames[i],XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME)==0)depthEnabled=true;
     else {TraceResult(TraceInstance,XR_ERROR_EXTENSION_NOT_PRESENT);return XR_ERROR_EXTENSION_NOT_PRESENT;}
   }
   auto p=std::make_unique<Instance>();
+  p->depthEnabled = depthEnabled;
   p->d3d11Enabled = d3d11Enabled;
   p->d3d12Enabled = d3d12Enabled;
   std::strncpy(p->properties.runtimeName,"WineVision VR",XR_MAX_RUNTIME_NAME_SIZE-1);
@@ -795,15 +922,18 @@ XrResult XRAPI_CALL CreateSession(XrInstance ih,const XrSessionCreateInfo *info,
     if(FAILED(context->QueryInterface(kIIDMTLD3D11ContextExt2,reinterpret_cast<void**>(&ext)))){
       context->Release();return XR_ERROR_GRAPHICS_DEVICE_INVALID;
     }
+    IMTLD3D11ContextExt4*ext4=nullptr;
+    (void)context->QueryInterface(kWVRD3D11ContextExt4IID,reinterpret_cast<void**>(&ext4));
+    if(i->depthEnabled && !ext4){ext->Release();context->Release();return XR_ERROR_FEATURE_UNSUPPORTED;}
     IMTLD3D11ContextExt3*ext3=nullptr;
     (void)context->QueryInterface(kIIDMTLD3D11ContextExt3,reinterpret_cast<void**>(&ext3));
     WVRDXMTTargetInfoV1 currentTargets{};
     if(FAILED(ext->GetWindowsVRTargets(&currentTargets))||
        currentTargets.generation!=i->targets.generation){
-      if(ext3)ext3->Release();ext->Release();context->Release();return XR_ERROR_RUNTIME_FAILURE;
+      if(ext4)ext4->Release();if(ext3)ext3->Release();ext->Release();context->Release();return XR_ERROR_RUNTIME_FAILURE;
     }
     auto s=std::make_unique<Session>();
-    s->instance=i;s->device=binding->device;s->device->AddRef();s->context=context;s->dxmt=ext;s->dxmtExt3=ext3;
+    s->instance=i;s->device=binding->device;s->device->AddRef();s->context=context;s->dxmt=ext;s->dxmtExt3=ext3;s->dxmtExt4=ext4;
     Session*raw=s.get();QueueSessionState(raw,XR_SESSION_STATE_READY);
     {std::lock_guard<std::mutex>l(g_mutex);g_sessions.push_back(std::move(s));}
     RegisterHandle(raw);*out=reinterpret_cast<XrSession>(raw);TraceResult(TraceSession,XR_SUCCESS,11);return XR_SUCCESS;
@@ -860,6 +990,7 @@ XrResult XRAPI_CALL DestroySession(XrSession h){
     if((*it)->session==s){UnregisterHandle(it->get());(*it)->magic=0;it=g_spaces.erase(it);}else ++it;
   }
   UnregisterHandle(s);s->magic=0;
+  if(s->dxmtExt4)s->dxmtExt4->Release();
   if(s->dxmtExt3)s->dxmtExt3->Release();
   if(s->dxmtQueue12)s->dxmtQueue12->Release();
   if(s->dxmt)s->dxmt->Release();
@@ -877,7 +1008,9 @@ XrResult XRAPI_CALL EndSession(XrSession h){auto*s=GetSession(h);if(!s)return XR
 XrResult XRAPI_CALL RequestExitSession(XrSession h){auto*s=GetSession(h);if(!s)return XR_ERROR_HANDLE_INVALID;if(!s->begun)return XR_ERROR_SESSION_NOT_RUNNING;if(s->exitRequested)return XR_ERROR_CALL_ORDER_INVALID;s->exitRequested=true;s->frameCondition.notify_all();QueueSessionState(s,XR_SESSION_STATE_STOPPING);return XR_SUCCESS;}
 XrResult XRAPI_CALL CreateReferenceSpace(XrSession h,const XrReferenceSpaceCreateInfo*info,XrSpace*out){auto*s=GetSession(h);if(!s||!info||!out)return XR_ERROR_HANDLE_INVALID;if(info->type!=XR_TYPE_REFERENCE_SPACE_CREATE_INFO)return XR_ERROR_VALIDATION_FAILURE;if(info->referenceSpaceType!=XR_REFERENCE_SPACE_TYPE_LOCAL&&info->referenceSpaceType!=XR_REFERENCE_SPACE_TYPE_VIEW&&info->referenceSpaceType!=XR_REFERENCE_SPACE_TYPE_STAGE)return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;auto p=std::make_unique<Space>();p->session=s;p->type=info->referenceSpaceType;p->poseInReferenceSpace=info->poseInReferenceSpace;Space*raw=p.get();{std::lock_guard<std::mutex>l(g_mutex);g_spaces.push_back(std::move(p));}RegisterHandle(raw);*out=reinterpret_cast<XrSpace>(raw);return XR_SUCCESS;}
 XrResult XRAPI_CALL DestroySpace(XrSpace h){auto*p=GetSpace(h);if(!p)return XR_ERROR_HANDLE_INVALID;std::lock_guard<std::mutex>l(g_mutex);UnregisterHandle(p);p->magic=0;g_spaces.erase(std::remove_if(g_spaces.begin(),g_spaces.end(),[p](auto&x){return x.get()==p;}),g_spaces.end());return XR_SUCCESS;}
-XrResult XRAPI_CALL EnumerateSwapchainFormatsImpl(XrSession h,uint32_t cap,uint32_t*count,int64_t*out){auto*s=GetSession(h);if(!s||!count)return XR_ERROR_HANDLE_INVALID;DXGI_FORMAT f=FormatForMetal(s->instance->targets.pixelFormat[0]);if(f==DXGI_FORMAT_UNKNOWN)return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;int64_t fmt=f;return EnumerateOne(&fmt,cap,count,out,sizeof(fmt));}
+XrResult XRAPI_CALL EnumerateSwapchainFormatsImpl(XrSession h,uint32_t cap,uint32_t*count,int64_t*out){auto*s=GetSession(h);if(!s||!count)return XR_ERROR_HANDLE_INVALID;DXGI_FORMAT f=FormatForMetal(s->instance->targets.pixelFormat[0]);if(f==DXGI_FORMAT_UNKNOWN)return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;int64_t formats[2]={f,DXGI_FORMAT_D32_FLOAT};
+  *count=s->instance->depthEnabled?2:1;if(!cap)return XR_SUCCESS;if(!out)return XR_ERROR_VALIDATION_FAILURE;
+  if(cap<*count)return XR_ERROR_SIZE_INSUFFICIENT;std::copy_n(formats,*count,out);return XR_SUCCESS;}
 XrResult XRAPI_CALL EnumerateSwapchainFormats(XrSession h,uint32_t cap,uint32_t*count,int64_t*out){const XrResult result=EnumerateSwapchainFormatsImpl(h, cap, count, out);TraceCall(TraceSwapchainFormats,result,0);return result;}
 
 XrResult XRAPI_CALL CreateSwapchainImpl(XrSession h,const XrSwapchainCreateInfo*info,XrSwapchain*out){
@@ -890,12 +1023,14 @@ XrResult XRAPI_CALL CreateSwapchainImpl(XrSession h,const XrSwapchainCreateInfo*
   // format fails at its own view creation, visibly. Refusing the flag instead left such engines without any
   // swapchain, and so without any picture.
   const XrSwapchainUsageFlags supportedUsage=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_SAMPLED_BIT|
-      XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT|XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
+      XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT|XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT|
+      (s->instance->depthEnabled?XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:0);
+  const bool depthImage=s->instance->depthEnabled && info->format==DXGI_FORMAT_D32_FLOAT;
   if(info->next||(info->usageFlags&~supportedUsage)!=0||
      (info->createFlags&~supportedFlags)!=0||info->arraySize==0||info->arraySize>16||
      info->faceCount!=1||info->mipCount!=1||info->sampleCount!=1||
-     !(info->usageFlags&XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT))return XR_ERROR_FEATURE_UNSUPPORTED;
-  DXGI_FORMAT format=FormatForMetal(s->instance->targets.pixelFormat[0]);
+     !(info->usageFlags&(depthImage?XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT)))return XR_ERROR_FEATURE_UNSUPPORTED;
+  DXGI_FORMAT format=depthImage?DXGI_FORMAT_D32_FLOAT:FormatForMetal(s->instance->targets.pixelFormat[0]);
   if(format==DXGI_FORMAT_UNKNOWN||info->format!=format)return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
   WVRDXMTTargetInfoV1 targets{};
   if(FAILED(GetSessionTargets(s, &targets))||targets.generation!=s->instance->targets.generation)return XR_ERROR_RUNTIME_FAILURE;
@@ -921,7 +1056,7 @@ XrResult XRAPI_CALL CreateSwapchainImpl(XrSession h,const XrSwapchainCreateInfo*
     desc.Format=format;
     desc.SampleDesc.Count=1;
     desc.Layout=D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    desc.Flags=depthImage?D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL:D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     for(auto&image:p->images){
       if(FAILED(s->device12->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
           D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&image.resource12)))||!image.resource12){
@@ -933,7 +1068,7 @@ XrResult XRAPI_CALL CreateSwapchainImpl(XrSession h,const XrSwapchainCreateInfo*
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width=info->width;desc.Height=info->height;desc.MipLevels=1;desc.ArraySize=info->arraySize;
     desc.Format=format;desc.SampleDesc.Count=1;desc.Usage=D3D11_USAGE_DEFAULT;
-    desc.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
+    desc.BindFlags=(depthImage?D3D11_BIND_DEPTH_STENCIL:D3D11_BIND_RENDER_TARGET)|D3D11_BIND_SHADER_RESOURCE;
     for(auto&image:p->images){
       if(FAILED(s->device->CreateTexture2D(&desc,nullptr,&image.texture11))||!image.texture11){
         for(auto&allocated:p->images)if(allocated.texture11)allocated.texture11->Release();
@@ -1009,14 +1144,17 @@ XrResult XRAPI_CALL WaitFrame(XrSession h,const XrFrameWaitInfo*info,XrFrameStat
   TraceEntry(TraceWaitFrame);
   auto*s=GetSession(h);if(!s)return XR_ERROR_HANDLE_INVALID;
   if((info&&info->type!=XR_TYPE_FRAME_WAIT_INFO)||!out||out->type!=XR_TYPE_FRAME_STATE){TraceResult(TraceWaitFrame,XR_ERROR_VALIDATION_FAILURE);return XR_ERROR_VALIDATION_FAILURE;}
-  ObserveSessionExitRequest(s);
+  WVRDXMTTrackingV1 tracking{};
+  WVRDXMTTargetInfoV1 currentTargets{};
+  bool currentTargetsValid = false;
+  ObserveSessionExitRequest(s, &tracking, &currentTargets, &currentTargetsValid);
   if(!s->begun||s->exitRequested||s->state==XR_SESSION_STATE_STOPPING){TraceResult(TraceWaitFrame,XR_ERROR_SESSION_NOT_RUNNING);return XR_ERROR_SESSION_NOT_RUNNING;}
   {
     std::unique_lock<std::mutex> lock(s->frameMutex);
     s->frameCondition.wait(lock,[&]{return !s->waitTokenPending||!s->begun||s->exitRequested;});
     if(!s->begun||s->exitRequested||s->state==XR_SESSION_STATE_STOPPING){TraceResult(TraceWaitFrame,XR_ERROR_SESSION_NOT_RUNNING);return XR_ERROR_SESSION_NOT_RUNNING;}
   }
-  WVRDXMTTrackingV1 tracking{};
+  constexpr XrDuration kDefaultDisplayPeriod = 11'111'111;
   auto publishWait = [&](XrTime displayTime, XrDuration period, XrBool32 shouldRender) {
     {
       std::lock_guard<std::mutex> lock(s->frameMutex);
@@ -1032,49 +1170,69 @@ XrResult XRAPI_CALL WaitFrame(XrSession h,const XrFrameWaitInfo*info,XrFrameStat
     s->frameCondition.notify_all();
     return true;
   };
-  WVRDXMTTargetInfoV1 currentTargets{};
-  if (FAILED(GetSessionTargets(s, &currentTargets))) { TraceResult(TraceWaitFrame,XR_ERROR_RUNTIME_FAILURE);return XR_ERROR_RUNTIME_FAILURE; }
-  if (!currentTargets.width[0] || !currentTargets.width[1] ||
-      !currentTargets.height[0] || !currentTargets.height[1]) {
+  if (!currentTargetsValid && FAILED(GetSessionTargets(s, &currentTargets))) { TraceResult(TraceWaitFrame,XR_ERROR_RUNTIME_FAILURE);return XR_ERROR_RUNTIME_FAILURE; }
+  auto publishHiddenFrame = [&]() -> XrResult {
     XrTime nextTime;
-    {std::lock_guard<std::mutex> lock(s->frameMutex);nextTime=s->predictedTime>0?s->predictedTime+11'111'111:MonotonicTimeNanoseconds();s->predictedTime=nextTime;}
-    if(!publishWait(nextTime,11'111'111,XR_FALSE))return XR_ERROR_SESSION_NOT_RUNNING;
+    {std::lock_guard<std::mutex> lock(s->frameMutex);nextTime=s->predictedTime>0?s->predictedTime+kDefaultDisplayPeriod:MonotonicTimeNanoseconds();s->predictedTime=nextTime;}
+    if(!publishWait(nextTime,kDefaultDisplayPeriod,XR_FALSE))return XR_ERROR_SESSION_NOT_RUNNING;
     TraceResult(TraceWaitFrame,XR_SUCCESS,0);
     std::this_thread::sleep_for(std::chrono::milliseconds(11));
     return XR_SUCCESS;
-  }
-  if (currentTargets.generation != s->instance->targets.generation) {
-    const auto &previous = s->instance->targets;
-    bool sameGeometry = true;
-    for (uint32_t eye = 0; eye < kViewCount; ++eye) {
-      sameGeometry = sameGeometry && currentTargets.width[eye] == previous.width[eye] &&
-          currentTargets.height[eye] == previous.height[eye] && currentTargets.pixelFormat[eye] == previous.pixelFormat[eye];
+  };
+  auto haveVisibleTargets = [&] {
+    return currentTargets.width[0] && currentTargets.width[1] && currentTargets.height[0] && currentTargets.height[1];
+  };
+  if (!haveVisibleTargets()) return publishHiddenFrame();
+  auto reconcileTargets = [&]() -> XrResult {
+    if (currentTargets.generation != s->instance->targets.generation) {
+      const auto &previous = s->instance->targets;
+      bool sameGeometry = true;
+      for (uint32_t eye = 0; eye < kViewCount; ++eye) {
+        sameGeometry = sameGeometry && currentTargets.width[eye] == previous.width[eye] &&
+            currentTargets.height[eye] == previous.height[eye] && currentTargets.pixelFormat[eye] == previous.pixelFormat[eye];
+      }
+      if (!sameGeometry) {
+        s->exitRequested = true;
+        s->frameCondition.notify_all();
+        QueueSessionState(s, XR_SESSION_STATE_LOSS_PENDING);
+        TraceResult(TraceWaitFrame,XR_ERROR_SESSION_LOST);
+        return XR_ERROR_SESSION_LOST;
+      }
+      s->instance->targets = currentTargets;
+      for (auto *swapchain : s->swapchains) swapchain->targetGeneration = currentTargets.generation;
+      s->lastWaitTrackingTime = 0;
+      {std::lock_guard<std::mutex> lock(s->frameMutex);s->predictedTime=0;}
     }
-    if (!sameGeometry) {
-      s->exitRequested = true;
-      s->frameCondition.notify_all();
-      QueueSessionState(s, XR_SESSION_STATE_LOSS_PENDING);
-      TraceResult(TraceWaitFrame,XR_ERROR_SESSION_LOST);
-      return XR_ERROR_SESSION_LOST;
-    }
-    s->instance->targets = currentTargets;
-    for (auto *swapchain : s->swapchains) swapchain->targetGeneration = currentTargets.generation;
-    s->lastWaitTrackingTime = 0;
-    {std::lock_guard<std::mutex> lock(s->frameMutex);s->predictedTime=0;}
+    return XR_SUCCESS;
+  };
+  if (const auto result = reconcileTargets(); XR_FAILED(result)) return result;
+  WVRFrameStateRequestV1 nextState{};
+  const bool nativeWait = GetSessionFrameState(s, nextState, static_cast<uint64_t>(s->lastWaitTrackingTime), kMaximumWait);
+  if (nativeWait) {
+    ObserveSessionExitRequest(s, &tracking, &currentTargets, &currentTargetsValid, &nextState);
+    if (s->exitRequested || !s->begun) return XR_ERROR_SESSION_NOT_RUNNING;
+    // A paused compositor publishes zero targets. Match the pre-wait path:
+    // skip rendering instead of mistaking pause for a resolution change.
+    if (!haveVisibleTargets()) return publishHiddenFrame();
+    if (const auto result = reconcileTargets(); XR_FAILED(result)) return result;
   }
   const auto deadline=std::chrono::steady_clock::now()+std::chrono::nanoseconds(kMaximumWait);
-  do {
+  bool haveInitialTracking = tracking.timestampNanoseconds != 0 || tracking.flags != 0;
+  if (!nativeWait) do {
     if(s->exitRequested||!s->begun)return XR_ERROR_SESSION_NOT_RUNNING;
-    if(FAILED(GetSessionTracking(s, &tracking))){TraceResult(TraceWaitFrame,XR_ERROR_RUNTIME_FAILURE);return XR_ERROR_RUNTIME_FAILURE;}
-    if((tracking.flags&1u)!=0 && tracking.timestampNanoseconds>s->lastWaitTrackingTime)break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    if (!haveInitialTracking) {
+      if(FAILED(GetSessionTracking(s, &tracking))){TraceResult(TraceWaitFrame,XR_ERROR_RUNTIME_FAILURE);return XR_ERROR_RUNTIME_FAILURE;}
+    }
+    haveInitialTracking = false;
+    if((tracking.flags&1u)!=0 && static_cast<XrTime>(tracking.timestampNanoseconds)>s->lastWaitTrackingTime)break;
+    std::this_thread::sleep_for(std::chrono::microseconds(250));
   } while(std::chrono::steady_clock::now()<deadline);
-  if((tracking.flags&1u)==0||tracking.timestampNanoseconds<=s->lastWaitTrackingTime){
+  if((tracking.flags&1u)==0||static_cast<XrTime>(tracking.timestampNanoseconds)<=s->lastWaitTrackingTime){
     ObserveSessionExitRequest(s);
     if(s->exitRequested)return XR_ERROR_SESSION_NOT_RUNNING;
     XrTime predicted;
-    {std::lock_guard<std::mutex> lock(s->frameMutex);const XrTime nextTime=s->predictedTime>0?s->predictedTime+11'111'111:MonotonicTimeNanoseconds();predicted=std::max(nextTime,static_cast<XrTime>(tracking.timestampNanoseconds));s->predictedTime=predicted;}
-    if(!publishWait(predicted,11'111'111,XR_FALSE))return XR_ERROR_SESSION_NOT_RUNNING;
+    {std::lock_guard<std::mutex> lock(s->frameMutex);const XrTime nextTime=s->predictedTime>0?s->predictedTime+kDefaultDisplayPeriod:MonotonicTimeNanoseconds();predicted=std::max(nextTime,static_cast<XrTime>(tracking.timestampNanoseconds));s->predictedTime=predicted;}
+    if(!publishWait(predicted,kDefaultDisplayPeriod,XR_FALSE))return XR_ERROR_SESSION_NOT_RUNNING;
     TraceResult(TraceWaitFrame,XR_SUCCESS,0);return XR_SUCCESS;
   }
   // Do not compare host compositor timestamps to guest steady_clock: Wine's
@@ -1083,16 +1241,27 @@ XrResult XRAPI_CALL WaitFrame(XrSession h,const XrFrameWaitInfo*info,XrFrameStat
   s->lastWaitTrackingTime=static_cast<XrTime>(tracking.timestampNanoseconds);
   XrTime previousTime,predictedTime;
   {std::lock_guard<std::mutex> lock(s->frameMutex);previousTime=s->predictedTime;predictedTime=std::max(s->lastWaitTrackingTime,previousTime>0?previousTime+1:s->lastWaitTrackingTime);s->predictedTime=predictedTime;}
-  XrDuration period=11'111'111;
-  if(previousTime>0&&predictedTime>previousTime){
-    const XrTime observed=s->lastWaitTrackingTime-previousTime;
-    if(observed>=4'000'000&&observed<=50'000'000)period=observed;
-  }
+  XrDuration period=kDefaultDisplayPeriod;
+  if(nativeWait && nextState.displayPeriodNanoseconds >= 7'000'000 && nextState.displayPeriodNanoseconds <= 14'000'000)
+    period=static_cast<XrDuration>(nextState.displayPeriodNanoseconds);
+  // Elapsed time between guest frames includes slow rendering and missed ticks;
+  // it must not be reported as the headset's display period.
   if(!publishWait(predictedTime,period,XR_TRUE))return XR_ERROR_SESSION_NOT_RUNNING;
   TraceResult(TraceWaitFrame,XR_SUCCESS,1);
   return XR_SUCCESS;
 }
 XrResult XRAPI_CALL BeginFrame(XrSession h,const XrFrameBeginInfo*info){TraceEntry(TraceBeginFrame);auto*s=GetSession(h);if(!s)return XR_ERROR_HANDLE_INVALID;if(info&&info->type!=XR_TYPE_FRAME_BEGIN_INFO){TraceResult(TraceBeginFrame,XR_ERROR_VALIDATION_FAILURE);return XR_ERROR_VALIDATION_FAILURE;}if(!s->begun||s->exitRequested||s->state==XR_SESSION_STATE_STOPPING){TraceResult(TraceBeginFrame,XR_ERROR_SESSION_NOT_RUNNING);return XR_ERROR_SESSION_NOT_RUNNING;}XrResult result=XR_SUCCESS;uint64_t frameIndex=0;{std::lock_guard<std::mutex> lock(s->frameMutex);if(!s->waitTokenPending){TraceResult(TraceBeginFrame,XR_ERROR_CALL_ORDER_INVALID);return XR_ERROR_CALL_ORDER_INVALID;}if(s->activeFrame)result=XR_FRAME_DISCARDED;s->activeFrame=true;s->activeFrameIndex=s->pendingFrameIndex;s->activeTracking=s->pendingTracking;s->activeDisplayTime=s->pendingDisplayTime;frameIndex=s->activeFrameIndex;s->waitTokenPending=false;}s->frameCondition.notify_all();TraceResult(TraceBeginFrame,result,frameIndex);return result;}
+bool ReconstructionProjection(const XrFovf &fov,float nearZ,float farZ,float *out) {
+  if(std::isnan(nearZ)||std::isnan(farZ)||nearZ<=0||farZ<=0||nearZ==farZ)return false;
+  const float l=std::tan(fov.angleLeft),r=std::tan(fov.angleRight),d=std::tan(fov.angleDown),u=std::tan(fov.angleUp);
+  if(!std::isfinite(l)||!std::isfinite(r)||!std::isfinite(d)||!std::isfinite(u)||r<=l||u<=d)return false;
+  std::fill_n(out,16,0.f);out[0]=2/(r-l);out[5]=2/(u-d);out[8]=(r+l)/(r-l);out[9]=(u+d)/(u-d);out[11]=-1;
+  if(std::isinf(farZ)){out[10]=-1;out[14]=-nearZ;}
+  else if(std::isinf(nearZ)){out[10]=0;out[14]=farZ;}
+  else {out[10]=farZ/(nearZ-farZ);out[14]=farZ*nearZ/(nearZ-farZ);}
+  return std::all_of(out,out+16,[](float v){return std::isfinite(v);});
+}
+
 XrResult XRAPI_CALL EndFrame(XrSession h,const XrFrameEndInfo*info){
   TraceEntry(TraceEndFrame);
   auto*s=GetSession(h);if(!s)return XR_ERROR_HANDLE_INVALID;
@@ -1118,18 +1287,21 @@ XrResult XRAPI_CALL EndFrame(XrSession h,const XrFrameEndInfo*info){
   auto*layer=reinterpret_cast<const XrCompositionLayerProjection*>(info->layers[0]);
   if(!layer||layer->type!=XR_TYPE_COMPOSITION_LAYER_PROJECTION||layer->next||layer->viewCount!=2||!layer->views){TraceResult(TraceEndFrame,XR_ERROR_LAYER_INVALID,activeFrameIndex);return XR_ERROR_LAYER_INVALID;}
   auto*compositionSpace=GetSpace(layer->space);if(!compositionSpace||compositionSpace->session!=s){TraceResult(TraceEndFrame,XR_ERROR_HANDLE_INVALID,activeFrameIndex);return XR_ERROR_HANDLE_INVALID;}
-  WVRDXMTTargetInfoV1 targets{};
-  if(FAILED(GetSessionTargets(s, &targets))){TraceResult(TraceEndFrame,XR_ERROR_RUNTIME_FAILURE,activeFrameIndex);return XR_ERROR_RUNTIME_FAILURE;}
+  WVRDXMTTargetInfoV1 targets = s->instance->targets;
+  if(!targets.generation && FAILED(GetSessionTargets(s, &targets))){TraceResult(TraceEndFrame,XR_ERROR_RUNTIME_FAILURE,activeFrameIndex);return XR_ERROR_RUNTIME_FAILURE;}
   
   WVRDXMTSubmitFrameV2 extended{};extended.targetGeneration=targets.generation;extended.frameID=activeFrameIndex;extended.timestampNanoseconds=static_cast<uint64_t>(info->displayTime);
   WVRDXMTD3D12SubmitFrameV1 d3d12Frame{};
   d3d12Frame.targetGeneration=extended.targetGeneration;
   d3d12Frame.frameID=extended.frameID;
   d3d12Frame.timestampNanoseconds=extended.timestampNanoseconds;
+  WVRDXMTDepthFrameV1 depthFrame{};
+  bool haveDepth[2]={false,false};
+  bool canCaptureDepth=true;
   bool needsExt3=false;
   for(uint32_t eye=0;eye<2;eye++){
     const auto&v=layer->views[eye];
-    if(v.type!=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW||v.next){TraceResult(TraceEndFrame,XR_ERROR_FEATURE_UNSUPPORTED,activeFrameIndex);return XR_ERROR_FEATURE_UNSUPPORTED;}
+    if(v.type!=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW){TraceResult(TraceEndFrame,XR_ERROR_FEATURE_UNSUPPORTED,activeFrameIndex);return XR_ERROR_FEATURE_UNSUPPORTED;}
     auto*sw=GetSwapchain(v.subImage.swapchain);
     if(!sw||sw->session!=s||v.subImage.imageArrayIndex>=sw->info.arraySize||sw->targetGeneration!=targets.generation){TraceResult(TraceEndFrame,XR_ERROR_SWAPCHAIN_RECT_INVALID,activeFrameIndex);return XR_ERROR_SWAPCHAIN_RECT_INVALID;}
     const auto&rect=v.subImage.imageRect;
@@ -1149,6 +1321,27 @@ XrResult XRAPI_CALL EndFrame(XrSession h,const XrFrameEndInfo*info){
       if(image==sw->images.end()||candidate->releaseOrder>image->releaseOrder)image=candidate;
     }
     if(image==sw->images.end()||image->acquired){TraceResult(TraceEndFrame,XR_ERROR_CALL_ORDER_INVALID,activeFrameIndex);return XR_ERROR_CALL_ORDER_INVALID;}
+    if(v.next) {
+      const auto*depth=static_cast<const XrCompositionLayerDepthInfoKHR*>(v.next);
+      if(!s->instance->depthEnabled || depth->type!=XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR || depth->next)return XR_ERROR_FEATURE_UNSUPPORTED;
+      if(!std::isfinite(depth->minDepth)||!std::isfinite(depth->maxDepth)||depth->minDepth<0||depth->maxDepth>1||depth->minDepth>=depth->maxDepth)return XR_ERROR_VALIDATION_FAILURE;
+      auto*ds=GetSwapchain(depth->subImage.swapchain);
+      if(!ds||ds->session!=s||ds->info.format!=DXGI_FORMAT_D32_FLOAT||ds->targetGeneration!=targets.generation)return XR_ERROR_HANDLE_INVALID;
+      const auto &dr=depth->subImage.imageRect;
+      if(depth->subImage.imageArrayIndex>=ds->info.arraySize||dr.offset.x<0||dr.offset.y<0||dr.extent.width<=0||dr.extent.height<=0||
+          int64_t(dr.offset.x)+dr.extent.width>ds->info.width||int64_t(dr.offset.y)+dr.extent.height>ds->info.height)return XR_ERROR_SWAPCHAIN_RECT_INVALID;
+      Image*depthImage=nullptr;for(auto &candidate:ds->images)if(candidate.releaseOrder && (!depthImage||candidate.releaseOrder>depthImage->releaseOrder))depthImage=&candidate;
+      if(!depthImage||depthImage->acquired)return XR_ERROR_CALL_ORDER_INVALID;
+      auto &g=depthFrame.geometry[eye];
+      if(!ReconstructionProjection(v.fov,depth->nearZ,depth->farZ,g.projection))return XR_ERROR_VALIDATION_FAILURE;
+      WVRDXMTTrackingV1 tracking{};XrPosef origin{};uint32_t flags=0;
+      if(FAILED(GetSessionTrackingAtTime(s,info->displayTime,&tracking)) || !OriginFromSpace(s,compositionSpace,tracking,origin,flags))
+        canCaptureDepth=false; // Optional reconstruction must not discard a valid color frame during tracking loss.
+      else MatrixFromPose(ComposePose(origin,v.pose),g.originFromEye);
+      g.colorSlice=v.subImage.imageArrayIndex;g.colorX=rect.offset.x;g.colorY=rect.offset.y;g.width=rect.extent.width;g.height=rect.extent.height;
+      g.depthSlice=depth->subImage.imageArrayIndex;g.depthX=dr.offset.x;g.depthY=dr.offset.y;g.depthWidth=dr.extent.width;g.depthHeight=dr.extent.height;
+      g.minDepth=depth->minDepth;g.maxDepth=depth->maxDepth;depthFrame.depth[eye]=depthImage->texture11;haveDepth[eye]=true;
+    }
     if(s->d3d12){
       if(!image->resource12||image->texture11){TraceResult(TraceEndFrame,XR_ERROR_LAYER_INVALID,activeFrameIndex);return XR_ERROR_LAYER_INVALID;}
       if(eye==0){d3d12Frame.left=image->resource12;d3d12Frame.leftArraySlice=v.subImage.imageArrayIndex;d3d12Frame.leftX=static_cast<uint32_t>(rect.offset.x);d3d12Frame.leftY=static_cast<uint32_t>(rect.offset.y);d3d12Frame.leftWidth=static_cast<uint32_t>(rect.extent.width);d3d12Frame.leftHeight=static_cast<uint32_t>(rect.extent.height);}
@@ -1158,6 +1351,15 @@ XrResult XRAPI_CALL EndFrame(XrSession h,const XrFrameEndInfo*info){
       if(eye==0){extended.left=image->texture11;extended.leftArraySlice=v.subImage.imageArrayIndex;extended.leftX=static_cast<uint32_t>(rect.offset.x);extended.leftY=static_cast<uint32_t>(rect.offset.y);extended.leftWidth=static_cast<uint32_t>(rect.extent.width);extended.leftHeight=static_cast<uint32_t>(rect.extent.height);}
       else{extended.right=image->texture11;extended.rightArraySlice=v.subImage.imageArrayIndex;extended.rightX=static_cast<uint32_t>(rect.offset.x);extended.rightY=static_cast<uint32_t>(rect.offset.y);extended.rightWidth=static_cast<uint32_t>(rect.extent.width);extended.rightHeight=static_cast<uint32_t>(rect.extent.height);}
     }
+  }
+  if(haveDepth[0]!=haveDepth[1])return XR_ERROR_LAYER_INVALID;
+  if(haveDepth[0]&&canCaptureDepth&&!s->d3d12) {
+    if(!s->dxmtExt4)return XR_ERROR_FEATURE_UNSUPPORTED;
+    depthFrame.color=extended;
+    const HRESULT hr=s->dxmtExt4->SubmitWindowsVRDepthFrame(&depthFrame);
+    if(hr==S_FALSE)TraceCompositorDrop(activeFrameIndex);
+    const XrResult result=FAILED(hr)?XR_ERROR_RUNTIME_FAILURE:XR_SUCCESS;
+    TraceResult(TraceEndFrame,result,static_cast<uint32_t>(hr));return result;
   }
   if(s->d3d12){
     if(!d3d12Frame.left||!d3d12Frame.right)return XR_ERROR_LAYER_INVALID;
@@ -1416,6 +1618,7 @@ XrResult XRAPI_CALL SuggestInteractionProfileBindings(XrInstance h,const XrInter
       i->bindings[binding.binding]=binding.action;
       if(std::find(action->bindingPaths.begin(),action->bindingPaths.end(),binding.binding)==action->bindingPaths.end())action->bindingPaths.push_back(binding.binding);
     }
+    for(auto &action:i->actions) CompileActionBindings(action.get());
     const XrPath left=UserPathForRole(i,kControllerLeft),right=UserPathForRole(i,kControllerRight);
     i->interactionProfiles[left]=info->interactionProfile;i->interactionProfiles[right]=info->interactionProfile;
   }
@@ -1436,39 +1639,62 @@ XrResult XRAPI_CALL SyncActions(XrSession h,const XrActionsSyncInfo*info){
   auto*s=GetSession(h);if(!s)return XR_ERROR_HANDLE_INVALID;
   if(!info||info->type!=XR_TYPE_ACTIONS_SYNC_INFO||(info->countActiveActionSets&&!info->activeActionSets))return XR_ERROR_VALIDATION_FAILURE;
   if(!s->actionSetsAttached)return XR_ERROR_ACTIONSET_NOT_ATTACHED;
-  std::vector<XrActionSet> activeSets;std::unordered_map<XrActionSet,XrPath> activeSubactions;
+  // Validate before changing the published snapshot. Identical active sets reuse
+  // their containers instead of allocating vector/map nodes on every frame.
+  std::lock_guard<std::recursive_mutex> actionLock(s->actionMutex);
+  bool setsChanged = s->activeActionSets.size() != info->countActiveActionSets;
   for(uint32_t n=0;n<info->countActiveActionSets;n++){
     const auto&active=info->activeActionSets[n];auto*set=GetActionSet(active.actionSet);
     if(!set||set->instance!=s->instance)return XR_ERROR_HANDLE_INVALID;
     if(std::find(s->attachedActionSets.begin(),s->attachedActionSets.end(),active.actionSet)==s->attachedActionSets.end())return XR_ERROR_ACTIONSET_NOT_ATTACHED;
-    if(std::find(activeSets.begin(),activeSets.end(),active.actionSet)!=activeSets.end())return XR_ERROR_VALIDATION_FAILURE;
+    for(uint32_t previous=0;previous<n;++previous)
+      if(info->activeActionSets[previous].actionSet==active.actionSet)return XR_ERROR_VALIDATION_FAILURE;
     if(active.subactionPath!=XR_NULL_PATH){
       auto path=s->instance->pathStrings.find(active.subactionPath);
       if(path==s->instance->pathStrings.end()||(path->second!="/user/hand/left"&&path->second!="/user/hand/right"))return XR_ERROR_PATH_UNSUPPORTED;
     }
-    activeSets.push_back(active.actionSet);activeSubactions.emplace(active.actionSet,active.subactionPath);
+    auto previous=s->activeSetSubactions.find(active.actionSet);
+    setsChanged |= n>=s->activeActionSets.size() || s->activeActionSets[n]!=active.actionSet ||
+        previous==s->activeSetSubactions.end() || previous->second!=active.subactionPath;
   }
-  ObserveSessionExitRequest(s);
-  std::lock_guard<std::recursive_mutex> actionLock(s->actionMutex);
+  WVRFrameStateRequestV1 actionState{};
+  const bool haveActionState = GetSessionFrameState(s, actionState);
+  ObserveSessionExitRequest(s, nullptr, nullptr, nullptr, haveActionState ? &actionState : nullptr);
   if(!s->begun||s->state!=XR_SESSION_STATE_FOCUSED){
     s->activeActionSets.clear();s->activeSetSubactions.clear();s->controllers=ControllerSample{};
     return XR_SESSION_NOT_FOCUSED;
   }
   ControllerSample controllers{};
-  if(FAILED(GetSessionController(s,kControllerLeft,&controllers.left))||FAILED(GetSessionController(s,kControllerRight,&controllers.right)))return XR_ERROR_RUNTIME_FAILURE;
-  s->activeActionSets.swap(activeSets);s->activeSetSubactions.swap(activeSubactions);s->controllers=controllers;
+  if (haveActionState) {
+    CopyFrameController(actionState.controllers[kControllerLeft], controllers.left);
+    CopyFrameController(actionState.controllers[kControllerRight], controllers.right);
+  } else if(FAILED(GetSessionController(s,kControllerLeft,&controllers.left))||FAILED(GetSessionController(s,kControllerRight,&controllers.right)))return XR_ERROR_RUNTIME_FAILURE;
+  if (setsChanged) {
+    std::vector<XrActionSet> activeSets; activeSets.reserve(info->countActiveActionSets);
+    std::unordered_map<XrActionSet,XrPath> activeSubactions; activeSubactions.reserve(info->countActiveActionSets);
+    for(uint32_t n=0;n<info->countActiveActionSets;++n) {
+      const auto &active=info->activeActionSets[n];
+      activeSets.push_back(active.actionSet); activeSubactions.emplace(active.actionSet,active.subactionPath);
+    }
+    s->activeActionSets.swap(activeSets); s->activeSetSubactions.swap(activeSubactions);
+  }
+  s->controllers=controllers;
   static std::atomic<uint32_t> syncCount{0};const uint32_t count=++syncCount;
   if(count<=3||(count&255u)==0){char line[320];std::snprintf(line,sizeof(line),"[WVR OpenXR] sync-actions count=%u sets=%zu state=%d left=%llu/%.2f/%.2f/%.2f,%.2f right=%llu/%.2f/%.2f/%.2f,%.2f\n",count,s->activeActionSets.size(),static_cast<int>(s->state.load()),static_cast<unsigned long long>(controllers.left.buttons),controllers.left.trigger,controllers.left.grip,controllers.left.thumbstickX,controllers.left.thumbstickY,static_cast<unsigned long long>(controllers.right.buttons),controllers.right.trigger,controllers.right.grip,controllers.right.thumbstickX,controllers.right.thumbstickY);TraceLine(line);}
 
-  for(auto&setPtr:s->instance->actionSets){
-    auto*set=setPtr.get();if(!ActionSetIsActive(s,set))continue;
+  // Only visit validated active sets. Resolve each set's hand filter once,
+  // rather than scanning every instance set and looking it up for every action.
+  for(XrActionSet activeSet:s->activeActionSets){
+    auto*set=GetActionSet(activeSet);if(!set)continue;
+    const auto activePath=s->activeSetSubactions.find(activeSet);
+    const uint32_t activeRole=activePath==s->activeSetSubactions.end()||activePath->second==XR_NULL_PATH
+        ? UINT32_MAX : RoleForPath(s->instance,activePath->second);
     for(XrAction handle:set->actions){
       auto*action=GetAction(handle);if(!action||action->type==XR_ACTION_TYPE_VIBRATION_OUTPUT)continue;
       for(uint32_t role:{kControllerLeft,kControllerRight}){
-        bool applicable=ActionAllowsRole(action,role)&&ActionHasBindingForRole(action,role);
-        auto activePath=s->activeSetSubactions.find(reinterpret_cast<XrActionSet>(set));
-        if(activePath!=s->activeSetSubactions.end()&&activePath->second!=XR_NULL_PATH&&RoleForPath(s->instance,activePath->second)!=role)applicable=false;
-        if(applicable)UpdateActionSnapshot(action,role,role==kControllerLeft?s->controllers.left:s->controllers.right);
+        if(activeRole!=UINT32_MAX&&activeRole!=role)continue;
+        if(ActionAllowsRole(action,role)&&ActionHasBindingForRole(action,role))
+          UpdateActionSnapshot(action,role,role==kControllerLeft?s->controllers.left:s->controllers.right);
       }
     }
   }

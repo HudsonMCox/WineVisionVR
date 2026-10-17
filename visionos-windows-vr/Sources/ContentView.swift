@@ -6,6 +6,8 @@ struct ContentView: View {
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
     @Bindable var model: LauncherModel
+    @AppStorage("WVRFrameSynthesisMode") private var frameSynthesisMode = 0
+    @AppStorage("WVRReconstructionValidation") private var reconstructionValidation = false
     @State private var importingManifest = false
     @State private var importingGameFolder = false
     @State private var exportingReport = false
@@ -185,6 +187,24 @@ struct ContentView: View {
 
     private var advancedOptions: some View {
         Form {
+                Section(L("Rendering experiments", "Rendering-Experimente")) {
+                    Picker(L("Image reconstruction", "Bildrekonstruktion"), selection: $frameSynthesisMode) {
+                        Text(L("Standard", "Standard")).tag(0)
+                        Text(L("Metal spatial reconstruction", "Räumliche Metal-Rekonstruktion")).tag(1)
+                        Text(L("Metal reconstruction + frame extrapolation", "Metal-Rekonstruktion + Frame-Extrapolation")).tag(2)
+                    }
+                    .disabled(!model.canChangeSelection)
+                    Text(L("Experimental. Uses submitted scene depth when available, otherwise estimates depth from the stereo images. Frame extrapolation estimates object motion; it does not increase simulation FPS. Applies on the next launch. Render scale is unchanged.", "Experimentell. Nutzt übermittelte Szenentiefe oder schätzt Tiefe aus Stereobildern. Frame-Extrapolation schätzt Objektbewegung; die Simulationsrate steigt nicht. Gilt beim nächsten Start. Die Render-Skalierung bleibt unverändert."))
+                        .font(.footnote).foregroundStyle(.secondary)
+
+                    Toggle(L("Validate depth reconstruction", "Tiefenrekonstruktion prüfen"), isOn: $reconstructionValidation)
+                        .disabled(!model.canChangeSelection || frameSynthesisMode != 0)
+                    if frameSynthesisMode != 0 {
+                        Text(L("Shadow validation is paused while image reconstruction is active.", "Die Schattenvalidierung pausiert während der Bildrekonstruktion.")).font(.footnote).foregroundStyle(.secondary)
+                    }
+                    Text(L("Compares reconstructed views with the original game images when scene depth is available. Adds GPU work; keeps normal stereo output. Applies on the next launch.", "Vergleicht rekonstruierte Ansichten mit den Originalbildern, wenn Szenentiefe verfügbar ist. Zusätzliche GPU-Arbeit; normale Stereoausgabe bleibt erhalten. Gilt beim nächsten Start."))
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 Section {
                     Picker(L("Saved game", "Gespeichertes Spiel"), selection: Binding(
                         get: { model.selectedLibraryEntryID ?? "" },

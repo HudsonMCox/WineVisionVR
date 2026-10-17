@@ -13,3 +13,7 @@ void madeira_seed_prefix_if_needed(const char *prefix_path);
 void madeira_display_set_layer(CAMetalLayer *layer);
 #import "Steam/SwiftSteam/lzma_shim.h"
 #import "../../windows-vr-native/include/WindowsVRAudioSession.h"
+
+#import "../../windows-vr-native/include/WindowsVRReconstruction.h"
+
+#import "../../windows-vr-native/include/WindowsVRFrameSynthesis.h"

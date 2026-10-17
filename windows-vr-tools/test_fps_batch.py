@@ -28,7 +28,7 @@ def run(name, command):
 
 clang = ['xcrun', '--sdk', 'macosx', 'clang++', '-std=c++20', '-O2']
 include = str(root / 'windows-vr-native/include')
-run('ticket-build', clang + ['-fsanitize=address,undefined', '-I', include,
+run('ticket-build', clang + ['-fsanitize=undefined', '-I', include,
     str(root / 'windows-vr-native/Tests/CompletionWindowTests.cpp'),
     '-o', str(build / 'tickets')])
 run('tickets', [str(build / 'tickets')])

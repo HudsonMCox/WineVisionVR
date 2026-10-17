@@ -44,3 +44,34 @@ struct WindowsVRRenderPose {
         return (eye == 0 ? projections.0 : projections.1) * rotation * currentProjectionInverse
     }
 }
+
+/// Fixed stereo grouping, with no temporary index/filter arrays. Groups preserve
+/// the first pending eye's order and the renderer's exact attachment identity rule.
+enum WindowsVRPresentationGroups {
+    static func next(remaining: UInt, count: Int, matches: (Int, Int) -> Bool) -> UInt {
+        precondition(count >= 0 && count <= 2)
+        guard remaining != 0 else { return 0 }
+        let first = remaining.trailingZeroBitCount
+        precondition(first < count)
+        var group: UInt = 1 << first
+        for index in (first + 1)..<count where remaining & (1 << index) != 0 {
+            if matches(first, index) { group |= 1 << index }
+        }
+        return group
+    }
+}
+
+/// The ABI always carries exactly two eyes. Keep their temporary metadata and
+/// source references inline instead of allocating short-lived Array buffers.
+struct WindowsVRStereoPair<Element>: RandomAccessCollection {
+    let first: Element
+    let second: Element
+    var startIndex: Int { 0 }
+    var endIndex: Int { 2 }
+    func index(after index: Int) -> Int { index + 1 }
+    func index(before index: Int) -> Int { index - 1 }
+    subscript(index: Int) -> Element {
+        precondition(index == 0 || index == 1)
+        return index == 0 ? first : second
+    }
+}

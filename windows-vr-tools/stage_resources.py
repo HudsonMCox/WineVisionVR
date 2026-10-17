@@ -309,6 +309,11 @@ def validate_guest_tree(guest_root):
         pair = [arm64ec_root / "OpenComposite/bin/vrclient_x64.dll", arm64ec_root / "wvr_openxr.dll"]
         if any(not path.is_file() or path.is_symlink() or not is_arm64ec_pe(path) for path in pair):
             fail("An ARM64EC guest package must contain matching ARM64EC OpenComposite and OpenXR PE DLLs.")
+        from stage_arm64ec_guest import validate
+        try:
+            validate(arm64ec_root)
+        except (ValueError, OSError, TypeError) as error:
+            fail(f"ARM64EC guest package receipt validation failed: {error}")
 
 
 def validate_d3d12_stage(stage_root, native_archive):

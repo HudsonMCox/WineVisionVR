@@ -9,7 +9,7 @@ c=(a.source/'src/dxmt/dxmt_context.cpp').read_text()
 gate=c.split('bool eligible = ',1)[1].split(';',1)[0]
 s=(a.source/'src/d3d11/d3d11_context_impl.cpp').read_text()
 shader=s.split('const bool foveationSafe = ',1)[1].split(';',1)[0]
-loop=c[c.index('      for (unsigned i=1; i<data->render_target_count; ++i) {'):c.index('      static const bool foveationPeer')]
+loop=c[c.index('      for (unsigned i=1; i<data->render_target_count; ++i) {'):c.index('      // A failed early probe')]
 code=r'''
 #include <cassert>
 struct Attachment { unsigned texture=1,store_action=1,resolve_texture=0,level=0,depth_plane=0; };
@@ -41,7 +41,7 @@ cache=(a.source/'src/d3d11/d3d11_pipeline_cache.cpp').read_text()
 assert 'parameters[i].SystemValue != microsoft::D3D10_SB_NAME_UNDEFINED' in cache
 assert 'bool foveation_safe_ = false;' in cache
 assert 'parameters[i].SystemValue != microsoft::D3D10_SB_NAME_POSITION' in cache
-assert c.index('data->fence_wait.forEach(',c.index('WVRGuestFoveationPassV1 foveation')) < c.index('foveation.operation=4;') < c.index('encoder.setVertexBuffer(gpu_buffer_',c.index('WVRGuestFoveationPassV1 foveation'))
+assert c.index('data->fence_wait.forEach(',c.index('WVRGuestFoveationPassV1 foveation')) < c.index('foveation.operation=4;') < c.index('std::array<wmtcmd_render_setbuffer, 7> setup',c.index('WVRGuestFoveationPassV1 foveation'))
 with tempfile.TemporaryDirectory(prefix='winevision-foveation-gates-') as tmp:
  cpp=Path(tmp)/'probe.cpp';exe=Path(tmp)/'probe';cpp.write_text(code)
  subprocess.run(['xcrun','--sdk','macosx','clang++','-std=c++20',str(cpp),'-o',str(exe)],check=True)

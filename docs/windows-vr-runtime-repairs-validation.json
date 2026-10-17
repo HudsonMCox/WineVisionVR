@@ -1,0 +1,8 @@
+{
+  "scope": "Synthetic CPU/Metal checks, compiled runtime ABI inspection; no agent-launched game",
+  "followup": "docs/windows-vr-performance-next-validation.json",
+  "olderLocalEvidenceDirectory": ".build-runtime-repairs",
+  "headsetFPSMeasured": false,
+  "boneworksRepairRequiresRetest": true,
+  "inGameFoveationActivationRequiresRetest": true
+}

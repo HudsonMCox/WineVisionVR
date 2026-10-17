@@ -5,10 +5,10 @@ if(NOT WIN32)
     message(FATAL_ERROR "The guest OpenXR runtime DLL must target Windows.")
 endif()
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "This package stage is x64-only; ARM64EC uses a separate guest root.")
+    message(FATAL_ERROR "The guest runtime requires a 64-bit Windows target.")
 endif()
-if(CMAKE_GENERATOR_PLATFORM AND NOT CMAKE_GENERATOR_PLATFORM STREQUAL "x64")
-    message(FATAL_ERROR "This package stage is x64-only; use the x64 generator platform. ARM64EC gets a separate guest root later.")
+if(CMAKE_GENERATOR_PLATFORM AND NOT CMAKE_GENERATOR_PLATFORM MATCHES "^(x64|ARM64EC)$")
+    message(FATAL_ERROR "Use the x64 or ARM64EC generator platform, with separate guest roots.")
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -17,7 +17,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(OPENXR_SDK_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third-party/openxr" CACHE PATH
     "Pinned Khronos OpenXR-SDK source tree containing include/openxr")
-set(WINDOWS_VR_GUEST_STAGE "${CMAKE_BINARY_DIR}/stage/WindowsVR/Guest/x64" CACHE PATH
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL "ARM64EC")
+    set(_guest_arch arm64ec)
+else()
+    set(_guest_arch x64)
+endif()
+set(WINDOWS_VR_GUEST_STAGE "${CMAKE_BINARY_DIR}/stage/WindowsVR/Guest/${_guest_arch}" CACHE PATH
     "Guest package root shared with OpenComposite and stage_resources.py --guest-stage")
 
 if(NOT EXISTS "${OPENXR_SDK_SOURCE_ROOT}/include/openxr/openxr.h")

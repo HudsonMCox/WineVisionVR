@@ -1,0 +1,145 @@
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -653,6 +653,10 @@
+       *ppvObject = ref(static_cast<IMTLD3D11ContextExt1 *>(&ext_));
+       return S_OK;
+     }
++    if (riid == kWVRD3D11ContextExt4IID) {
++      auto *extension=static_cast<IMTLD3D11ContextExt4 *>(&ext_);
++      extension->AddRef();*ppvObject=extension;return S_OK;
++    }
+     if (riid == kWVRD3D11ContextExt3IID) {
+       auto *extension = static_cast<IMTLD3D11ContextExt3 *>(&ext_);
+       extension->AddRef(); *ppvObject = extension; return S_OK;
+@@ -5214,7 +5218,7 @@
+ };
+ 
+ template <typename ContextInternalState>
+-class MTLD3D11ContextExt : public IMTLD3D11ContextExt1, public IMTLD3D11ContextExt2, public IMTLD3D11ContextExt3 {
++class MTLD3D11ContextExt : public IMTLD3D11ContextExt1, public IMTLD3D11ContextExt2, public IMTLD3D11ContextExt3, public IMTLD3D11ContextExt4 {
+   class CachedTemporalScaler {
+   public:
+     WMTPixelFormat color_pixel_format;
+@@ -5235,6 +5239,10 @@
+   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) final {
+     if (!ppvObject) return E_POINTER;
+     *ppvObject = nullptr;
++    if (riid == kWVRD3D11ContextExt4IID) {
++      auto *extension=static_cast<IMTLD3D11ContextExt4 *>(this);
++      AddRef();*ppvObject=extension;return S_OK;
++    }
+     if (riid == kWVRD3D11ContextExt3IID) {
+       auto *p = static_cast<IMTLD3D11ContextExt3 *>(this); AddRef(); *ppvObject = p; return S_OK;
+     }
+@@ -5527,6 +5535,13 @@
+   }
+ 
+   HRESULT STDMETHODCALLTYPE SubmitWindowsVRFrameV2(const WVRDXMTSubmitFrameV2 *frame) final {
++    return SubmitWindowsVRFrameCommon(frame,nullptr);
++  }
++  HRESULT STDMETHODCALLTYPE SubmitWindowsVRDepthFrame(const WVRDXMTDepthFrameV1 *frame) final {
++    if(!frame || !frame->depth[0] || !frame->depth[1])return E_INVALIDARG;
++    return SubmitWindowsVRFrameCommon(&frame->color,frame);
++  }
++  HRESULT SubmitWindowsVRFrameCommon(const WVRDXMTSubmitFrameV2 *frame,const WVRDXMTDepthFrameV1 *depthFrame) {
+     if (!frame || !frame->left || !frame->right || !frame->targetGeneration) return E_INVALIDARG;
+     WVRDXMTTargetInfoV1 targets = cached_targets_;
+     if (targets.generation != frame->targetGeneration) {
+@@ -5568,16 +5583,44 @@
+     layout.leftWidth = frame->leftWidth; layout.leftHeight = frame->leftHeight;
+     layout.rightSlice = frame->rightArraySlice; layout.rightX = frame->rightX; layout.rightY = frame->rightY;
+     layout.rightWidth = frame->rightWidth; layout.rightHeight = frame->rightHeight;
++    Rc<Texture> depthTextures[2];
++    WVRReconstructionSubmitV1 reconstruction{};
++    if(depthFrame) {
++      reconstruction.abiVersion=WVR_RECONSTRUCTION_ABI;reconstruction.structSize=sizeof(reconstruction);
++      reconstruction.frameID=frame->frameID;reconstruction.timestampNanoseconds=frame->timestampNanoseconds;
++      reconstruction.targetGeneration=frame->targetGeneration;
++      for(unsigned eye=0;eye<2;++eye) {
++        auto resource=depthFrame->depth[eye];D3D11_RESOURCE_DIMENSION dimension{};resource->GetType(&dimension);
++        if(dimension!=D3D11_RESOURCE_DIMENSION_TEXTURE2D)return E_INVALIDARG;
++        D3D11_TEXTURE2D_DESC desc{};static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
++        const auto &g=depthFrame->geometry[eye];
++        if(desc.Format!=DXGI_FORMAT_D32_FLOAT || desc.SampleDesc.Count!=1 || g.depthSlice>=desc.ArraySize ||
++            g.depthX>desc.Width || g.depthY>desc.Height || !g.depthWidth || !g.depthHeight ||
++            g.depthWidth>desc.Width-g.depthX || g.depthHeight>desc.Height-g.depthY)return E_INVALIDARG;
++        depthTextures[eye]=static_cast<D3D11ResourceCommon*>(resource)->texture();
++        if(!depthTextures[eye])return E_INVALIDARG;
++        reconstruction.eyes[eye]=g;
++      }
++    }
+     auto result = std::make_shared<WindowsVRSubmissionResult>();
+     {
+       std::lock_guard<std::mutex> leaseLock(windows_vr_lease_mutex_);
+       windows_vr_leases_[frame->left] = {RetainWindowsVRResource(frame->left), {}, 0, result};
+       windows_vr_leases_[frame->right] = {RetainWindowsVRResource(frame->right), {}, 0, result};
++      if(depthFrame)for(unsigned eye=0;eye<2;++eye)
++        windows_vr_leases_[depthFrame->depth[eye]]={RetainWindowsVRResource(depthFrame->depth[eye]),{},0,result};
+     }
+     ctx_->EmitWindowsVROperation([leftTexture = std::move(leftTexture), rightTexture = std::move(rightTexture),
+-                  frameCopy = layout, result](ArgumentEncodingContext &enc) mutable {
++                  frameCopy = layout, result, reconstruction,
++                  depthLeft=std::move(depthTextures[0]), depthRight=std::move(depthTextures[1])](ArgumentEncodingContext &enc) mutable {
++      WMT::Texture nativeDepthLeft{},nativeDepthRight{};
++      if(depthLeft && depthRight) {
++        nativeDepthLeft=depthLeft->current()->texture();nativeDepthRight=depthRight->current()->texture();
++        reconstruction.eyes[0].depthTexture=nativeDepthLeft.handle;
++        reconstruction.eyes[1].depthTexture=nativeDepthRight.handle;
++      }
+       enc.queueWindowsVRSubmission(leftTexture->current()->texture(), rightTexture->current()->texture(),
+-                                     frameCopy, result);
++                                     frameCopy, result, reconstruction, nativeDepthLeft, nativeDepthRight);
+     }, true);
+     return S_OK;
+   }
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -1378,7 +1378,16 @@
+       f.abiVersion=WVR_COMPOSITOR_ABI_VERSION_V2; f.structSize=sizeof(f); f.status=WVRCompositorStatusInvalidArgument;
+       f.commandBuffer=cmdbuf.handle; f.leftTexture=pending.left.handle; f.rightTexture=pending.right.handle;
+       f.producerEvent=queue_.event.handle; f.producerValue=event_seq_id;
+-      WMTWindowsVRBridgeCallV2(&f);
++      if(pending.geometry.abiVersion==WVR_RECONSTRUCTION_ABI) {
++        auto &g=pending.geometry;g.status=WVRCompositorStatusUnsupportedABI;
++        g.commandBuffer=f.commandBuffer;g.producerEvent=f.producerEvent;g.producerValue=f.producerValue;
++        g.eyes[0].colorTexture=f.leftTexture;g.eyes[1].colorTexture=f.rightTexture;
++        WMTWindowsVRBridgeCallV1(reinterpret_cast<WMTWindowsVRRequestV1*>(&g));
++        f.status=g.status;f.compositorTicket=g.compositorTicket;f.consumerEvent=g.consumerEvent;
++        // Scene depth is an optional composition hint. A rejected capture must
++        // not discard a valid game color frame (including older native peers).
++        if(g.status!=WVRCompositorStatusOK)WMTWindowsVRBridgeCallV2(&f);
++      } else WMTWindowsVRBridgeCallV2(&f);
+       pending.result->status=f.status; pending.result->consumerEvent=f.consumerEvent;
+       pending.result->ticket=f.compositorTicket; pending.result->completed=true;
+     }
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -19,6 +19,7 @@
+ #pragma once
+ 
+ #include "Metal.hpp"
++#include "WindowsVRReconstruction.h"
+ #include <condition_variable>
+ #include <memory>
+ #include <mutex>
+@@ -703,9 +704,9 @@
+   void signalEvent(WMT::Reference<WMT::Event> &&event, uint64_t value);
+   void waitEvent(WMT::Reference<WMT::Event> &&event, uint64_t value);
+   void queueWindowsVRSubmission(WMT::Texture left, WMT::Texture right, const WMTWindowsVRRequestV2 &f,
+-                                std::shared_ptr<WindowsVRSubmissionResult> result) {
++                                std::shared_ptr<WindowsVRSubmissionResult> result, WVRReconstructionSubmitV1 geometry = {}, WMT::Texture depthLeft = {}, WMT::Texture depthRight = {}) {
+     if (windows_vr_submission_) { std::lock_guard<std::mutex> l(result->mutex); result->status=WVRCompositorStatusIncompatibleTexture; result->completed=true; result->changed.notify_all(); return; }
+-    PendingWindowsVRSubmission p{}; p.left=std::move(left); p.right=std::move(right); p.frame=f; p.result=std::move(result); windows_vr_submission_=std::move(p);
++    PendingWindowsVRSubmission p{}; p.left=std::move(left); p.right=std::move(right); if(depthLeft)p.depthLeft=std::move(depthLeft); if(depthRight)p.depthRight=std::move(depthRight); p.frame=f; p.geometry=geometry; p.result=std::move(result); windows_vr_submission_=std::move(p);
+   }
+ 
+ 
+@@ -865,7 +866,7 @@
+   // in their constructors (ClearUAV reaches device_ through getComputePipeline): members start in
+   // declaration order, so declared after them it was still uninitialised memory there, and a game
+   // could die at start in newComputePipelineStateWithDescriptor on a garbage device.
+-  struct PendingWindowsVRSubmission { WMT::Reference<WMT::Texture> left, right; WMTWindowsVRRequestV2 frame{}; std::shared_ptr<WindowsVRSubmissionResult> result; };
++  struct PendingWindowsVRSubmission { WMT::Reference<WMT::Texture> left, right, depthLeft, depthRight; WMTWindowsVRRequestV2 frame{}; WVRReconstructionSubmitV1 geometry{}; std::shared_ptr<WindowsVRSubmissionResult> result; };
+   std::optional<PendingWindowsVRSubmission> windows_vr_submission_;
+   WMT::Device device_;
+ 

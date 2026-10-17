@@ -30,3 +30,11 @@ fi
 if [[ -d "$APP/WindowsVR/Guest/x64" ]]; then
   python3 "$(dirname "$0")/verify_openvr_bundle.py" "$APP/WindowsVR/Guest/x64/wvr_openxr.dll"
 fi
+
+if [[ -d "$APP/WindowsVR/Guest/arm64ec" ]]; then
+  python3 "$(dirname "$0")/stage_arm64ec_guest.py" --output "$APP/WindowsVR/Guest/arm64ec" --verify
+fi
+
+if [[ -d "$APP/WindowsVR/CacheTools" ]]; then
+  python3 "$(dirname "$0")/stage_fex_cache.py" --verify --output "$APP/WindowsVR/CacheTools" --runtime "$APP/Runtime"
+fi
