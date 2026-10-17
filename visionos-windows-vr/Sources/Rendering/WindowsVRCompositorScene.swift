@@ -605,9 +605,10 @@ private final class WindowsVRCompositorRenderer {
         else { return false }
 
         let foveated = layerRenderer.configuration.isFoveationEnabled
-        // Preserve the existing M2 profile's uniform guest eye raster. Never
+        // Uniform guest eye raster for the M2 profile, already a 64-pixel multiple
+        // so producer extent alignment for Unity leaves it unchanged. Never
         // advertise gaze-varying physical allocation dimensions to OpenXR.
-        let width = UInt32(Bundle.main.object(forInfoDictionaryKey: "WVRUniformEyeWidth") as? Int ?? 1888)
+        let width = UInt32(Bundle.main.object(forInfoDictionaryKey: "WVRUniformEyeWidth") as? Int ?? 1920)
         let height = UInt32(Bundle.main.object(forInfoDictionaryKey: "WVRUniformEyeHeight") as? Int ?? 1792)
         // Guest D3D11 swapchains remain RGBA sRGB even when the compositor
         // display target is BGRA. Presentation samples and converts the format.
