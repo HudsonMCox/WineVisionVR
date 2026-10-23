@@ -1,0 +1,155 @@
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 11b8b5a..cda399f 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -25,6 +25,7 @@
+ #include "dxmt_occlusion_query.hpp"
+ #include "dxmt_presenter.hpp"
+ #include "wsi_platform.hpp"
++#include "util_env.hpp"
+ #include <cstdint>
+ #include <cfloat>
+ 
+@@ -950,6 +951,71 @@ isNextPassOverwriting(const RenderEncoderColorAttachmentData &color, EncoderData
+   return false;
+ }
+ 
++// true if `next` overwrites the whole depth attachment before anything can read it
++static bool
++isNextPassOverwritingDepth(const RenderEncoderDepthAttachmentData &depth, EncoderData *next) {
++  if (!next || !depth.attachment.ptr() || depth.depth_plane != 0)
++    return false;
++  if (next->type == EncoderType::Clear) {
++    auto clear = static_cast<ClearEncoderData *>(next);
++    if (clear->clear_dsv == 0 || clear->attachment.ptr() != depth.attachment.ptr())
++      return false;
++    auto texture = depth.attachment->allocation->descriptor;
++    auto planar_flags = DepthStencilPlanarFlags(texture->pixelFormat());
++    unsigned required_flags = 1;
++    if (planar_flags & 2)
++      required_flags |= 2;
++    return (clear->clear_dsv & required_flags) == required_flags;
++  }
++  if (next->type == EncoderType::Render) {
++    auto render = static_cast<RenderEncoderData *>(next);
++    if (render->depth.attachment.ptr() != depth.attachment.ptr())
++      return false;
++    return render->depth.depth_plane == 0 &&
++           (render->depth.load_action == WMTLoadActionClear || render->depth.load_action == WMTLoadActionDontCare);
++  }
++  return false;
++}
++
++// true if `next` overwrites the whole stencil attachment before anything can read it
++static bool
++isNextPassOverwritingStencil(const RenderEncoderStencilAttachmentData &stencil, EncoderData *next) {
++  if (!next || !stencil.attachment.ptr() || stencil.depth_plane != 0)
++    return false;
++  if (next->type == EncoderType::Clear) {
++    auto clear = static_cast<ClearEncoderData *>(next);
++    if (clear->clear_dsv == 0 || clear->attachment.ptr() != stencil.attachment.ptr())
++      return false;
++    auto texture = stencil.attachment->allocation->descriptor;
++    auto planar_flags = DepthStencilPlanarFlags(texture->pixelFormat());
++    unsigned required_flags = 2;
++    if (planar_flags & 1)
++      required_flags |= 1;
++    return (clear->clear_dsv & required_flags) == required_flags;
++  }
++  if (next->type == EncoderType::Render) {
++    auto render = static_cast<RenderEncoderData *>(next);
++    if (render->stencil.attachment.ptr() != stencil.attachment.ptr())
++      return false;
++    return render->stencil.depth_plane == 0 &&
++           (render->stencil.load_action == WMTLoadActionClear || render->stencil.load_action == WMTLoadActionDontCare);
++  }
++  return false;
++}
++
++static bool
++TileStoreElisionExtEnabled() {
++  static const bool enabled = [] {
++    bool val = env::getEnvVar("DXMT_TILE_STORE_ELISION_EXT") == "1";
++    WARN("DXMT_TILE_STORE_ELISION_EXT=", val ? "1" : "0");
++    return val;
++  }();
++  return enabled;
++}
++
++static uint64_t s_elided_stores_count = 0;
++static uint64_t s_last_logged_frame = 0;
++
+ QueryReadbacks
+ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id) {
+   assert(!encoder_current);
+@@ -1018,8 +1084,17 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+           color_info.store_action = color_data.store_action;
+           if (color_data.store_action == WMTStoreActionStore && !color_data.resolve_attachment &&
+               color_data.attachment->allocation->descriptor->transient_attachment &&
+-              isNextPassOverwriting(color_data, next_encoder))
++              isNextPassOverwriting(color_data, next_encoder)) {
+             color_info.store_action = WMTStoreActionDontCare;
++            if (TileStoreElisionExtEnabled())
++              s_elided_stores_count++;
++          } else if (TileStoreElisionExtEnabled() &&
++                     color_data.store_action == WMTStoreActionStoreAndMultisampleResolve &&
++                     color_data.attachment->allocation->descriptor->transient_attachment &&
++                     isNextPassOverwriting(color_data, next_encoder)) {
++            color_info.store_action = WMTStoreActionMultisampleResolve;
++            s_elided_stores_count++;
++          }
+           color_info.level = color_data.level;
+           color_info.slice = color_data.slice;
+           color_info.depth_plane = color_data.depth_plane;
+@@ -1037,6 +1112,17 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+             depth_info.texture = data->eye_parent_depth;
+           depth_info.load_action = depth_data.load_action;
+           depth_info.store_action = depth_data.store_action;
++          if (TileStoreElisionExtEnabled() &&
++              depth_data.attachment->allocation->descriptor->transient_attachment &&
++              isNextPassOverwritingDepth(depth_data, next_encoder)) {
++            if (depth_data.store_action == WMTStoreActionStore) {
++              depth_info.store_action = WMTStoreActionDontCare;
++              s_elided_stores_count++;
++            } else if (depth_data.store_action == WMTStoreActionStoreAndMultisampleResolve) {
++              depth_info.store_action = WMTStoreActionMultisampleResolve;
++              s_elided_stores_count++;
++            }
++          }
+           depth_info.level = depth_data.level;
+           depth_info.slice = depth_data.slice;
+           depth_info.depth_plane = depth_data.depth_plane;
+@@ -1048,6 +1134,17 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+           stencil_info.texture = stencil_data.attachment.texture();
+           stencil_info.load_action = stencil_data.load_action;
+           stencil_info.store_action = stencil_data.store_action;
++          if (TileStoreElisionExtEnabled() &&
++              stencil_data.attachment->allocation->descriptor->transient_attachment &&
++              isNextPassOverwritingStencil(stencil_data, next_encoder)) {
++            if (stencil_data.store_action == WMTStoreActionStore) {
++              stencil_info.store_action = WMTStoreActionDontCare;
++              s_elided_stores_count++;
++            } else if (stencil_data.store_action == WMTStoreActionStoreAndMultisampleResolve) {
++              stencil_info.store_action = WMTStoreActionMultisampleResolve;
++              s_elided_stores_count++;
++            }
++          }
+           stencil_info.level = stencil_data.level;
+           stencil_info.slice = stencil_data.slice;
+           stencil_info.depth_plane = stencil_data.depth_plane;
+@@ -1509,6 +1606,15 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+     }
+   }
+ 
++  if (TileStoreElisionExtEnabled()) {
++    if (frame_id_ >= s_last_logged_frame + 600 || frame_id_ < s_last_logged_frame) {
++      if (frame_id_ >= s_last_logged_frame + 600) {
++        WARN("tile-store-elision elided=", s_elided_stores_count, " frame=", frame_id_);
++      }
++      s_last_logged_frame = frame_id_;
++    }
++  }
++
+   return readbacks;
+ }
+ 

@@ -230,6 +230,8 @@ the Khronos OpenXR SDK, and LLVM with llvm-mingw (Martin Storsjo). JIT comes fro
 [StikDebug](https://github.com/rebelancap/StikDebug-visionos) by rebelancap, StikJIT and idevice (Jackson Coxson).
 [ALVR's visionOS client](https://github.com/alvr-org/alvr-visionos) was the reference for the compositor scene
 policies and rotational reprojection. The Steam client code is adapted from Madeira's, by Jfishin and 125hz.
+Neural foveated reconstruction and stereo frame extrapolation (Mode 4) adapts concepts, 2D Gaussian canvas reconstruction, and temporal extrapolation architecture from [OpenSuperSampling (OSS)](https://github.com/cashcon57/open-supersampling) by cashcon57 and contributors (Apache-2.0), along with stereo temporal frame generation principles (StereoFG) for cross-eye disparity feature gating.
+[VeRantyx](https://github.com/Ag3497120/VeRantyx) by Ag3497120 (MIT): Reference for custom DirectX/Vulkan runtime bridge architectures on Apple Silicon, in-process synchronization models, and zero-copy IOSurface frame transport.
 
 **Inspiration (no AVP Play code is shipped here).** [AVP Play](https://github.com/myMartek/avp-play) by myMartek, where
 this started: it showed that this kind of game can be run on a Vision Pro, and a few conventions carried over (the

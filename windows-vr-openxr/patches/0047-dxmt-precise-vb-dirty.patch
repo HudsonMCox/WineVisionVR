@@ -1,0 +1,52 @@
+From c2356f6128ff14025637df53df42bb32abfb860e Mon Sep 17 00:00:00 2001
+From: HudsonMCox <HCI_cox@icloud.com>
+Date: Sun, 18 Oct 2026 15:01:53 -0400
+Subject: [PATCH] 0047 dxmt precise vb dirty
+
+---
+ src/d3d11/d3d11_context_imm.cpp | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 3e118cb..bc51089 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -85,6 +85,18 @@ PreciseCBufferDirtyEnabled() {
+   return enabled;
+ }
+ 
++// Dirty only the vertex-buffer slots that bind the renamed buffer instead of every slot,
++// so draws whose vertex buffers were not mapped skip re-encoding their vertex buffer table.
++static bool
++PreciseVBDirtyEnabled() {
++  static const bool enabled = [] {
++    bool val = env::getEnvVar("DXMT_PRECISE_VB_DIRTY") == "1";
++    WARN("DXMT_PRECISE_VB_DIRTY=", val ? "1" : "0");
++    return val;
++  }();
++  return enabled;
++}
++
+ class MTLD3D11ImmediateContext : public ImmediateContextBase {
+ public:
+   MTLD3D11ImmediateContext(MTLD3D11Device *pDevice, CommandQueue &cmd_queue) :
+@@ -168,7 +180,15 @@ public:
+         return E_INVALIDARG;
+       case D3D11_MAP_WRITE_DISCARD: {
+         if (bind_flag & D3D11_BIND_VERTEX_BUFFER) {
+-          state_.InputAssembler.VertexBuffers.set_dirty();
++          if (PreciseVBDirtyEnabled()) {
++            IUnknown *raw = pResource;
++            auto &vbs = state_.InputAssembler.VertexBuffers;
++            for (size_t slot = 0; slot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; slot++)
++              if (vbs.test_bound(slot) && vbs[slot].RawPointer == raw)
++                vbs.set_dirty(slot);
++          } else {
++            state_.InputAssembler.VertexBuffers.set_dirty();
++          }
+         }
+         if (bind_flag & D3D11_BIND_CONSTANT_BUFFER) {
+           if (PreciseCBufferDirtyEnabled()) {
+-- 
+2.50.0.windows.2
+

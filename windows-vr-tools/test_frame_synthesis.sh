@@ -9,6 +9,7 @@ xcrun --sdk macosx clang++ -std=c++20 -O2 -fobjc-arc \
  "$ROOT/windows-vr-native/Sources/WindowsVRCompositorBridge.mm" \
  "$ROOT/windows-vr-native/Sources/WindowsVRGuestFoveation.mm" \
  "$ROOT/windows-vr-native/Sources/WindowsVRFrameSynthesis.mm" \
+ "$ROOT/windows-vr-native/Sources/WindowsVRNeuralReconstruction.mm" \
  "$ROOT/windows-vr-native/Tests/FrameSynthesisProbe.mm" \
  -framework Foundation -framework Metal -framework QuartzCore -framework CoreFoundation \
  -o "$BUILD/frame-synthesis-probe"

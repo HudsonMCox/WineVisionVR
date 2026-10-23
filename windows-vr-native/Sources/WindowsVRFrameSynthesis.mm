@@ -1,5 +1,8 @@
 #include "WindowsVRFrameSynthesis.h"
 #include "WindowsVRReconstruction.h"
+#include "WindowsVRNeuralReconstruction.h"
+#include "WindowsVRGuestFoveation.h"
+#include "WindowsVRTextureSliceCache.h"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <algorithm>
@@ -246,6 +249,7 @@ struct Eye {
   __strong id<MTLTexture> color = nil, pyramid[3]{}, rawDepth = nil,
                           depth = nil, flow[2][3]{}, basis[3]{};
   WVRReconstructionEyeV1 geometry{};
+  bool borrowedColor = false;
 };
 struct Frame {
   Eye eyes[2];
@@ -265,6 +269,7 @@ struct Stats {
   std::atomic<uint64_t> frames{0}, gameDepth{0}, estimatedDepth{0},
       generated{0}, spatial{0}, resets{0}, busy{0}, failed{0}, temporal{0};
   std::atomic<double> gpuMs{0};
+  std::atomic<uint64_t> zeroCopyIngests{0};
 };
 // Owned per-eye history at output size, in display pose. Valid only for the
 // generation and sizes it was written with.
@@ -288,7 +293,14 @@ struct Context {
   uint32_t mode;
   std::mutex mutex;
   std::shared_ptr<Stats> stats = std::make_shared<Stats>();
+  WVRNeuralContext *neural = nullptr;
   Context(id<MTLDevice> d, uint32_t m) : device(d), mode(m) {}
+  ~Context() {
+    if (neural) {
+      wvr_neural_destroy_v1(neural);
+      neural = nullptr;
+    }
+  }
 };
 simd_float4x4 matrix(const float *m) {
   simd_float4x4 r;
@@ -319,10 +331,8 @@ id<MTLTexture> view(id<MTLTexture> t, unsigned slice) {
     return slice ? nil : t;
   if (t.textureType != MTLTextureType2DArray || slice >= t.arrayLength)
     return nil;
-  return [t newTextureViewWithPixelFormat:t.pixelFormat
-                              textureType:MTLTextureType2D
-                                   levels:NSMakeRange(0, 1)
-                                   slices:NSMakeRange(slice, 1)];
+  thread_local WVRTextureSliceCache cache;
+  return cache.get(t, slice);
 }
 bool region(id<MTLTexture> t, unsigned slice, unsigned x, unsigned y,
             unsigned w, unsigned h, id<MTLDevice> d) {
@@ -369,14 +379,23 @@ void reset(Context &c) {
   c.frames[0] = Frame{};
   c.frames[1] = Frame{};
   c.outputs[0] = c.outputs[1] = nil;
+  if (c.neural)
+    wvr_neural_reset_v1(c.neural);
   c.stats->resets++;
 }
 } // namespace
 extern "C" void *wvr_synthesis_create_v1(void *device, uint32_t mode) {
   @autoreleasepool {
-    if (!device || mode < 1 || mode > 3)
+    if (!device || mode < 1 || mode > 4)
       return nullptr;
     auto c = std::make_unique<Context>((__bridge id<MTLDevice>)device, mode);
+    if (mode == 4) {
+      c->neural = wvr_neural_create_v1(device);
+      if (!c->neural) {
+        NSLog(@"[synthesis] Failed to initialize neural reconstruction backend");
+        return nullptr;
+      }
+    }
     NSError *error = nil;
     auto lib = [c->device newLibraryWithSource:source options:nil error:&error];
     if (!lib) {
@@ -388,6 +407,8 @@ extern "C" void *wvr_synthesis_create_v1(void *device, uint32_t mode) {
                            "coverage_stats", "display_map", "motion_basis",
                            "temporal_resolve", "synth_depth", "disocclusion_fill"};
     for (unsigned i = 0; i < 12; i++) {
+      if (mode == 4 && i != 1)
+        continue;
       auto f =
           [lib newFunctionWithName:[NSString stringWithUTF8String:names[i]]];
       c->pipelines[i] = [c->device newComputePipelineStateWithFunction:f
@@ -473,6 +494,34 @@ wvr_synthesis_ingest_v1(void *ctx, const WVRAcquiredStereoFrameV2 *input,
                    widths[] = {input->leftWidth, input->rightWidth},
                    heights[] = {input->leftHeight, input->rightHeight};
     void *colors[] = {input->leftTexture, input->rightTexture};
+    static const bool zeroCopyIngestEnv = [] {
+      const char *v = getenv("WVR_SYNTHESIS_ZERO_COPY_INGEST");
+      const bool on = (v && strcmp(v, "1") == 0);
+      NSLog(@"[synthesis] Zero-copy ingest (WVR_SYNTHESIS_ZERO_COPY_INGEST) is %s",
+            on ? "ENABLED" : "DISABLED");
+      return on;
+    }();
+    static const bool reconEveryCall = [] {
+      const char *v = getenv("WVR_NEURAL_RECON_EVERY_CALL");
+      return (v && strcmp(v, "1") == 0);
+    }();
+    id<MTLTexture> colorViews[2] = {nil, nil};
+    bool canZeroCopy = zeroCopyIngestEnv && (c.mode == 4) && explicitDepth && !reconEveryCall;
+    if (canZeroCopy) {
+      for (unsigned i = 0; i < 2; i++) {
+        auto color = (__bridge id<MTLTexture>)colors[i];
+        if (xs[i] != 0 || ys[i] != 0 || widths[i] != color.width ||
+            heights[i] != color.height) {
+          canZeroCopy = false;
+          break;
+        }
+        colorViews[i] = view(color, slices[i]);
+        if (!colorViews[i]) {
+          canZeroCopy = false;
+          break;
+        }
+      }
+    }
     for (unsigned i = 0; i < 2; i++) {
       auto color = (__bridge id<MTLTexture>)colors[i];
       if (!region(color, slices[i], xs[i], ys[i], widths[i], heights[i],
@@ -510,10 +559,19 @@ wvr_synthesis_ingest_v1(void *ctx, const WVRAcquiredStereoFrameV2 *input,
         reset(c);
         return -1;
       }
-      if (!ensure(c.device, e.color, color.pixelFormat, widths[i], heights[i],
-                  MTLTextureUsageShaderRead)) {
-        reset(c);
-        return -1;
+      if (canZeroCopy) {
+        e.color = colorViews[i];
+        e.borrowedColor = true;
+      } else {
+        if (e.borrowedColor) {
+          e.color = nil;
+          e.borrowedColor = false;
+        }
+        if (!ensure(c.device, e.color, color.pixelFormat, widths[i], heights[i],
+                    MTLTextureUsageShaderRead)) {
+          reset(c);
+          return -1;
+        }
       }
       if (c.mode == 2) {
         unsigned w = std::min(192u, widths[i]),
@@ -545,7 +603,7 @@ wvr_synthesis_ingest_v1(void *ctx, const WVRAcquiredStereoFrameV2 *input,
         }
       }
     }
-    if (c.mode == 3)
+    if ((c.mode == 3 || c.mode == 4) && explicitDepth)
       for (unsigned i = 0; i < 2; i++)
         if (!ensure(c.device, frame.eyes[i].depth, MTLPixelFormatRG32Float,
                     widths[i], heights[i])) {
@@ -555,30 +613,39 @@ wvr_synthesis_ingest_v1(void *ctx, const WVRAcquiredStereoFrameV2 *input,
     [commands encodeWaitForEvent:(__bridge id<MTLSharedEvent>)
                                      input->producerReadyEvent
                            value:input->producerReadyValue];
-    auto blit = [commands blitCommandEncoder];
-    if (!blit) {
-      reset(c);
-      return -1;
+    if (canZeroCopy) {
+      id leaseObj = (__bridge id)input->lease;
+      [commands addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        (void)leaseObj;
+      }];
+      c.stats->zeroCopyIngests++;
+    } else {
+      auto blit = [commands blitCommandEncoder];
+      if (!blit) {
+        reset(c);
+        return -1;
+      }
+      for (unsigned i = 0; i < 2; i++) {
+        auto src = (__bridge id<MTLTexture>)colors[i];
+        [blit copyFromTexture:src
+                  sourceSlice:slices[i]
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(xs[i], ys[i], 0)
+                   sourceSize:MTLSizeMake(widths[i], heights[i], 1)
+                    toTexture:frame.eyes[i].color
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+      }
+      [blit endEncoding];
     }
-    for (unsigned i = 0; i < 2; i++) {
-      auto src = (__bridge id<MTLTexture>)colors[i];
-      [blit copyFromTexture:src
-                sourceSlice:slices[i]
-                sourceLevel:0
-               sourceOrigin:MTLOriginMake(xs[i], ys[i], 0)
-                 sourceSize:MTLSizeMake(widths[i], heights[i], 1)
-                  toTexture:frame.eyes[i].color
-           destinationSlice:0
-           destinationLevel:0
-          destinationOrigin:MTLOriginMake(0, 0, 0)];
-    }
-    [blit endEncoding];
-    if (c.mode == 3 && explicitDepth) {
+    if ((c.mode == 3 || c.mode == 4) && explicitDepth) {
       auto enc = [commands computeCommandEncoder];
       if (!enc) {
         reset(c);
         return -1;
       }
+      [enc setComputePipelineState:c.pipelines[1]];
       for (unsigned i = 0; i < 2; i++) {
         auto &e = frame.eyes[i];
         auto &g = e.geometry;
@@ -589,12 +656,17 @@ wvr_synthesis_ingest_v1(void *ctx, const WVRAcquiredStereoFrameV2 *input,
           reset(c);
           return -1;
         }
-        P p = params(e.geometry, frame.eyes[1 - i].geometry);
+        P p{};
+        p.inverseProjection = simd_inverse(matrix(e.geometry.projection));
         p.size = {(uint32_t)e.depth.width, (uint32_t)e.depth.height};
         p.depthOrigin = {g.depthX, g.depthY};
         p.depthSize = {g.depthWidth, g.depthHeight};
         p.range = {g.minDepth, g.maxDepth};
-        dispatch(c, enc, 1, p, {depth, e.depth});
+        [enc setBytes:&p length:sizeof(p) atIndex:0];
+        [enc setTexture:depth atIndex:0];
+        [enc setTexture:e.depth atIndex:1];
+        [enc dispatchThreads:MTLSizeMake(p.size.x, p.size.y, 1)
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
       }
       [enc endEncoding];
     }
@@ -725,10 +797,12 @@ wvr_synthesis_ingest_v1(void *ctx, const WVRAcquiredStereoFrameV2 *input,
     frame.interval =
         c.ready ? input->producerTimestampNanoseconds - old.time : 0;
     frame.id = input->producerFrameID;
+    if (frame.interval > 0)
+      wvr_guest_foveation_report_frame_interval_v1(frame.id, frame.interval);
     frame.time = input->producerTimestampNanoseconds;
     frame.generation = generation;
     frame.jitterValid = (input->jitterFlags & WVR_SUBMIT_JITTER_VALID) != 0;
-    frame.depthValid = explicitDepth && c.mode == 3;
+    frame.depthValid = explicitDepth && (c.mode == 3 || c.mode == 4);
     for (unsigned eye = 0; eye < 2; eye++) {
       frame.jitterNdc[eye][0] = input->jitterNdc[eye][0];
       frame.jitterNdc[eye][1] = input->jitterNdc[eye][1];
@@ -741,7 +815,9 @@ wvr_synthesis_ingest_v1(void *ctx, const WVRAcquiredStereoFrameV2 *input,
 }
 static int32_t encode(void *ctx, uint64_t timestamp, uint32_t lw, uint32_t lh,
                       uint32_t rw, uint32_t rh, uint32_t extrapolate,
-                      void *buffer, const WVRFrameSynthesisViewV1 *views) {
+                      void *buffer, const WVRFrameSynthesisViewV1 *views,
+                      void *rateMapEye0 = nullptr, uint32_t rateMapLayer0 = 0,
+                      void *rateMapEye1 = nullptr, uint32_t rateMapLayer1 = 0) {
   @autoreleasepool {
     if (!ctx || !buffer)
       return -1;
@@ -786,12 +862,123 @@ static int32_t encode(void *ctx, uint64_t timestamp, uint32_t lw, uint32_t lh,
       c.stats->busy++;
       return 1;
     }
+    static const bool ratemapExtrapEnv = [] {
+      const char *v = getenv("WVR_NEURAL_RATEMAP_EXTRAP");
+      const bool on = (v && strcmp(v, "1") == 0);
+      NSLog(@"[synthesis] Rate-map physical extrapolation (WVR_NEURAL_RATEMAP_EXTRAP) is %s", on ? "ENABLED" : "DISABLED");
+      return on;
+    }();
+    void *rateMaps[2] = {rateMapEye0, rateMapEye1};
+    uint32_t rateMapLayers[2] = {rateMapLayer0, rateMapLayer1};
+    bool useRateMap = ratemapExtrapEnv && (c.mode == 4) && rateMaps[0] && rateMaps[1];
+    unsigned targetWidths[2] = {widths[0], widths[1]};
+    unsigned targetHeights[2] = {heights[0], heights[1]};
+
+    if (useRateMap) {
+      for (unsigned i = 0; i < 2; i++) {
+        id<MTLRasterizationRateMap> rmap = (__bridge id<MTLRasterizationRateMap>)rateMaps[i];
+        if (rmap && rateMapLayers[i] < rmap.layerCount) {
+          MTLSize phys = [rmap physicalSizeForLayer:rateMapLayers[i]];
+          if (phys.width > 0 && phys.height > 0) {
+            targetWidths[i] = (unsigned)phys.width;
+            targetHeights[i] = (unsigned)phys.height;
+          } else {
+            useRateMap = false;
+            break;
+          }
+        } else {
+          useRateMap = false;
+          break;
+        }
+      }
+    }
+    if (!useRateMap) {
+      targetWidths[0] = widths[0]; targetWidths[1] = widths[1];
+      targetHeights[0] = heights[0]; targetHeights[1] = heights[1];
+      rateMaps[0] = rateMaps[1] = nullptr;
+      rateMapLayers[0] = rateMapLayers[1] = 0;
+    }
     for (unsigned i = 0; i < 2; i++)
-      if (!ensure(c.device, slot->eyes[i], MTLPixelFormatRGBA16Float, widths[i],
-                  heights[i])) {
+      if (!ensure(c.device, slot->eyes[i], MTLPixelFormatRGBA16Float, targetWidths[i],
+                  targetHeights[i])) {
         *slot->busy = false;
         return -1;
       }
+    if (c.mode == 4) {
+      for (unsigned i = 0; i < 2; i++)
+        if (!ensure(c.device, slot->depthScratch[i], MTLPixelFormatR32Float, targetWidths[i], targetHeights[i])) {
+          *slot->busy = false;
+          return -1;
+        }
+
+      WVRNeuralFrameParamsV1 np{};
+      np.frameID = now.id;
+      np.timestampNanoseconds = now.time;
+      np.displayTimestampNanoseconds = timestamp;
+      // With WVR_YORO_SECONDARY_SKIP the right eye is always rendered at reduced
+      // density, so the left eye stays primary and the right eye is stereo-warped.
+      float yoroScale = 1.0f;
+      const bool yoroSecondary = wvr_guest_foveation_yoro_secondary_skip_v1(&yoroScale) == 1;
+      np.primaryEye = yoroSecondary ? 0u : (uint32_t)(now.id & 1);
+      for (unsigned i = 0; i < 2; i++) {
+        np.eyes[i].width = widths[i];
+        np.eyes[i].height = heights[i];
+        memcpy(np.eyes[i].originFromEye, now.eyes[i].geometry.originFromEye, 64);
+        memcpy(np.eyes[i].projection, now.eyes[i].geometry.projection, 64);
+        np.eyes[i].jitterNDC[0] = now.jitterValid ? now.jitterNdc[i][0] : 0.0f;
+        np.eyes[i].jitterNDC[1] = now.jitterValid ? now.jitterNdc[i][1] : 0.0f;
+        np.eyes[i].eyeRole = (i == np.primaryEye) ? 0 : 1;
+        float gazeCenter[2] = {0.5f, 0.5f}, gazeRadius = 0.25f;
+        np.eyes[i].gazeValid = (wvr_guest_foveation_copy_gaze_v1(i, gazeCenter, &gazeRadius) == 1) ? 1u : 0u;
+        np.eyes[i].gazeCenterUV[0] = gazeCenter[0];
+        np.eyes[i].gazeCenterUV[1] = gazeCenter[1];
+        np.eyes[i].gazeRadiusUV = gazeRadius;
+      }
+
+      int32_t ret = wvr_neural_encode_ratemap_v1(
+          c.neural,
+          (__bridge void *)commands,
+          &np,
+          (__bridge void *)now.eyes[0].color,
+          (__bridge void *)((now.depthValid && now.eyes[0].depth) ? now.eyes[0].depth : nil),
+          (__bridge void *)now.eyes[1].color,
+          (__bridge void *)((now.depthValid && now.eyes[1].depth) ? now.eyes[1].depth : nil),
+          (__bridge void *)slot->eyes[0],
+          (__bridge void *)slot->depthScratch[0],
+          (__bridge void *)slot->eyes[1],
+          (__bridge void *)slot->depthScratch[1],
+          views ? views[0].originFromEye : now.eyes[0].geometry.originFromEye,
+          views ? views[0].projection : now.eyes[0].geometry.projection,
+          views ? views[1].originFromEye : now.eyes[1].geometry.originFromEye,
+          views ? views[1].projection : now.eyes[1].geometry.projection,
+          rateMaps[0], rateMapLayers[0],
+          rateMaps[1], rateMapLayers[1]);
+
+      if (ret != 0) {
+        *slot->busy = false;
+        return -1;
+      }
+
+      for (unsigned i = 0; i < 2; i++) {
+        c.outputs[i] = slot->eyes[i];
+        c.displayDepth[i] = slot->depthScratch[i];
+      }
+
+      auto busy = slot->busy;
+      auto stats = c.stats;
+      [commands addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        if (b.status != MTLCommandBufferStatusCompleted)
+          stats->failed++;
+        else if (b.GPUEndTime > b.GPUStartTime)
+          stats->gpuMs.store((b.GPUEndTime - b.GPUStartTime) * 1000);
+        busy->store(false);
+      }];
+
+      if (views)
+        c.stats->trackedPoseJobs++;
+      c.stats->generated++;
+      return 0;
+    }
     bool history = c.mode == 2 && previous.id && previous.time < now.time;
     // Temporal resolve needs display-pose output, explicit depth, valid jitter, and
     // source eyes smaller than the output. History is per eye at output size.
@@ -983,16 +1170,31 @@ extern "C" int32_t
 wvr_synthesis_encode_display_v1(void *ctx, uint64_t timestamp,
                                 const WVRFrameSynthesisViewV1 views[2],
                                 uint32_t extrapolate, void *buffer) {
+  return wvr_synthesis_encode_display_ratemap_v1(ctx, timestamp, views,
+                                                 nullptr, 0, nullptr, 0,
+                                                 extrapolate, buffer);
+}
+extern "C" int32_t
+wvr_synthesis_encode_display_ratemap_v1(void *ctx, uint64_t timestamp,
+                                        const WVRFrameSynthesisViewV1 views[2],
+                                        void *rateMapEye0, uint32_t rateMapLayer0,
+                                        void *rateMapEye1, uint32_t rateMapLayer1,
+                                        uint32_t extrapolate, void *buffer) {
   if (!views)
     return -1;
   return encode(ctx, timestamp, views[0].width, views[0].height, views[1].width,
-                views[1].height, extrapolate, buffer, views);
+                views[1].height, extrapolate, buffer, views,
+                rateMapEye0, rateMapLayer0, rateMapEye1, rateMapLayer1);
 }
 extern "C" void *wvr_synthesis_copy_source_v1(void *ctx, uint32_t eye) {
   if (!ctx || eye > 1)
     return nullptr;
   auto &c = *static_cast<Context *>(ctx);
   std::lock_guard lock(c.mutex);
+  // A borrowed (zero-copy) guest texture goes back to the producer once its lease is
+  // released, so it must never become the compositor's long-lived snapshot.
+  if (c.frames[c.latest].eyes[eye].borrowedColor)
+    return nullptr;
   auto t = c.frames[c.latest].eyes[eye].color;
   return c.ready && t ? (__bridge_retained void *)t : nullptr;
 }
@@ -1034,12 +1236,16 @@ extern "C" void wvr_synthesis_reset_history_v1(void *ctx) {
   auto &c = *static_cast<Context *>(ctx);
   std::lock_guard lock(c.mutex);
   c.history.valid = false;
+  if (c.neural)
+    wvr_neural_reset_v1(c.neural);
 }
 extern "C" int32_t wvr_synthesis_forecast_reliable_v1(void *ctx) {
   if (!ctx)
     return 0;
   auto &c = *static_cast<Context *>(ctx);
   std::lock_guard lock(c.mutex);
+  if (c.ready && c.mode == 4)
+    return 1;
   // Coverage is sampled asynchronously every 60 frames, so this reads the last
   // completed sample. Until the first sample lands both values are zero.
   const double left = c.stats->motionCoverage[0].load(),
@@ -1051,6 +1257,7 @@ extern "C" int32_t wvr_synthesis_copy_stats_v1(void *ctx, char *buffer,
   if (!ctx || !buffer || !size)
     return 0;
   auto &c = *static_cast<Context *>(ctx);
+  std::lock_guard lock(c.mutex);
   auto &s = *c.stats;
   snprintf(
       buffer, size,
@@ -1060,7 +1267,7 @@ extern "C" int32_t wvr_synthesis_copy_stats_v1(void *ctx, char *buffer,
       "commandBufferGPUms=%.3f motion=estimated-optical-flow "
       "coverageFrameID=%llu depthCoverageL=%.4f depthCoverageR=%.4f "
       "motionCoverageL=%.4f motionCoverageR=%.4f trackedPoseDisplayJobs=%llu "
-      "temporalJobs=%llu",
+      "temporalJobs=%llu zeroCopyIngests=%llu",
       c.mode, (unsigned long long)s.frames.load(),
       (unsigned long long)s.gameDepth.load(),
       (unsigned long long)s.estimatedDepth.load(),
@@ -1071,6 +1278,14 @@ extern "C" int32_t wvr_synthesis_copy_stats_v1(void *ctx, char *buffer,
       s.depthCoverage[0].load(), s.depthCoverage[1].load(),
       s.motionCoverage[0].load(), s.motionCoverage[1].load(),
       (unsigned long long)s.trackedPoseJobs.load(),
-      (unsigned long long)s.temporal.load());
+      (unsigned long long)s.temporal.load(),
+      (unsigned long long)s.zeroCopyIngests.load());
+  if (c.mode == 4 && c.neural) {
+    size_t len = strlen(buffer);
+    if (len + 1 < size) {
+      buffer[len] = ' ';
+      wvr_neural_copy_stats_v1(c.neural, buffer + len + 1, (uint32_t)(size - len - 1));
+    }
+  }
   return 1;
 }

@@ -134,13 +134,20 @@ targets:
       - sdk: QuartzCore.framework
       - sdk: Metal.framework
       - sdk: AVFAudio.framework
+      - sdk: MetalFX.framework
     sources:
       - path: ../windows-vr-native/Sources
       - path: ../windows-vr-native/include
         headerVisibility: public
+      # FSR 3.1 Metal passes, compiled into the framework's default.metallib
+      - path: ../windows-vr-native/third-party/fidelityfx/gpu/fsr3upscaler/msl
+        buildPhase: sources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.avpplay.windows-vr.native-bridge
+        MTL_HEADER_SEARCH_PATHS: $(SRCROOT)/../windows-vr-native/third-party/fidelityfx/gpu
+        # Texture atomics (FSR depth reprojection, SPD counter) need MSL 3.1.
+        MTL_LANGUAGE_REVISION: Metal31
         EXPORTED_SYMBOLS_FILE: $(SRCROOT)/../windows-vr-native/shader-compiler/NativeBridge.exports
         GENERATE_INFOPLIST_FILE: YES
         CLANG_ENABLE_OBJC_ARC: YES

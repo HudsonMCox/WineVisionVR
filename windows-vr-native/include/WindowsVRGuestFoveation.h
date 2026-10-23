@@ -5,6 +5,7 @@
 // Old native handlers reject this version; callers then render uniformly.
 #define WVR_GUEST_FOVEATION_ABI 0x57564631u
 #define WVR_GUEST_FOVEATION_SAFE_SHADER 1u
+#define WVR_GUEST_FOVEATION_YORO_SECONDARY_SKIP 4u
 // Version 496 appends arrayLength. Legacy 492-byte requests are single-layer.
 #define WVR_GUEST_FOVEATION_PASS_V1_LEGACY_SIZE 492u
 #pragma pack(push, 4)
@@ -49,6 +50,14 @@ void wvr_guest_foveation_register_eye_v1(uint32_t role, void *texture,
 // Native endpoint also used by the synthetic GPU contract probe.
 int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *request);
 int wvr_guest_foveation_copy_stats_v1(char *buffer, uint32_t capacity);
+// Foveal gaze centre (UV, y down) and radius per eye, derived from the
+// published system rasterization rate map. Returns 0 and writes centre
+// 0.5,0.5 / radius 0.25 when no usable map is published.
+int wvr_guest_foveation_copy_gaze_v1(uint32_t eye, float *outCenterUV,
+                                     float *outRadiusUV);
+int wvr_guest_foveation_yoro_secondary_skip_v1(float *outScale);
+void wvr_guest_foveation_report_frame_interval_v1(uint64_t producerFrameID,
+                                                 uint64_t intervalNanoseconds);
 #ifdef __cplusplus
 }
 #endif

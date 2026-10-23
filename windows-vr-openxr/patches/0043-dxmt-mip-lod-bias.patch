@@ -1,0 +1,93 @@
+diff --git a/src/dxmt/dxmt_sampler.cpp b/src/dxmt/dxmt_sampler.cpp
+index 83bd58a..c4e077c 100644
+--- a/src/dxmt/dxmt_sampler.cpp
++++ b/src/dxmt/dxmt_sampler.cpp
+@@ -1,8 +1,79 @@
+ #include "dxmt_sampler.hpp"
+ #include "winemetal.h"
++#include "log/log.hpp"
++#include "util_env.hpp"
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <mutex>
++#include <string>
+ 
+ namespace dxmt {
+ 
++namespace {
++
++// Base mip LOD bias for a reduced internal render resolution: log2(WVR_INTERNAL_RENDER_SCALE)
++// plus DXMT_MIP_LOD_BIAS_EXTRA. DXMT_MIP_LOD_BIAS=0 disables it. Read once.
++float
++getRenderScaleMipLodBias() {
++  static const float bias = [] {
++    if (env::getEnvVar("DXMT_MIP_LOD_BIAS") == "0")
++      return 0.0f;
++
++    float scale = 1.0f;
++    const std::string scaleText = env::getEnvVar("WVR_INTERNAL_RENDER_SCALE");
++    if (!scaleText.empty()) {
++      char *end = nullptr;
++      const double value = std::strtod(scaleText.c_str(), &end);
++      if (end != scaleText.c_str() && *end == '\0' && std::isfinite(value) && value >= 0.5 && value <= 1.0)
++        scale = static_cast<float>(value);
++    }
++
++    float extra = 0.0f;
++    const std::string extraText = env::getEnvVar("DXMT_MIP_LOD_BIAS_EXTRA");
++    if (!extraText.empty()) {
++      char *end = nullptr;
++      const double value = std::strtod(extraText.c_str(), &end);
++      if (end != extraText.c_str() && std::isfinite(value))
++        extra = static_cast<float>(value);
++    }
++
++    const float result = std::log2(scale) + extra;
++    if (result == 0.0f)
++      return 0.0f;
++    return std::clamp(result, -16.0f, 15.99f);
++  }();
++  return bias;
++}
++
++// Adds the render-scale bias to a sampler's LOD bias. Both D3D11 and D3D12 sampler creation
++// route through Sampler::createSampler, and the bias is consumed from Sampler::lod_bias
++// (argument buffer metadata), so this is the single application point.
++float
++applyRenderScaleMipLodBias(const WMTSamplerInfo &info, float lod_bias) {
++  const float bias = getRenderScaleMipLodBias();
++  if (bias == 0.0f)
++    return lod_bias;
++  // Comparison samplers (shadow maps) keep their own LOD.
++  if (info.compare_function != WMTCompareFunctionNever)
++    return lod_bias;
++  // Fixed-LOD samplers gain nothing from a bias.
++  if (info.lod_min_clamp == info.lod_max_clamp)
++    return lod_bias;
++  // MIN_MAG_MIP_POINT is exact texel fetch; keep it unbiased.
++  if (info.min_filter == WMTSamplerMinMagFilterNearest && info.mag_filter == WMTSamplerMinMagFilterNearest &&
++      (info.mip_filter == WMTSamplerMipFilterNearest || info.mip_filter == WMTSamplerMipFilterNotMipmapped))
++    return lod_bias;
++
++  static std::once_flag applied_once;
++  std::call_once(applied_once, [bias] {
++    WARN("Applying negative mip LOD bias ", bias, " to sampler states (render scale / DXMT_MIP_LOD_BIAS_EXTRA)");
++  });
++  return std::clamp(lod_bias + bias, -16.0f, 15.99f);
++}
++
++} // namespace
++
+ void
+ Sampler::incRef() {
+   refcount_.fetch_add(1u, std::memory_order_acquire);
+@@ -42,7 +113,7 @@ Sampler::createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod
+     return nullptr;
+   }
+   ret->sampler_state_cube_handle = cube_sampler_info.gpu_resource_id;
+-  ret->lod_bias = lod_bias;
++  ret->lod_bias = applyRenderScaleMipLodBias(info, lod_bias);
+ 
+   return ret;
+ };

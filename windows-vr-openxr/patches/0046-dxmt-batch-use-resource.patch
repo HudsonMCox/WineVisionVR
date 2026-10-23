@@ -1,0 +1,87 @@
+From 326306241db95f29d97123e643e8a818f8427757 Mon Sep 17 00:00:00 2001
+From: HudsonMCox <HCI_cox@icloud.com>
+Date: Sun, 18 Oct 2026 14:37:36 -0400
+Subject: [PATCH] 0046 dxmt batch use resource
+
+---
+ src/winemetal/unix/winemetal_unix.c | 50 +++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 2132406..8edc04b 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -861,6 +861,20 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
+   return STATUS_SUCCESS;
+ }
+ 
++#define WMT_USE_RESOURCE_BATCH 32
++
++/* DXMT_BATCH_USE_RESOURCE=1: fold runs of consecutive useResource commands that share
++   usage/stages into one useResources:count: call (same residency, fewer msgSends). */
++static int
++batch_use_resource_enabled(void) {
++  static int enabled = -1;
++  if (enabled < 0) {
++    const char *env = getenv("DXMT_BATCH_USE_RESOURCE");
++    enabled = env && env[0] == '1';
++  }
++  return enabled;
++}
++
+ static NTSTATUS
+ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
+   struct unixcall_generic_obj_cmd_noret *params = obj;
+@@ -911,6 +925,24 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
+     }
+     case WMTComputeCommandUseResource: {
+       struct wmtcmd_compute_useresource *body = (struct wmtcmd_compute_useresource *)next;
++      if (batch_use_resource_enabled()) {
++        id<MTLResource> batch[WMT_USE_RESOURCE_BATCH];
++        NSUInteger count = 0;
++        batch[count++] = (id<MTLResource>)body->resource;
++        while (count < WMT_USE_RESOURCE_BATCH && next->next.ptr) {
++          const struct wmtcmd_base *peek = next->next.ptr;
++          const struct wmtcmd_compute_useresource *pb = (const struct wmtcmd_compute_useresource *)peek;
++          if (peek->type != WMTComputeCommandUseResource || pb->usage != body->usage)
++            break;
++          batch[count++] = (id<MTLResource>)pb->resource;
++          next = peek;
++        }
++        if (count == 1)
++          [encoder useResource:batch[0] usage:(MTLResourceUsage)body->usage];
++        else
++          [encoder useResources:batch count:count usage:(MTLResourceUsage)body->usage];
++        break;
++      }
+       [encoder useResource:(id<MTLResource>)body->resource usage:(MTLResourceUsage)body->usage];
+       break;
+     }
+@@ -966,6 +998,24 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+       break;
+     case WMTRenderCommandUseResource: {
+       struct wmtcmd_render_useresource *body = (struct wmtcmd_render_useresource *)next;
++      if (batch_use_resource_enabled()) {
++        id<MTLResource> batch[WMT_USE_RESOURCE_BATCH];
++        NSUInteger count = 0;
++        batch[count++] = (id<MTLResource>)body->resource;
++        while (count < WMT_USE_RESOURCE_BATCH && next->next.ptr) {
++          const struct wmtcmd_base *peek = next->next.ptr;
++          const struct wmtcmd_render_useresource *pb = (const struct wmtcmd_render_useresource *)peek;
++          if (peek->type != WMTRenderCommandUseResource || pb->usage != body->usage || pb->stages != body->stages)
++            break;
++          batch[count++] = (id<MTLResource>)pb->resource;
++          next = peek;
++        }
++        if (count == 1)
++          [encoder useResource:batch[0] usage:(MTLResourceUsage)body->usage stages:(MTLRenderStages)body->stages];
++        else
++          [encoder useResources:batch count:count usage:(MTLResourceUsage)body->usage stages:(MTLRenderStages)body->stages];
++        break;
++      }
+       [encoder useResource:(id<MTLResource>)body->resource
+                      usage:(MTLResourceUsage)body->usage
+                     stages:(MTLRenderStages)body->stages];
+-- 
+2.50.0.windows.2
+

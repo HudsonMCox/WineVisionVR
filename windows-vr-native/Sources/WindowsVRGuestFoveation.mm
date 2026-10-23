@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <memory>
@@ -67,6 +68,11 @@ static void armProgress(std::shared_ptr<EventProgress> state) {
                       // mid-buffer query signal.
                       state->value.store(completed.signaledValue,
                                          std::memory_order_release);
+                      // In-process atomic notification (VeRantyx os_sync_wait_on_address pattern)
+                      // Wakes any waiting threads immediately without wineserver roundtrip
+#if defined(__cpp_lib_atomic_wait) && __cpp_lib_atomic_wait
+                      state->value.notify_all();
+#endif
                       ++progressNotifications;
                     }
                     armProgress(state);
@@ -78,6 +84,83 @@ struct EyeMap {
   double published = 0;
 };
 std::array<EyeMap, 2> eyeMaps;
+// Foveal gaze estimate per eye, derived from the published system rate map.
+// The map is retained here, so cache identity (pointer + layer) cannot be
+// recycled by a later allocation.
+struct GazeEstimate {
+  __strong id<MTLRasterizationRateMap> map = nil;
+  uint32_t layer = 0;
+  bool computed = false, valid = false, logged = false;
+  float centerU = 0.5f, centerV = 0.5f, radius = 0.25f;
+  float loggedU = 0.5f, loggedV = 0.5f, loggedRadius = 0.25f;
+  double lastLog = 0;
+  double computedAt = 0;
+};
+std::array<GazeEstimate, 2> gazeEstimates;
+// Returns the rate-weighted centroid (UV, y down) of screen cells whose local
+// rate is >= 0.9 of the peak, plus the half-width of that region in UV. The
+// local rate is the Jacobian determinant of the screen->physical mapping
+// (physical pixels per screen pixel, squared), sampled on a 32x32 grid with
+// finite differences.
+bool computeGaze(id<MTLRasterizationRateMap> map, uint32_t layer, float &centerU,
+                 float &centerV, float &radius) {
+  if (!map || layer >= map.layerCount)
+    return false;
+  const MTLSize screen = map.screenSize;
+  if (!screen.width || !screen.height ||
+      ![map physicalSizeForLayer:layer].width)
+    return false;
+  constexpr int N = 32;
+  const double W = screen.width, H = screen.height;
+  const double hx = std::max(1.0, W / 64.0), hy = std::max(1.0, H / 64.0);
+  auto phys = [&](double x, double y) {
+    return [map mapScreenToPhysicalCoordinates:(MTLCoordinate2D){float(x), float(y)}
+                                      forLayer:layer];
+  };
+  std::array<double, N * N> rate{};
+  double peak = 0;
+  for (int j = 0; j < N; ++j)
+    for (int i = 0; i < N; ++i) {
+      const double sx = (i + 0.5) * W / N, sy = (j + 0.5) * H / N;
+      const double x0 = std::max(0.0, sx - hx), x1 = std::min(W, sx + hx);
+      const double y0 = std::max(0.0, sy - hy), y1 = std::min(H, sy + hy);
+      const auto a = phys(x0, sy), b = phys(x1, sy);
+      const auto c = phys(sx, y0), d = phys(sx, y1);
+      const double dxdx = (b.x - a.x) / (x1 - x0),
+                   dydx = (b.y - a.y) / (x1 - x0);
+      const double dxdy = (d.x - c.x) / (y1 - y0),
+                   dydy = (d.y - c.y) / (y1 - y0);
+      const double r = std::fabs(dxdx * dydy - dxdy * dydx);
+      rate[j * N + i] = std::isfinite(r) ? r : 0;
+      peak = std::max(peak, rate[j * N + i]);
+    }
+  if (!(peak > 0))
+    return false;
+  const double threshold = 0.9 * peak, cell = 1.0 / N;
+  double sumW = 0, sumU = 0, sumV = 0;
+  double minU = 1, maxU = 0, minV = 1, maxV = 0;
+  for (int j = 0; j < N; ++j)
+    for (int i = 0; i < N; ++i) {
+      const double r = rate[j * N + i];
+      if (r < threshold)
+        continue;
+      const double u = (i + 0.5) * cell, v = (j + 0.5) * cell;
+      sumW += r;
+      sumU += r * u;
+      sumV += r * v;
+      minU = std::min(minU, u);
+      maxU = std::max(maxU, u);
+      minV = std::min(minV, v);
+      maxV = std::max(maxV, v);
+    }
+  if (!(sumW > 0))
+    return false;
+  centerU = float(sumU / sumW);
+  centerV = float(sumV / sumW);
+  radius = float(std::clamp(0.5 * (std::max(maxU - minU, maxV - minV) + cell),
+                            cell, 0.5));
+  return true;
+}
 struct EyeTarget {
   __strong id<MTLTexture> root = nil;
   uint32_t role = 0, slice = 0, eyeWidth = 0, eyeHeight = 0;
@@ -90,6 +173,9 @@ struct EyeTarget {
                                        rightSourceMap = nil;
   __strong id<MTLBuffer> parameters = nil;
   uint32_t mapLayer = 0, rightMapLayer = 0;
+  bool yoroSkip = false;
+  float yoroScale = 1.0f;
+  float drsScale = 1.0f;
   // Cached with adaptedMap so resolves do not query the map per pass.
   uint32_t bounds[4] = {};
   MTLSize physicalSize = {};
@@ -98,6 +184,9 @@ struct EyeTarget {
   __strong id<MTLRasterizationRateMap> layeredMap = nil, layeredSource[2] = {};
   __strong id<MTLBuffer> layeredParameters = nil, layerParameters[2] = {};
   uint32_t layeredSourceLayer[2] = {}, layeredWidth = 0, layeredHeight = 0;
+  bool layeredYoroSkip = false;
+  float layeredYoroScale = 1.0f;
+  float layeredDrsScale = 1.0f;
   uint32_t layerBounds[2][4] = {};
   MTLSize layerPhysical[2] = {};
 };
@@ -109,7 +198,17 @@ std::atomic<uint64_t> sceneDraws{0}, logicalArea{0}, mappedArea{0},
     unmatchedTargets{0}, staleMaps{0}, atlasBegun{0}, bridgeCalls{0},
     capabilities{0}, uniformBindings{0};
 std::atomic<uint64_t> sliceViewHits{0}, sliceViewCreates{0};
-std::atomic<uint64_t> layeredBegun{0}, anySizeTargets{0};
+std::atomic<uint64_t> layeredBegun{0}, anySizeTargets{0},
+    yoroSecondaryPasses{0};
+std::atomic<bool> lastYoroSkipRequested{false};
+std::atomic<float> drsScale{1.0f};
+std::atomic<float> drsEmaMs{0.0f};
+std::atomic<uint64_t> drsAdjustments{0};
+std::mutex drsGovernorMutex;
+double drsLastUpdateTime = 0.0;
+double drsLastChangeTime = 0.0;
+double drsLastLogTime = 0.0;
+float drsCurrentEmaMs = 0.0f;
 std::atomic<uint64_t> begun{0}, resolved{0}, rejected{0}, nextToken{1},
     mapAdaptations{0}, mapAdaptNanoseconds{0};
 __strong id<MTLLibrary> resolveLibrary = nil;
@@ -154,9 +253,81 @@ id<MTLTexture> singleSlice(id<MTLTexture> texture, uint32_t slice) {
 // Samples one layer's system rate functions and adapts them in normalized
 // screen space. Conservative neighboring maxima widen high-quality regions;
 // no gaze point is reconstructed, persisted or exposed.
+struct YoroConfig {
+  bool enabled = false;
+  float scale = 0.5f;
+};
+static const YoroConfig &yoroConfig() {
+  static const YoroConfig cfg = [] {
+    YoroConfig c{};
+    if (const char *env = std::getenv("WVR_YORO_SECONDARY_SKIP"))
+      c.enabled = std::strcmp(env, "1") == 0;
+    if (const char *scaleEnv = std::getenv("WVR_YORO_SECONDARY_SCALE")) {
+      char *end = nullptr;
+      const float parsed = std::strtof(scaleEnv, &end);
+      if (end != scaleEnv && std::isfinite(parsed))
+        c.scale = std::clamp(parsed, 0.25f, 1.0f);
+    }
+    NSLog(@"[guest-foveation] yoroSecondarySkip=%d scale=%.2f",
+          c.enabled ? 1 : 0, c.scale);
+    return c;
+  }();
+  return cfg;
+}
+
+struct DrsConfig {
+  bool enabled = false;
+  float targetHz = 45.0f;
+  float targetMs = 1000.0f / 45.0f;
+  float minScale = 0.5f;
+};
+static const DrsConfig &drsConfig() {
+  static const DrsConfig cfg = [] {
+    DrsConfig c{};
+    if (const char *env = std::getenv("WVR_DRS_FOVEATION"))
+      c.enabled = std::strcmp(env, "1") == 0;
+    if (const char *hzEnv = std::getenv("WVR_DRS_TARGET_HZ")) {
+      char *end = nullptr;
+      const float parsed = std::strtof(hzEnv, &end);
+      if (end != hzEnv && std::isfinite(parsed) && parsed > 0.0f) {
+        c.targetHz = parsed;
+        c.targetMs = 1000.0f / parsed;
+      }
+    }
+    if (const char *minEnv = std::getenv("WVR_DRS_MIN_SCALE")) {
+      char *end = nullptr;
+      const float parsed = std::strtof(minEnv, &end);
+      if (end != minEnv && std::isfinite(parsed))
+        c.minScale = std::clamp(parsed, 0.125f, 1.0f);
+    }
+    if (c.enabled)
+      NSLog(@"[guest-foveation] dynamic foveation governor enabled targetHz=%.1f targetMs=%.2f minScale=%.2f",
+            c.targetHz, c.targetMs, c.minScale);
+    return c;
+  }();
+  return cfg;
+}
+
+static void reduceSecondaryAxis(float *rates, float scale) {
+  if (scale >= 0.999f)
+    return;
+  float peak = 0.0f;
+  for (unsigned i = 1; i < 31; ++i)
+    peak = std::max(peak, rates[i]);
+  if (peak <= 0.0f)
+    return;
+  const float threshold = 0.9f * peak;
+  for (unsigned i = 1; i < 31; ++i) {
+    if (rates[i] >= threshold)
+      continue;
+    rates[i] = std::clamp(rates[i] * scale, 0.125f, 1.0f);
+  }
+}
+
 static bool sampleAdaptedRates(id<MTLRasterizationRateMap> source,
                                NSUInteger layer, float (&x)[32],
-                               float (&y)[32]) {
+                               float (&y)[32], bool reduce = false,
+                               float scale = 1.0f) {
   constexpr unsigned count = 32;
   if (!source || layer >= source.layerCount)
     return false;
@@ -194,18 +365,23 @@ static bool sampleAdaptedRates(id<MTLRasterizationRateMap> source,
     x[i] = std::min(1.0f, std::ceil(std::max({sx[lo], sx[i], sx[hi]}) * 8) / 8);
     y[i] = std::min(1.0f, std::ceil(std::max({sy[lo], sy[i], sy[hi]}) * 8) / 8);
   }
+  if (reduce) {
+    reduceSecondaryAxis(x, scale);
+    reduceSecondaryAxis(y, scale);
+  }
   return true;
 }
 
 // The original system map stays immutable; the adapted map is a new object.
 id<MTLRasterizationRateMap> adaptMap(id<MTLRasterizationRateMap> source,
                                      NSUInteger layer, NSUInteger width,
-                                     NSUInteger height) {
+                                     NSUInteger height, bool reduce = false,
+                                     float scale = 1.0f) {
   if (!source || layer >= source.layerCount || !width || !height)
     return nil;
   float x[32], y[32];
   const auto started = std::chrono::steady_clock::now();
-  if (!sampleAdaptedRates(source, layer, x, y))
+  if (!sampleAdaptedRates(source, layer, x, y, reduce, scale))
     return nil;
   auto rates = [[MTLRasterizationRateLayerDescriptor alloc]
       initWithSampleCount:MTLSizeMake(32, 32, 1)
@@ -301,7 +477,9 @@ static bool eyeSizeMatches(uint64_t width, uint64_t height, uint32_t eyeWidth,
 static id<MTLRasterizationRateMap> adaptStereoAtlas(const EyeMap &left,
                                                     const EyeMap &right,
                                                     NSUInteger width,
-                                                    NSUInteger height) {
+                                                    NSUInteger height,
+                                                    float leftScale = 1.0f,
+                                                    float rightScale = 1.0f) {
   auto l = adaptMap(left.map, left.layer, width, height);
   auto r = adaptMap(right.map, right.layer, width, height);
   if (!l || !r)
@@ -327,6 +505,12 @@ static id<MTLRasterizationRateMap> adaptStereoAtlas(const EyeMap &left,
     x[i + 32] = slope(r, true, i, width);
     y[i] = std::max(slope(l, false, i, height), slope(r, false, i, height));
   }
+  if (leftScale < 0.999f) {
+    reduceSecondaryAxis(x, leftScale);
+    reduceSecondaryAxis(y, leftScale);
+  }
+  if (rightScale < 0.999f)
+    reduceSecondaryAxis(x + 32, rightScale);
   // Keep a full-rate filter guard at texture edges and the eye boundary.
   // This prevents reconstruction footprints from straddling independently
   // rasterized viewports or Metal's physical edge padding.
@@ -349,13 +533,17 @@ static id<MTLRasterizationRateMap> adaptStereoAtlas(const EyeMap &left,
 static id<MTLRasterizationRateMap> adaptLayeredPair(const EyeMap &left,
                                                     const EyeMap &right,
                                                     NSUInteger width,
-                                                    NSUInteger height) {
+                                                    NSUInteger height,
+                                                    float leftScale = 1.0f,
+                                                    float rightScale = 1.0f) {
   if (!left.map || !right.map || left.map.device != right.map.device ||
       !width || !height)
     return nil;
   float lx[32], ly[32], rx[32], ry[32];
-  if (!sampleAdaptedRates(left.map, left.layer, lx, ly) ||
-      !sampleAdaptedRates(right.map, right.layer, rx, ry))
+  if (!sampleAdaptedRates(left.map, left.layer, lx, ly, leftScale < 0.999f,
+                          leftScale) ||
+      !sampleAdaptedRates(right.map, right.layer, rx, ry, rightScale < 0.999f,
+                          rightScale))
     return nil;
   const auto started = std::chrono::steady_clock::now();
   auto l = [[MTLRasterizationRateLayerDescriptor alloc]
@@ -385,15 +573,24 @@ static id<MTLRasterizationRateMap> adaptLayeredPair(const EyeMap &left,
 // whenever either eye map, its layer, or the target size changes.
 static bool refreshLayered(EyeTarget &entry,
                            const std::array<EyeMap, 2> &eyes, uint32_t width,
-                           uint32_t height, id<MTLDevice> device) {
+                           uint32_t height, id<MTLDevice> device,
+                           bool yoroSkip = false, float yoroScale = 1.0f,
+                           float drsScale = 1.0f) {
+  const float effectiveYoroScale = yoroSkip ? yoroScale : 1.0f;
+  const float leftScale = drsScale;
+  const float rightScale = drsScale * effectiveYoroScale;
   bool current = entry.layeredMap && entry.layeredWidth == width &&
-                 entry.layeredHeight == height;
+                 entry.layeredHeight == height &&
+                 entry.layeredYoroSkip == yoroSkip &&
+                 entry.layeredYoroScale == effectiveYoroScale &&
+                 std::fabs(entry.layeredDrsScale - drsScale) < 0.025f;
   for (unsigned l = 0; l < 2; ++l)
     current &= entry.layeredSource[l] == eyes[l].map &&
                entry.layeredSourceLayer[l] == eyes[l].layer;
   if (current)
     return true;
-  auto map = adaptLayeredPair(eyes[0], eyes[1], width, height);
+  auto map = adaptLayeredPair(eyes[0], eyes[1], width, height, leftScale,
+                              rightScale);
   if (!map)
     return false;
   auto parameters =
@@ -403,7 +600,9 @@ static bool refreshLayered(EyeTarget &entry,
     return false;
   [map copyParameterDataToBuffer:parameters offset:0];
   for (unsigned l = 0; l < 2; ++l) {
-    auto single = adaptMap(eyes[l].map, eyes[l].layer, width, height);
+    const float layerScale = (l == 0) ? leftScale : rightScale;
+    auto single = adaptMap(eyes[l].map, eyes[l].layer, width, height,
+                           layerScale < 0.999f, layerScale);
     if (!single)
       return false;
     auto buffer =
@@ -428,6 +627,9 @@ static bool refreshLayered(EyeTarget &entry,
   entry.layeredParameters = parameters;
   entry.layeredWidth = width;
   entry.layeredHeight = height;
+  entry.layeredYoroSkip = yoroSkip;
+  entry.layeredYoroScale = effectiveYoroScale;
+  entry.layeredDrsScale = drsScale;
   for (unsigned l = 0; l < 2; ++l) {
     entry.layeredSource[l] = eyes[l].map;
     entry.layeredSourceLayer[l] = eyes[l].layer;
@@ -657,9 +859,19 @@ extern "C" int wvr_guest_foveation_install_v1(void) {
 extern "C" void wvr_guest_foveation_reset_v1(void) {
   std::lock_guard<std::mutex> lock(stateMutex);
   eyeMaps = {};
+  gazeEstimates = {};
+  lastYoroSkipRequested.store(false, std::memory_order_relaxed);
   targets = {};
   nextTarget = 0;
   lastIdentityKnown = false;
+  {
+    std::lock_guard<std::mutex> drsLock(drsGovernorMutex);
+    drsCurrentEmaMs = 0.0f;
+    drsLastUpdateTime = 0.0;
+    drsLastChangeTime = 0.0;
+  }
+  drsScale.store(1.0f, std::memory_order_relaxed);
+  drsEmaMs.store(0.0f, std::memory_order_relaxed);
 }
 extern "C" void wvr_guest_foveation_publish_maps_v1(void *left,
                                                     uint32_t leftLayer,
@@ -1028,7 +1240,9 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
       r->structSize == sizeof(*r) ? r->arrayLength : 1u;
   const bool layered = arrayLength == 2;
   if (r->operation != 1 || activePass ||
-      r->flags != WVR_GUEST_FOVEATION_SAFE_SHADER || !r->commandBuffer ||
+      (r->flags & ~WVR_GUEST_FOVEATION_YORO_SECONDARY_SKIP) !=
+          WVR_GUEST_FOVEATION_SAFE_SHADER ||
+      !r->commandBuffer ||
       (!hasColor && (!r->depthTexture || r->colorCount)) || r->colorCount > 8 ||
       r->depthStencilReadOnlyMask > 3 || (arrayLength != 1 && !layered) ||
       (layered && !hasColor)) {
@@ -1141,6 +1355,18 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
   std::lock_guard<std::mutex> lock(stateMutex);
   EyeTarget *entry = nullptr;
   MTLSize size{};
+  const auto &yoro = yoroConfig();
+  const bool yoroSkip =
+      yoro.enabled || (r->flags & WVR_GUEST_FOVEATION_YORO_SECONDARY_SKIP) != 0;
+  if (r->flags & WVR_GUEST_FOVEATION_YORO_SECONDARY_SKIP)
+    lastYoroSkipRequested.store(true, std::memory_order_relaxed);
+  const float yoroScale = yoro.scale;
+  const auto &drs = drsConfig();
+  const float currentDrsScale =
+      drs.enabled ? drsScale.load(std::memory_order_relaxed) : 1.0f;
+  const float quantizedDrsScale =
+      std::clamp(std::round(currentDrsScale * 20.0f) / 20.0f,
+                 drs.enabled ? drs.minScale : 0.125f, 1.0f);
   if (layered) {
     // The pair occupies slice s for role 0 and slice s+1 for role 1 of one root.
     for (auto &target : targets)
@@ -1174,7 +1400,8 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
       return -1;
     }
     if (!refreshLayered(*entry, eyeMaps, r->width, r->height,
-                        commands.device)) {
+                        commands.device, yoroSkip, yoroScale,
+                        quantizedDrsScale)) {
       ++rejected;
       return -1;
     }
@@ -1350,19 +1577,33 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
       }
     }
     const auto &left = entry->atlas ? eyeMaps[0] : eye;
+    const bool targetYoroSkip = yoroSkip && (entry->atlas || entry->role == 1);
+    const float targetYoroScale = targetYoroSkip ? yoroScale : 1.0f;
+    const float singleScale = (entry->role == 1)
+                                  ? (quantizedDrsScale * targetYoroScale)
+                                  : quantizedDrsScale;
     if (entry->sourceMap != left.map || entry->mapLayer != left.layer ||
         (entry->atlas && (entry->rightSourceMap != right.map ||
                           entry->rightMapLayer != right.layer)) ||
+        entry->yoroSkip != targetYoroSkip ||
+        entry->yoroScale != targetYoroScale ||
+        std::fabs(entry->drsScale - quantizedDrsScale) >= 0.025f ||
         entry->adaptedMap.screenSize.width != r->width ||
         entry->adaptedMap.screenSize.height != r->height) {
       entry->adaptedMap =
           entry->atlas
-              ? adaptStereoAtlas(left, right, entry->eyeWidth, entry->eyeHeight)
-              : adaptMap(left.map, left.layer, r->width, r->height);
+              ? adaptStereoAtlas(left, right, entry->eyeWidth, entry->eyeHeight,
+                                 quantizedDrsScale,
+                                 quantizedDrsScale * targetYoroScale)
+              : adaptMap(left.map, left.layer, r->width, r->height,
+                         singleScale < 0.999f, singleScale);
       entry->sourceMap = left.map;
       entry->mapLayer = left.layer;
       entry->rightSourceMap = entry->atlas ? right.map : nil;
       entry->rightMapLayer = right.layer;
+      entry->yoroSkip = targetYoroSkip;
+      entry->yoroScale = targetYoroScale;
+      entry->drsScale = quantizedDrsScale;
       entry->parameters =
           entry->adaptedMap
               ? [commands.device
@@ -1543,10 +1784,128 @@ extern "C" int wvr_guest_foveation_process_v1(WVRGuestFoveationPassV1 *r) {
     ++layeredBegun;
   if (entry->atlas)
     ++atlasBegun;
+  if (yoroSkip && (layered || entry->atlas || entry->role == 1))
+    ++yoroSecondaryPasses;
   sceneDraws.fetch_add(r->drawCalls);
   logicalArea.fetch_add(uint64_t(r->width) * r->height);
   mappedArea.fetch_add(uint64_t(size.width) * size.height);
   return 0;
+}
+extern "C" int wvr_guest_foveation_copy_gaze_v1(uint32_t eye, float *outCenterUV,
+                                                float *outRadiusUV) {
+  if (!outCenterUV || !outRadiusUV)
+    return 0;
+  outCenterUV[0] = 0.5f;
+  outCenterUV[1] = 0.5f;
+  *outRadiusUV = 0.25f;
+  if (eye > 1)
+    return 0;
+  std::lock_guard<std::mutex> lock(stateMutex);
+  const auto &source = eyeMaps[eye];
+  if (!source.map)
+    return 0;
+  auto &gaze = gazeEstimates[eye];
+  // Recomputed when the published map object or its layer changes, and at
+  // most every 33 ms otherwise: the system may refresh a reused map's rates
+  // in place as gaze moves, which the identity check alone would not see.
+  const double computeNow = CACurrentMediaTime();
+  if (!gaze.computed || gaze.map != source.map || gaze.layer != source.layer ||
+      computeNow - gaze.computedAt >= 0.033) {
+    gaze.map = source.map;
+    gaze.layer = source.layer;
+    gaze.computed = true;
+    gaze.computedAt = computeNow;
+    gaze.valid = computeGaze(source.map, source.layer, gaze.centerU,
+                             gaze.centerV, gaze.radius);
+    if (!gaze.valid) {
+      gaze.centerU = gaze.centerV = 0.5f;
+      gaze.radius = 0.25f;
+    }
+  }
+  const double now = CACurrentMediaTime();
+  if (!gaze.valid) {
+    if (now - gaze.lastLog >= 0.5) {
+      NSLog(@"[guest-foveation] gaze unavailable eye=%u", eye);
+      gaze.lastLog = now;
+    }
+    return 0;
+  }
+  outCenterUV[0] = gaze.centerU;
+  outCenterUV[1] = gaze.centerV;
+  *outRadiusUV = gaze.radius;
+  const bool changed =
+      !gaze.logged || std::fabs(gaze.centerU - gaze.loggedU) > 0.02f ||
+      std::fabs(gaze.centerV - gaze.loggedV) > 0.02f ||
+      std::fabs(gaze.radius - gaze.loggedRadius) > 0.02f;
+  if (changed && (!gaze.logged || now - gaze.lastLog >= 0.5)) {
+    NSLog(@"[guest-foveation] gaze eye=%u centerUV=(%.3f, %.3f) radiusUV=%.3f",
+          eye, gaze.centerU, gaze.centerV, gaze.radius);
+    gaze.logged = true;
+    gaze.loggedU = gaze.centerU;
+    gaze.loggedV = gaze.centerV;
+    gaze.loggedRadius = gaze.radius;
+    gaze.lastLog = now;
+  }
+  return 1;
+}
+extern "C" int wvr_guest_foveation_yoro_secondary_skip_v1(float *outScale) {
+  const auto &cfg = yoroConfig();
+  if (!cfg.enabled && !lastYoroSkipRequested.load(std::memory_order_relaxed))
+    return 0;
+  if (outScale)
+    *outScale = cfg.scale;
+  return 1;
+}
+extern "C" void
+wvr_guest_foveation_report_frame_interval_v1(uint64_t producerFrameID,
+                                             uint64_t intervalNanoseconds) {
+  const auto &cfg = drsConfig();
+  if (!cfg.enabled || intervalNanoseconds == 0)
+    return;
+  const float intervalMs = float(double(intervalNanoseconds) / 1e6);
+  if (!std::isfinite(intervalMs) || intervalMs <= 0.0f)
+    return;
+
+  std::lock_guard<std::mutex> lock(drsGovernorMutex);
+  if (drsCurrentEmaMs <= 0.0f) {
+    drsCurrentEmaMs = intervalMs;
+  } else {
+    constexpr float alpha = 0.1f;
+    drsCurrentEmaMs = alpha * intervalMs + (1.0f - alpha) * drsCurrentEmaMs;
+  }
+  drsEmaMs.store(drsCurrentEmaMs, std::memory_order_relaxed);
+
+  const double now = CACurrentMediaTime();
+  if (drsLastUpdateTime == 0.0) {
+    drsLastUpdateTime = now;
+    return;
+  }
+  if (now - drsLastUpdateTime < 0.250)
+    return;
+
+  const float current = drsScale.load(std::memory_order_relaxed);
+  float updated = current;
+  if (drsCurrentEmaMs > cfg.targetMs * 1.05f) {
+    updated = std::max(cfg.minScale, current - 0.05f);
+  } else if (drsCurrentEmaMs < cfg.targetMs * 1.02f &&
+             now - drsLastChangeTime >= 1.0) {
+    // A frame-capped game never runs faster than the target, so probe upwards
+    // slowly while on target; a resulting miss lowers the scale again.
+    updated = std::min(1.0f, current + 0.05f);
+  }
+  updated = std::clamp(std::round(updated * 20.0f) / 20.0f, cfg.minScale, 1.0f);
+  drsLastUpdateTime = now;
+
+  if (std::fabs(updated - current) >= 0.025f) {
+    drsScale.store(updated, std::memory_order_relaxed);
+    drsAdjustments.fetch_add(1, std::memory_order_relaxed);
+    drsLastChangeTime = now;
+    if (now - drsLastLogTime >= 1.0) {
+      drsLastLogTime = now;
+      NSLog(@"[guest-foveation] drsScale=%.2f emaMs=%.2f targetMs=%.2f",
+            updated, drsCurrentEmaMs, cfg.targetMs);
+    }
+  }
 }
 extern "C" int wvr_guest_foveation_copy_stats_v1(char *buffer,
                                                  uint32_t capacity) {
@@ -1554,6 +1913,7 @@ extern "C" int wvr_guest_foveation_copy_stats_v1(char *buffer,
     return 0;
   const auto adaptations = mapAdaptations.load();
   const auto area = logicalArea.load();
+  const auto &yoro = yoroConfig();
   std::snprintf(
       buffer, capacity,
       "guestFoveation begun=%llu resolved=%llu rejected=%llu draws=%llu "
@@ -1561,7 +1921,8 @@ extern "C" int wvr_guest_foveation_copy_stats_v1(char *buffer,
       "systemMaps=per-eye maxAgeMs=25 adaptations=%llu meanAdaptCPUms=%.3f "
       "atlas=%llu bridgeCalls=%llu capabilities=%llu uniform=%llu "
       "eventNotifications=%llu sliceViewHits=%llu sliceViewCreates=%llu "
-      "layeredBegun=%llu anySizeTargets=%llu",
+      "layeredBegun=%llu anySizeTargets=%llu yoroSecondary=%llu "
+      "yoroScale=%.2f drsScale=%.2f drsEmaMs=%.2f drsAdjustments=%llu",
       (unsigned long long)begun.load(), (unsigned long long)resolved.load(),
       (unsigned long long)rejected.load(),
       (unsigned long long)sceneDraws.load(),
@@ -1580,6 +1941,10 @@ extern "C" int wvr_guest_foveation_copy_stats_v1(char *buffer,
       (unsigned long long)sliceViewHits.load(std::memory_order_relaxed),
       (unsigned long long)sliceViewCreates.load(std::memory_order_relaxed),
       (unsigned long long)layeredBegun.load(),
-      (unsigned long long)anySizeTargets.load());
+      (unsigned long long)anySizeTargets.load(),
+      (unsigned long long)yoroSecondaryPasses.load(), double(yoro.scale),
+      double(drsScale.load(std::memory_order_relaxed)),
+      double(drsEmaMs.load(std::memory_order_relaxed)),
+      (unsigned long long)drsAdjustments.load(std::memory_order_relaxed));
   return 1;
 }

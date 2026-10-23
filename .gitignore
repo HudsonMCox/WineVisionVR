@@ -43,3 +43,4 @@ visionos-windows-vr/.local.philip.x86.yml
 
 # Machine-local XcodeGen identity and development-signing overrides.
 /visionos-windows-vr/.local*
+CLAUDE.local.md

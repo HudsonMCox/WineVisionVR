@@ -1,0 +1,44 @@
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index b8dd85e..3e118cb 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -73,6 +73,18 @@ ImmediateContextBase::GetDynamicBufferAllocation(Rc<DynamicBuffer> &dynamic) {
+   return {dynamic->immediateName().ptr(), dynamic->immediateSuballocation()};
+ }
+ 
++// Dirty only the constant-buffer slots that bind a renamed buffer instead of every slot of
++// every stage, so unrelated stages' tables are not re-encoded after each per-object update.
++static bool
++PreciseCBufferDirtyEnabled() {
++  static const bool enabled = [] {
++    bool val = env::getEnvVar("DXMT_PRECISE_CBUFFER_DIRTY") == "1";
++    WARN("DXMT_PRECISE_CBUFFER_DIRTY=", val ? "1" : "0");
++    return val;
++  }();
++  return enabled;
++}
++
+ class MTLD3D11ImmediateContext : public ImmediateContextBase {
+ public:
+   MTLD3D11ImmediateContext(MTLD3D11Device *pDevice, CommandQueue &cmd_queue) :
+@@ -159,8 +171,18 @@ public:
+           state_.InputAssembler.VertexBuffers.set_dirty();
+         }
+         if (bind_flag & D3D11_BIND_CONSTANT_BUFFER) {
+-          for (auto &stage : state_.ShaderStages) {
+-            stage.ConstantBuffers.set_dirty();
++          if (PreciseCBufferDirtyEnabled()) {
++            IUnknown *raw = pResource;
++            for (auto &stage : state_.ShaderStages) {
++              for (size_t slot = 0; slot < 14; slot++) {
++                if (stage.ConstantBuffers.test_bound(slot) && stage.ConstantBuffers[slot].RawPointer == raw)
++                  stage.ConstantBuffers.set_dirty(slot);
++              }
++            }
++          } else {
++            for (auto &stage : state_.ShaderStages) {
++              stage.ConstantBuffers.set_dirty();
++            }
+           }
+         }
+         if (bind_flag & D3D11_BIND_SHADER_RESOURCE) {

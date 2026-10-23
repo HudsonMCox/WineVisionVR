@@ -8,7 +8,8 @@ extern "C" {
 // 1 = edge-adaptive spatial reconstruction; 2 adds bounded object
 // extrapolation. 3 = spatial reconstruction plus a foveal temporal resolve; it
 // needs explicit game depth and projection jitter (the jitter-carrying V3
-// submission) and otherwise behaves as 1. These are custom Metal algorithms,
+// submission) and otherwise behaves as 1. 4 = stereo YORO/AFW + foveal neural
+// reconstruction with alternating eyes and 90 Hz extrapolation. These are custom Metal algorithms,
 // not NVIDIA DLSS or a MetalFX interpolator.
 void *wvr_synthesis_create_v1(void *device, uint32_t mode);
 void wvr_synthesis_destroy_v1(void *context);
@@ -29,6 +30,13 @@ int32_t wvr_synthesis_encode_display_v1(void *context,
                                         const WVRFrameSynthesisViewV1 views[2],
                                         uint32_t extrapolate,
                                         void *commandBuffer);
+int32_t wvr_synthesis_encode_display_ratemap_v1(void *context,
+                                                uint64_t timestampNanoseconds,
+                                                const WVRFrameSynthesisViewV1 views[2],
+                                                void *rateMapEye0, uint32_t rateMapLayer0,
+                                                void *rateMapEye1, uint32_t rateMapLayer1,
+                                                uint32_t extrapolate,
+                                                void *commandBuffer);
 // Both eye outputs are encoded together. They stay owned by the context and are
 // borrowed until its next encode/destroy; the caller's retained command buffer
 // owns resources used for presentation. No CPU/GPU wait is performed here.

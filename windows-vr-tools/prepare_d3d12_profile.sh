@@ -98,6 +98,11 @@ patches=[
  "windows-vr-openxr/patches/0040-dxmt-d3d12-single-pass-stereo.patch",
  "windows-vr-openxr/patches/0041-dxmt-d3d11-getdata-blocking-wait.patch",
  "windows-vr-openxr/patches/0042-dxmt-wine-log-nul-safety.patch",
+ "windows-vr-openxr/patches/0043-dxmt-mip-lod-bias.patch",
+ "windows-vr-openxr/patches/0044-dxmt-tile-store-elision-ext.patch",
+ "windows-vr-openxr/patches/0045-dxmt-precise-cbuffer-dirty.patch",
+ "windows-vr-openxr/patches/0046-dxmt-batch-use-resource.patch",
+ "windows-vr-openxr/patches/0047-dxmt-precise-vb-dirty.patch",
 ]
 subprocess.run(["git","init","--quiet"],cwd=dest,check=True)
 for rel in patches:
