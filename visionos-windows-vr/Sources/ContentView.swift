@@ -7,7 +7,7 @@ struct ContentView: View {
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
     @Bindable var model: LauncherModel
-    @AppStorage("WVRFrameSynthesisMode") private var frameSynthesisMode = 0
+    @AppStorage("WVRFrameSynthesisMode") private var frameSynthesisMode = 4
     @AppStorage("WVRReconstructionValidation") private var reconstructionValidation = false
     @AppStorage("WVRRenderQuality") private var renderQuality: Double = 0
     @AppStorage("WVRInternalRenderScale") private var internalRenderScale = 1.0

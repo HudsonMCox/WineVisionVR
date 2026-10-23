@@ -1548,7 +1548,7 @@ struct WVRNeuralContext {
   bool startupSummaryLogged = false;
   std::atomic<uint64_t> encodeCalls{0};
   std::atomic<uint64_t> passNeural{0};              // eye passes through VRFovealNet
-  std::atomic<uint64_t> passAnalyticalNoFlag{0};    // weights loaded, WVR_FORCE_NEURAL_RECONSTRUCTION unset
+  std::atomic<uint64_t> passAnalyticalNoFlag{0};    // weights loaded, WVR_FORCE_NEURAL_RECONSTRUCTION=0
   std::atomic<uint64_t> passAnalyticalNoWeights{0}; // no usable .wvnw
   std::atomic<uint64_t> passNoHistory{0};           // no warped history candidate this pass
   std::atomic<uint64_t> passNoStereo{0};            // eye B pass without the YORO stereo candidate
@@ -1981,9 +1981,14 @@ extern "C" int32_t wvr_neural_encode_ratemap_v1(
     const bool reuseRecon = !reconEveryCall && ctx->historyValid &&
                             params->frameID == ctx->lastReconFrameID;
     if (reuseRecon) ctx->reconReuses++;
+    // The OSS student runs by default whenever its weights load; WVR_FORCE_NEURAL_RECONSTRUCTION=0 selects the
+    // analytical blend instead.
     static const bool useNeural = [] {
       const char *forceNeuralEnv = getenv("WVR_FORCE_NEURAL_RECONSTRUCTION");
-      return forceNeuralEnv && strcmp(forceNeuralEnv, "1") == 0;
+      const bool on = !(forceNeuralEnv && strcmp(forceNeuralEnv, "0") == 0);
+      NSLog(@"[WindowsVRNeural] VRFovealNet student %s (WVR_FORCE_NEURAL_RECONSTRUCTION=%s)", on ? "enabled" : "DISABLED",
+            forceNeuralEnv ? forceNeuralEnv : "unset");
+      return on;
     }();
     const bool runNeural = useNeural && ctx->weightsLoaded && ctx->weightsHeader.num_tensors >= 32;
 
@@ -2256,7 +2261,7 @@ extern "C" int32_t wvr_neural_encode_ratemap_v1(
       NSLog(@"[WindowsVRNeural] Pipeline summary: path=%s forceNeural=%d weights=%s fnv64=%016llx file=%s | "
             "depth=%s in=%lux%lu/%lux%lu out=%lux%lu/%lux%lu primaryEye=%u | upscaler=%s rateMapExtrap=%d objectMotion=%d "
             "reconEveryCall=%d gpuTiming=%d dumpFrame=%llu",
-            runNeural ? "VRFovealNet" : (useNeural ? "analytical (weights unusable)" : "analytical (WVR_FORCE_NEURAL_RECONSTRUCTION unset)"),
+            runNeural ? "VRFovealNet" : (useNeural ? "analytical (weights unusable)" : "analytical (WVR_FORCE_NEURAL_RECONSTRUCTION=0)"),
             useNeural ? 1 : 0,
             ctx->weightsLoaded ? "loaded" : "missing", (unsigned long long)ctx->weightsHash, ctx->weightsPath,
             depthValid ? "valid" : "MISSING",

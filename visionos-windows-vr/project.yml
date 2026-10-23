@@ -96,6 +96,10 @@ targets:
       - path: Resources/DesktopDemo
         type: folder
         buildPhase: resources
+      # OSS student weights for the mode-4 neural reconstruction, at the bundle root
+      # (Resources/WindowsVR is git-ignored, so a fresh clone has no copy there)
+      - path: Resources/vr_foveal_student_fp16.wvnw
+        buildPhase: resources
       # Copy helper files individually: a folder resource would replace the
       # loader directory and delete ntdll/apisetschema on incremental builds.
       - path: Resources/arm64ec-windows/dockhost.exe

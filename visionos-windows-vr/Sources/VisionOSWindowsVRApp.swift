@@ -7,6 +7,9 @@ struct VisionOSWindowsVRApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        // Mode 4 (adaptive frame generation with the OSS student reconstruction) is the default until the
+        // user picks another mode; registered before any reader of the key.
+        UserDefaults.standard.register(defaults: ["WVRFrameSynthesisMode": 4])
         // Before anything calls the compositor bridge, which reads this switch once.
         if LaunchDiagnostics.enabled {
             setenv("WVR_TRACE_BRIDGE", "1", 1)
